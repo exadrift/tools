@@ -1,0 +1,220 @@
+package config
+
+import (
+	"fmt"
+	"os"
+	"os/user"
+	"sync"
+
+	"github.com/exadrift/go/kv"
+	"github.com/exadrift/tools/crucible/internal/defaults"
+	"github.com/exadrift/tools/crucible/internal/ssh"
+	"github.com/exadrift/tools/crucible/internal/yamlstack"
+	"github.com/goccy/go-yaml"
+)
+
+var (
+	sshInfoCache = map[string]*ssh.SshInfo{}
+	sshInfoLock  sync.Mutex
+)
+
+type SshConfig struct {
+	AllowUnknownHosts           bool    `yaml:"allowUnknownHosts"`
+	IgnoreHostKeyChange         bool    `yaml:"ignoreHostKeyChange"`
+	KeyPath                     string  `yaml:"keyPath"`        // the main ssh key path, expected to be able to access all hosts except those with overrides
+	KnownHostsPath              string  `yaml:"knownHostsPath"` // path to the known_hosts file
+	User                        string  `yaml:"user"`
+	MaxConnectionAttempts       int     `yaml:"maxConnectionAttempts" default:"20"`        // maximum consecutive connection attempts
+	DelayAfterConnectionFailure float64 `yaml:"delayAfterConnectionFailure" default:"5.0"` // number of seconds to wait before retrying
+}
+
+type Executor struct {
+	MaxConcurrentHosts int       `yaml:"maxConcurrentHosts" default:"10"`
+	ShellBinary        string    `yaml:"shellBinary" default:"sh"`
+	Ssh                SshConfig `yaml:"ssh"`
+	SyncExecutionSteps bool      `yaml:"syncExecutionSteps"` // if true, execution step must complete on all hosts before advancing
+}
+
+type HostConfig struct {
+	Host    string         `yaml:"host"`
+	Group   string         `yaml:"group"`   // optional group key, which must be uniquely identifiable and different than any host key name
+	Context map[string]any `yaml:"context"` // generic k/v storage for data to be referenced later
+	Ssh     SshConfig      `yaml:"ssh"`
+}
+
+type UserConfig struct {
+	Username string
+	HomeDir  string
+}
+
+type Config struct {
+	// keys are unique host identifiers, though they themselves have no meaning
+	Executor    Executor               `yaml:"executor"`
+	Hosts       map[string]*HostConfig `yaml:"hosts"`
+	SudoPrompt  bool                   `yaml:"sudoPrompt"`
+	ValuesStore *kv.Store
+	User        *UserConfig
+	Debug       bool
+	Json        bool
+	CwdPath     string
+	sudoPass    string
+	lock        sync.Mutex
+}
+
+func (c *Config) GetSudoPass() string {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	if c.sudoPass == "" {
+		// inject this in if it is being used during a tty-less debugging session and is set
+		sudoPass := os.Getenv("CRUCIBLE_SUDO_PASSWORD")
+		if sudoPass != "" {
+			c.sudoPass = sudoPass
+		}
+	}
+	return c.sudoPass
+}
+
+func (c *Config) SetSudoPass(value string) {
+	c.lock.Lock()
+	defer c.lock.Unlock()
+	c.sudoPass = value
+}
+
+func FromFilePaths(stackPaths ...string) (*Config, error) {
+	b, err := yamlstack.StackYaml(stackPaths...)
+	if err != nil {
+		return nil, err
+	}
+
+	c := &Config{}
+	err = yaml.Unmarshal(b, c)
+	if err != nil {
+		return nil, fmt.Errorf("yaml provided was incompatible with the config spec\n%w", err)
+	}
+
+	err = defaults.ApplyDefaults(c)
+	if err != nil {
+		return nil, fmt.Errorf("unable to apply defaults to config\n%w", err)
+	}
+
+	c.User = &UserConfig{}
+	u, err := user.Current()
+	if err != nil {
+		return nil, fmt.Errorf("unable to ascertain current user\n%w", err)
+	}
+	c.User.Username = u.Username
+	c.User.HomeDir = u.HomeDir
+
+	return c, nil
+}
+
+func (c *Config) getSshInfo(hostIdent string) (*ssh.SshInfo, error) {
+	sshInfoLock.Lock()
+	defer sshInfoLock.Unlock()
+
+	var err error
+	sshInfo, ok := sshInfoCache[hostIdent]
+	if !ok {
+		sshInfo, err = ssh.GetSshInfo(c.Hosts[hostIdent].Host)
+		if err != nil {
+			return nil, err
+		}
+
+		sshInfoCache[hostIdent] = sshInfo
+	}
+
+	return sshInfo, nil
+}
+
+func (c *Config) Username(hostIdent string) (string, error) {
+	if c.Hosts[hostIdent].Ssh.User != "" {
+		return c.Hosts[hostIdent].Ssh.User, nil
+	}
+
+	if c.Executor.Ssh.User != "" {
+		return c.Executor.Ssh.User, nil
+	}
+
+	info, err := c.getSshInfo(hostIdent)
+	if err != nil {
+		return "", err
+	}
+
+	return info.User, nil
+}
+
+func (c *Config) Hostname(hostIdent string) (string, error) {
+	info, err := c.getSshInfo(hostIdent)
+	if err != nil {
+		return "", err
+	}
+
+	return info.Hostname, nil
+}
+
+func (c *Config) Port(hostIdent string) (int, error) {
+	info, err := c.getSshInfo(hostIdent)
+	if err != nil {
+		return 0, err
+	}
+
+	return info.Port, nil
+}
+
+func (c *Config) KeyPath(hostIdent string) (string, error) {
+	if c.Hosts[hostIdent].Ssh.KeyPath != "" {
+		return c.Hosts[hostIdent].Ssh.KeyPath, nil
+	}
+
+	if c.Executor.Ssh.KeyPath != "" {
+		return c.Executor.Ssh.KeyPath, nil
+	}
+
+	info, err := c.getSshInfo(hostIdent)
+	if err != nil {
+		return "", err
+	}
+
+	return info.KeyPath, nil
+}
+
+func (c *Config) KnownHostsFile(hostIdent string) (string, error) {
+	if c.Hosts[hostIdent].Ssh.KnownHostsPath != "" {
+		return c.Hosts[hostIdent].Ssh.KnownHostsPath, nil
+	}
+
+	if c.Executor.Ssh.KnownHostsPath != "" {
+		return c.Executor.Ssh.KnownHostsPath, nil
+	}
+
+	info, err := c.getSshInfo(hostIdent)
+	if err != nil {
+		return "", err
+	}
+
+	return info.KnownHostsPath, nil
+}
+
+func (c *Config) AllowUnknownHosts(hostIdent string) bool {
+	if c.Hosts[hostIdent].Ssh.AllowUnknownHosts {
+		return true
+	}
+
+	if c.Executor.Ssh.AllowUnknownHosts {
+		return true
+	}
+
+	return false
+}
+
+func (c *Config) IgnoreHostKeyChange(hostIdent string) bool {
+	if c.Hosts[hostIdent].Ssh.IgnoreHostKeyChange {
+		return true
+	}
+
+	if c.Executor.Ssh.IgnoreHostKeyChange {
+		return true
+	}
+
+	return false
+}
