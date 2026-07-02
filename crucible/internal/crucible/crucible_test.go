@@ -162,7 +162,9 @@ func (suite *CrucibleTestSuite) TestEndToEnd() {
 
 	extraConfig := kv.NewStore()
 	err = extraConfig.Set(suite.sshHost, "hosts", "testServer", "host")
+	suite.NoError(err)
 	err = extraConfig.Set("test", "hosts", "testServer", "ssh", "user")
+	suite.NoError(err)
 	err = extraConfig.Set("/root/.ssh/id_ed25519", "hosts", "testServer", "ssh", "keyPath")
 	suite.NoError(err)
 	extraConfigBytes, err := yaml.Marshal(extraConfig.GetMapping())
