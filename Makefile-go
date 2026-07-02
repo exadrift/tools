@@ -3,7 +3,7 @@ GO_VERSION := 1.26
 LINTER_VERSION := 2.12.2
 VERSION ?= local
 GO_IMAGE := golang:$(GO_VERSION)-alpine
-MOUNT ?= ""
+MOUNT ?=
 DOCKER_CMD := docker run --network host --rm -e CGO_ENABLED=0 -e HOME=$$HOME -v $$HOME:$$HOME -v $(shell pwd):/build -v /tmp:/tmp -v /var/run/docker.sock:/var/run/docker.sock $(MOUNT) -w /build
 GO_RUN_USER := $(DOCKER_CMD) -u $(shell id -u):$(shell id -g) $(GO_IMAGE) go
 GO_RUN_ROOT := $(DOCKER_CMD) $(GO_IMAGE) go
