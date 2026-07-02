@@ -1,0 +1,84 @@
+name: perform CI release workflow
+permissions:
+  # the write permission is necessary to create the base tag, which reflects the repo state
+  # prior to any state finalization, even after merge, the pre-merge commit point needs to be known
+  # in order to see which items need post-merge steps based on prior changes
+  contents: write
+  checks: read
+
+on:
+  push:
+    branches:
+      - "**"
+
+jobs:
+  create-changed-directory-matrix:
+    runs-on: ubuntu-24.04
+    name: get directories containing changes
+    outputs:
+      directories: ${{ steps.get-changed-dirs.outputs.directories }}
+    steps:
+      - id: get-changed-dirs
+        uses: exadrift/github-actions/changed-dirs@changed-dirs-v1
+
+  continuous-integration:
+    name: ${{ matrix.item.name }} - continuous integration
+    needs: create-changed-directory-matrix
+    runs-on: ubuntu-24.04
+    if: needs.create-changed-directory-matrix.outputs.directories != '[]'
+    strategy:
+      matrix:
+        item: ${{ fromJson(needs.create-changed-directory-matrix.outputs.directories) }}
+    defaults:
+      run:
+        working-directory: ${{ matrix.item.path }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - uses: exadrift/github-actions/is-default@is-default-v1
+        id: is-default
+
+      - uses: exadrift/github-actions/versioning@versioning-v1
+        id: versioning
+        with:
+          # not covered by run.working-directory
+          working-directory: ${{ matrix.item.path }}
+          tag-prefix: ${{ matrix.item.name }}-
+
+      - name: perform lint check
+        run: ../make-script lint-check
+
+      - name: perform tests
+        run: ../make-script test
+
+      - uses: docker/login-action@v4
+        if: ${{ steps.is-default.outputs.is-default == 'true' }}
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_API_KEY }}
+
+      - if: ${{ steps.is-default.outputs.is-default == 'true' }}
+        name: publish docker images
+        run: |
+          ../make-script publish
+          VERSION=${MAJOR_VERSION} make publish
+
+      - if: ${{ steps.is-default.outputs.is-default == 'true' }}
+        uses: exadrift/github-actions/release@release-v1
+        with:
+          working-directory: ${{ matrix.item.path }}
+          tags: ${{ matrix.item.name }}-${{ steps.versioning.outputs.version }}
+          description: release of ${{ matrix.item.name }} github action
+
+  update-base-tag:
+    runs-on: ubuntu-24.04
+    name: update base tag
+    needs:
+      - continuous-integration
+    steps:
+      - name: update base tag
+        uses: exadrift/github-actions/changed-dirs@changed-dirs-v1
+        with:
+          update-base-tag: true

@@ -1,0 +1,23 @@
+#!/bin/sh
+
+set -e
+
+if [ ! -d test-containers ]
+then
+    echo "no test containers found"
+    exit
+fi
+
+PARENT=$(basename $PWD)
+for DIR in test-containers/*
+do
+    if [ ! -f ${DIR}/Dockerfile ]
+    then
+        continue
+    fi
+
+    IMAGE_NAME="${PARENT}/${DIR}"
+    echo "building container ${IMAGE_NAME}"
+
+    docker build -t ${IMAGE_NAME} ${DIR}
+done

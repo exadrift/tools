@@ -1,0 +1,33 @@
+#!/bin/sh
+
+set -e
+
+if [ -z $1 ]
+then
+    echo "make-script <target>"
+    exit 1
+fi
+
+if [ -f Makefile ]
+then
+    MAKEFILE=Makefile
+else
+    if [ -f go.mod ]
+    then
+        MAKEFILE="../Makefile-go"
+    fi
+fi
+
+if [ -z ${MAKEFILE} ]
+then
+    echo "no makefile specified"
+    exit 1
+fi
+
+if [ -d mnt ]
+then
+    echo "adding mount override"
+    export MOUNT="-v ${PWD}/mnt:/mnt"
+fi
+
+make -f ${MAKEFILE} $1
