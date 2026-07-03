@@ -63,7 +63,7 @@ jobs:
         name: publish docker images
         run: |
           ../make-script publish
-          VERSION=${MAJOR_VERSION} make publish
+          VERSION=${MAJOR_VERSION} ../make-script publish
 
       - if: ${{ steps.is-default.outputs.is-default == 'true' }}
         uses: exadrift/github-actions/release@release-v1
