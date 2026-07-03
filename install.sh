@@ -4,14 +4,20 @@ set -e
 
 CONTAINER_NAME=temp-exadrift
 
-if [ "$1" == "" ]
+if [ "$(whoami)" != "root" ]
+then
+    echo "this installer requires root privileges in order to place files in the /usr/local/bin path"
+    sudo echo "prompted for sudo caching"
+fi
+
+if [ "$1" = "" ]
 then
     echo "install.sh <name> <version>"
     exit 1
 fi
 IMAGE_NAME=$1
 
-if [ "$2" == "" ]
+if [ "$2" = "" ]
 then
     echo "install.sh <name> <version>"
     exit 1
@@ -19,7 +25,7 @@ fi
 IMAGE_TAG=$2
 
 DOCKER_LOC=$(which docker)
-if [ "${DOCKER_LOC}" == "" ]
+if [ "${DOCKER_LOC}" = "" ]
 then
     echo "you must have docker installed in order to user the installer"
     exit 1
