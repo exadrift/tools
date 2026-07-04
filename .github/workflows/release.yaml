@@ -55,7 +55,7 @@ jobs:
 
       - name: build target
         run: |
-          ../make-script build
+          VERSION=${{ steps.versioning.outputs.version }} ../make-script build
 
       - uses: docker/login-action@v4
         if: ${{ steps.is-default.outputs.is-default == 'true' }}

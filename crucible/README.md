@@ -6,8 +6,7 @@ crucible is a powerful environment configuration tool which can be used to maint
 ## getting started
 download the latest version crucible your deployment control machine and place it in your path:
 ```
-curl https://raw.githubusercontent.com/exadrift/tools/refs/heads/main/install.sh | sh crucible v0
-
+curl https://raw.githubusercontent.com/exadrift/tools/refs/heads/main/install.sh | sh -s -- crucible v0
 ```
 once downloaded, run `crucible --help`
 
