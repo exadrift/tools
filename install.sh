@@ -4,10 +4,10 @@ set -e
 
 CONTAINER_NAME=temp-exadrift
 
-if [ "$(whoami)" != "root" ]
+if [ "$(id -u)" != "0" ]
 then
     echo "this installer requires root privileges in order to place files in the /usr/local/bin path"
-    exec sudo "$0" "$@"
+    exit 1
 fi
 
 if [ "$1" = "" ]
