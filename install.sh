@@ -32,9 +32,11 @@ then
 fi
 
 TARGET_PATH=/usr/local/bin/${IMAGE_NAME}
+DOCKER_IMAGE=exadrift/${IMAGE_NAME}:${IMAGE_TAG}
 
 docker rm -f ${CONTAINER_NAME} > /dev/null 2>&1
-docker container create --name ${CONTAINER_NAME} exadrift/${IMAGE_NAME}:${IMAGE_TAG}
+docker pull ${DOCKER_IMAGE}
+docker container create --name ${CONTAINER_NAME} ${DOCKER_IMAGE}
 docker container cp ${CONTAINER_NAME}:/${IMAGE_NAME} ${TARGET_PATH}
 chmod +x /usr/local/bin/${IMAGE_NAME}
 docker rm -f ${CONTAINER_NAME}
