@@ -7,7 +7,7 @@ CONTAINER_NAME=temp-exadrift
 if [ "$(whoami)" != "root" ]
 then
     echo "this installer requires root privileges in order to place files in the /usr/local/bin path"
-    sudo echo "prompted for sudo caching"
+    exec sudo "$0" "$@"
 fi
 
 if [ "$1" = "" ]
