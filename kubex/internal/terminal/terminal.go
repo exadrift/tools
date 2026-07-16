@@ -44,7 +44,9 @@ func (t *Terminal) Start(cmd *exec.Cmd) error {
 		return err
 	}
 
-	ptmx.Write([]byte("alias k='kubectl'\nclear\n"))
+	if _, err = ptmx.Write([]byte("alias k='kubectl'\nclear\n")); err != nil {
+		return err
+	}
 
 	t.pty = ptmx
 
@@ -114,7 +116,7 @@ func convertColor(c vt10x.Color) tcell.Color {
 }
 
 func (t *Terminal) Draw(screen tcell.Screen) {
-	t.Box.DrawForSubclass(screen, t)
+	t.DrawForSubclass(screen, t)
 
 	x, y, w, h := t.GetInnerRect()
 
@@ -126,10 +128,12 @@ func (t *Terminal) Draw(screen tcell.Screen) {
 		t.vt.Resize(w, h)
 
 		if t.pty != nil {
-			pty.Setsize(t.pty, &pty.Winsize{
+			if err := pty.Setsize(t.pty, &pty.Winsize{
 				Cols: uint16(w),
 				Rows: uint16(h),
-			})
+			}); err != nil {
+				panic(err)
+			}
 		}
 	}
 
@@ -166,67 +170,69 @@ func (t *Terminal) Draw(screen tcell.Screen) {
 
 func (t *Terminal) InputHandler() func(event *tcell.EventKey, setFocus func(p tview.Primitive)) {
 	return t.WrapInputHandler(func(ev *tcell.EventKey, setFocus func(p tview.Primitive)) {
-
-		if ev.Key() == tcell.KeyUp && ev.Modifiers()&tcell.ModShift != 0 {
-		}
+		var err error
 
 		switch ev.Key() {
 		case tcell.KeyRune:
-			t.pty.Write([]byte(string(ev.Rune())))
+			_, err = t.pty.Write([]byte(string(ev.Rune())))
 
 		case tcell.KeyEnter:
-			t.pty.Write([]byte("\r"))
+			_, err = t.pty.Write([]byte("\r"))
 
 		case tcell.KeyTab:
-			t.pty.Write([]byte("\t"))
+			_, err = t.pty.Write([]byte("\t"))
 
 		case tcell.KeyBackspace, tcell.KeyBackspace2:
-			t.pty.Write([]byte{0x7f})
+			_, err = t.pty.Write([]byte{0x7f})
 
 		case tcell.KeyUp:
-			t.pty.Write([]byte("\x1b[A"))
+			_, err = t.pty.Write([]byte("\x1b[A"))
 
 		case tcell.KeyDown:
-			t.pty.Write([]byte("\x1b[B"))
+			_, err = t.pty.Write([]byte("\x1b[B"))
 
 		case tcell.KeyLeft:
-			t.pty.Write([]byte("\x1b[D"))
+			_, err = t.pty.Write([]byte("\x1b[D"))
 
 		case tcell.KeyRight:
-			t.pty.Write([]byte("\x1b[C"))
+			_, err = t.pty.Write([]byte("\x1b[C"))
 
 		case tcell.KeyHome:
-			t.pty.Write([]byte("\x1b[H"))
+			_, err = t.pty.Write([]byte("\x1b[H"))
 
 		case tcell.KeyEnd:
-			t.pty.Write([]byte("\x1b[F"))
+			_, err = t.pty.Write([]byte("\x1b[F"))
 
 		case tcell.KeyPgUp:
-			t.pty.Write([]byte("\x1b[5~"))
+			_, err = t.pty.Write([]byte("\x1b[5~"))
 
 		case tcell.KeyPgDn:
-			t.pty.Write([]byte("\x1b[6~"))
+			_, err = t.pty.Write([]byte("\x1b[6~"))
 
 		case tcell.KeyDelete:
-			t.pty.Write([]byte("\x1b[3~"))
+			_, err = t.pty.Write([]byte("\x1b[3~"))
 
 		case tcell.KeyInsert:
-			t.pty.Write([]byte("\x1b[2~"))
+			_, err = t.pty.Write([]byte("\x1b[2~"))
 
 		case tcell.KeyCtrlC:
-			t.pty.Write([]byte{3})
+			_, err = t.pty.Write([]byte{3})
 
 		case tcell.KeyCtrlD:
-			t.pty.Write([]byte{4})
+			_, err = t.pty.Write([]byte{4})
 
 		case tcell.KeyCtrlZ:
-			t.pty.Write([]byte{26})
+			_, err = t.pty.Write([]byte{26})
 
 		case tcell.KeyCtrlR:
-			t.pty.Write([]byte{0x12})
+			_, err = t.pty.Write([]byte{0x12})
 
 		case tcell.KeyCtrlV:
-			t.pty.Write([]byte("| vi -\n"))
+			_, err = t.pty.Write([]byte("| vi -\n"))
+		}
+
+		if err != nil {
+			panic(err)
 		}
 	})
 }
