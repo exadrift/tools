@@ -1,8 +1,11 @@
 package terminal
 
 import (
+	"errors"
+	"log"
 	"os"
 	"os/exec"
+	"syscall"
 
 	"github.com/creack/pty"
 	"github.com/gdamore/tcell/v2"
@@ -51,7 +54,13 @@ func (t *Terminal) Start(cmd *exec.Cmd) error {
 		for {
 			n, err := ptmx.Read(buf)
 			if err != nil {
-				return
+				if errors.Is(err, syscall.EIO) {
+					// if we've received an EOF, exit
+					t.app.Stop()
+					return
+				}
+
+				log.Fatal(err)
 			}
 
 			// Update terminal state outside the tview event loop.
@@ -70,21 +79,35 @@ func convertColor(c vt10x.Color) tcell.Color {
 	case vt10x.Black:
 		return tcell.ColorBlack
 	case vt10x.Red:
-		return tcell.ColorRed
+		return tcell.ColorMaroon
 	case vt10x.Green:
 		return tcell.ColorGreen
 	case vt10x.Yellow:
-		return tcell.ColorYellow
+		return tcell.ColorOlive
 	case vt10x.Blue:
-		return tcell.ColorBlue
+		return tcell.ColorNavy
 	case vt10x.Magenta:
-		return tcell.ColorDarkMagenta
+		return tcell.ColorPurple
 	case vt10x.Cyan:
 		return tcell.ColorTeal
+	case vt10x.LightGrey:
+		return tcell.ColorSilver
+	case vt10x.DarkGrey:
+		return tcell.ColorGray
+	case vt10x.LightRed:
+		return tcell.ColorRed
+	case vt10x.LightGreen:
+		return tcell.ColorLime
+	case vt10x.LightYellow:
+		return tcell.ColorYellow
+	case vt10x.LightBlue:
+		return tcell.ColorBlue
+	case vt10x.LightMagenta:
+		return tcell.ColorFuchsia
+	case vt10x.LightCyan:
+		return tcell.ColorAqua
 	case vt10x.White:
 		return tcell.ColorWhite
-	case vt10x.DefaultFG:
-		return tcell.ColorDefault
 	default:
 		return tcell.ColorDefault
 	}
@@ -132,13 +155,22 @@ func (t *Terminal) Draw(screen tcell.Screen) {
 			)
 		}
 	}
+
+	cur := t.vt.Cursor()
+	if t.HasFocus() {
+		screen.ShowCursor(x+cur.X, y+cur.Y)
+	} else {
+		screen.HideCursor()
+	}
 }
 
 func (t *Terminal) InputHandler() func(event *tcell.EventKey, setFocus func(p tview.Primitive)) {
 	return t.WrapInputHandler(func(ev *tcell.EventKey, setFocus func(p tview.Primitive)) {
 
-		switch ev.Key() {
+		if ev.Key() == tcell.KeyUp && ev.Modifiers()&tcell.ModShift != 0 {
+		}
 
+		switch ev.Key() {
 		case tcell.KeyRune:
 			t.pty.Write([]byte(string(ev.Rune())))
 
@@ -162,6 +194,39 @@ func (t *Terminal) InputHandler() func(event *tcell.EventKey, setFocus func(p tv
 
 		case tcell.KeyRight:
 			t.pty.Write([]byte("\x1b[C"))
+
+		case tcell.KeyHome:
+			t.pty.Write([]byte("\x1b[H"))
+
+		case tcell.KeyEnd:
+			t.pty.Write([]byte("\x1b[F"))
+
+		case tcell.KeyPgUp:
+			t.pty.Write([]byte("\x1b[5~"))
+
+		case tcell.KeyPgDn:
+			t.pty.Write([]byte("\x1b[6~"))
+
+		case tcell.KeyDelete:
+			t.pty.Write([]byte("\x1b[3~"))
+
+		case tcell.KeyInsert:
+			t.pty.Write([]byte("\x1b[2~"))
+
+		case tcell.KeyCtrlC:
+			t.pty.Write([]byte{3})
+
+		case tcell.KeyCtrlD:
+			t.pty.Write([]byte{4})
+
+		case tcell.KeyCtrlZ:
+			t.pty.Write([]byte{26})
+
+		case tcell.KeyCtrlR:
+			t.pty.Write([]byte{0x12})
+
+		case tcell.KeyCtrlV:
+			t.pty.Write([]byte("| vi -\n"))
 		}
 	})
 }

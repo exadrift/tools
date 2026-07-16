@@ -2,6 +2,7 @@ package main
 
 import (
 	"log"
+	"os"
 	"os/exec"
 
 	"github.com/exadrift/tools/kubex/internal/display"
@@ -9,6 +10,8 @@ import (
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
+
+var Version = ""
 
 func main() {
 	gridView := tview.NewGrid()
@@ -50,7 +53,11 @@ func main() {
 	gridView.AddItem(namespaceTable, 0, 1, 1, 1, 0, 0, true)
 	gridView.AddItem(term, 0, 2, 1, 1, 0, 0, true)
 
-	cmd := exec.Command("/bin/bash")
+	shell := os.Getenv("SHELL")
+	if shell == "" {
+		shell = "/bin/bash"
+	}
+	cmd := exec.Command(shell)
 	if err := term.Start(cmd); err != nil {
 		log.Fatal(err)
 	}
