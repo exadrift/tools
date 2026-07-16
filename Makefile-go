@@ -46,6 +46,10 @@ bin/$(NAME): $(GO_FILES)
 install: bin/$(NAME)
 	cp ./bin/$(NAME) /usr/local/bin/
 
+.PHONY: run
+run: bin/$(NAME)
+	./bin/$(NAME)
+
 .PHONY: clean
 clean:
 	rm -rf bin
