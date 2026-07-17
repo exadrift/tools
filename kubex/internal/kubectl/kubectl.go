@@ -99,7 +99,9 @@ func GetCurrentNamespace(curContext string) (string, error) {
 	}
 
 	cfg := Config{}
-	json.Unmarshal(jsonBytes, &cfg)
+	if err = json.Unmarshal(jsonBytes, &cfg); err != nil {
+		return "", fmt.Errorf("unable to unmarshal config data: %w", err)
+	}
 
 	for _, ctx := range cfg.Contexts {
 		if ctx.Name == curContext {
