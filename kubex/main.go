@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"os"
 	"os/exec"
@@ -14,6 +15,23 @@ import (
 var Version = ""
 
 func main() {
+	for _, arg := range os.Args {
+		if arg == "--help" {
+			fmt.Println("kubex - kubernetes explorer")
+			fmt.Println("help:")
+			fmt.Println()
+			fmt.Println("  k                   - invoke kubectl (terminal alias)")
+			fmt.Println("  <tab> / <shift-tab> - change focus through panes right / left")
+			fmt.Println("  <ctrl> + <v>        - execute command at prompt and send output to vi")
+			os.Exit(0)
+		}
+
+		if arg == "--version" {
+			fmt.Printf("%s\n", Version)
+			os.Exit(0)
+		}
+	}
+
 	gridView := tview.NewGrid()
 	gridView.SetRows(0).SetColumns(30, 30, 0).SetBorder(false)
 
