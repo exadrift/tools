@@ -76,6 +76,45 @@ func (t *Terminal) Start(cmd *exec.Cmd) error {
 	return nil
 }
 
+func convertColor(c vt10x.Color) tcell.Color {
+	switch c {
+	case vt10x.Black:
+		return tcell.ColorBlack
+	case vt10x.Red:
+		return tcell.ColorMaroon
+	case vt10x.Green:
+		return tcell.ColorGreen
+	case vt10x.Yellow:
+		return tcell.ColorOlive
+	case vt10x.Blue:
+		return tcell.ColorNavy
+	case vt10x.Magenta:
+		return tcell.ColorPurple
+	case vt10x.Cyan:
+		return tcell.ColorTeal
+	case vt10x.LightGrey:
+		return tcell.ColorSilver
+	case vt10x.DarkGrey:
+		return tcell.ColorGray
+	case vt10x.LightRed:
+		return tcell.ColorRed
+	case vt10x.LightGreen:
+		return tcell.ColorLime
+	case vt10x.LightYellow:
+		return tcell.ColorYellow
+	case vt10x.LightBlue:
+		return tcell.ColorBlue
+	case vt10x.LightMagenta:
+		return tcell.ColorFuchsia
+	case vt10x.LightCyan:
+		return tcell.ColorAqua
+	case vt10x.White:
+		return tcell.ColorWhite
+	default:
+		return tcell.ColorDefault
+	}
+}
+
 func (t *Terminal) Draw(screen tcell.Screen) {
 	t.DrawForSubclass(screen, t)
 
@@ -106,12 +145,17 @@ func (t *Terminal) Draw(screen tcell.Screen) {
 	for row := 0; row < maxH; row++ {
 		for col := 0; col < maxW; col++ {
 			cell := t.vt.Cell(col, row)
+
+			style := tcell.StyleDefault.
+				Foreground(convertColor(cell.FG)).
+				Background(convertColor(cell.BG))
+
 			screen.SetContent(
 				x+col,
 				y+row,
 				cell.Char,
 				nil,
-				tcell.StyleDefault,
+				style,
 			)
 		}
 	}

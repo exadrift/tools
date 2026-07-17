@@ -1,3 +1,5 @@
+# v0.1.3
+- put back color
 # v0.1.2
 - change pager from ctrl+v to ctrl+p
 # v0.1.1
