@@ -22,7 +22,7 @@ func main() {
 			fmt.Println()
 			fmt.Println("  k                   - invoke kubectl (terminal alias)")
 			fmt.Println("  <tab> / <shift-tab> - change focus through panes right / left")
-			fmt.Println("  <ctrl> + <p>        - execute command at prompt and send output to vi")
+			fmt.Println("  <ctrl> + <v>        - execute command at prompt and send output to vi")
 			os.Exit(0)
 		}
 

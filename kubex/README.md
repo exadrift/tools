@@ -19,4 +19,4 @@ kubex
 ## navigation / command
 - `k` alias to execute `kubectl`
 - `tab`/`shift+tab` switch pane right/left respectively
-- `ctrl+p` execute a command which has been fully typed but `<enter>` has not yet been pressed.  this will execute the command and pipe the output to `vi` for viewing with scrollability
+- `ctrl+v` execute a command which has been fully typed but `<enter>` has not yet been pressed.  this will execute the command and pipe the output to `vi` for viewing with scrollability
