@@ -1,13 +1,27 @@
 package kubectl
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
 )
 
-func run(name string, args ...string) ([]string, error) {
+type Context struct {
+	Namespace string `json:"namespace"`
+}
+
+type NamedContext struct {
+	Name    string  `json:"name"`
+	Context Context `json:"context"`
+}
+
+type Config struct {
+	Contexts []NamedContext `json:"contexts"`
+}
+
+func run_pre_split(name string, args ...string) ([]byte, error) {
 	cmd := exec.Command(name, args...)
 	b, err := cmd.Output()
 	if err != nil {
@@ -16,6 +30,15 @@ func run(name string, args ...string) ([]string, error) {
 			return nil, fmt.Errorf("terminated with exit code %d - %s", exitErr.ExitCode(), string(exitErr.Stderr))
 		}
 
+		return nil, err
+	}
+
+	return b, nil
+}
+
+func run(name string, args ...string) ([]string, error) {
+	b, err := run_pre_split(name, args...)
+	if err != nil {
 		return nil, err
 	}
 
@@ -69,17 +92,22 @@ func GetNamespaces() ([]string, error) {
 	return strippedList, nil
 }
 
-func GetCurrentNamespace() (string, error) {
-	all, err := run("kubectl", "config", "view", "--output", "jsonpath={.contexts[0].context.namespace}")
+func GetCurrentNamespace(curContext string) (string, error) {
+	jsonBytes, err := run_pre_split("kubectl", "config", "view", "--output", "json")
 	if err != nil {
 		return "", err
 	}
 
-	if len(all) == 0 {
-		return "default", nil
+	cfg := Config{}
+	json.Unmarshal(jsonBytes, &cfg)
+
+	for _, ctx := range cfg.Contexts {
+		if ctx.Name == curContext {
+			return ctx.Context.Namespace, nil
+		}
 	}
 
-	return all[0], nil
+	return "default", nil
 }
 
 func SetCurrentNamespace(ns string) error {

@@ -18,7 +18,7 @@ func InitializeDisplay(contextTable *tview.Table, namespaceTable *tview.Table) e
 		return err
 	}
 
-	if curNamespace, err = kubectl.GetCurrentNamespace(); err != nil {
+	if curNamespace, err = kubectl.GetCurrentNamespace(curContext); err != nil {
 		return err
 	}
 
@@ -54,7 +54,7 @@ func PopulateContexts(table *tview.Table) error {
 func PopulateNamespaces(table *tview.Table) error {
 	var err error
 
-	if curNamespace, err = kubectl.GetCurrentNamespace(); err != nil {
+	if curNamespace, err = kubectl.GetCurrentNamespace(curContext); err != nil {
 		return err
 	}
 
