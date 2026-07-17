@@ -227,7 +227,7 @@ func (t *Terminal) InputHandler() func(event *tcell.EventKey, setFocus func(p tv
 		case tcell.KeyCtrlR:
 			_, err = t.pty.Write([]byte{0x12})
 
-		case tcell.KeyCtrlV:
+		case tcell.KeyCtrlP:
 			_, err = t.pty.Write([]byte("| vi -\n"))
 		}
 
