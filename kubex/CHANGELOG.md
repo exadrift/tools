@@ -1,3 +1,6 @@
+# v0.2.0
+- switched to in-house TUI renderer
+- switched to exadrift fork of vt10x with render speed optimization
 # v0.1.3
 - put back color
 # v0.1.2

@@ -6,10 +6,8 @@ import (
 	"os"
 	"os/exec"
 
+	"github.com/exadrift/go/tui"
 	"github.com/exadrift/tools/kubex/internal/display"
-	"github.com/exadrift/tools/kubex/internal/terminal"
-	"github.com/gdamore/tcell/v2"
-	"github.com/rivo/tview"
 )
 
 var Version = ""
@@ -32,80 +30,56 @@ func main() {
 		}
 	}
 
-	gridView := tview.NewGrid()
-	gridView.SetRows(0).SetColumns(30, 30, 0).SetBorder(false)
+	contextMenu := tui.NewMenu()
+	contextMenu.EnableBorder(true).SetTitle("context")
 
-	contextTable := tview.NewTable()
-	contextTable.SetBorder(true).SetTitleAlign(tview.AlignLeft).SetTitle("context")
-	contextTable.SetSelectable(true, true)
+	namespaceMenu := tui.NewMenu()
+	namespaceMenu.EnableBorder(true).SetTitle("namespace")
 
-	namespaceTable := tview.NewTable()
-	namespaceTable.SetBorder(true).SetTitleAlign(tview.AlignLeft).SetTitle("namespace")
-	namespaceTable.SetSelectable(true, true)
-
-	if err := display.InitializeDisplay(contextTable, namespaceTable); err != nil {
+	if err := display.InitializeDisplay(contextMenu, namespaceMenu); err != nil {
 		log.Fatal(err)
 	}
 
-	app := tview.NewApplication()
+	shell := tui.NewShell()
+	shell.EnableBorder(true).SetTitle("terminal")
 
-	term := terminal.New(app, 80, 25)
+	layout := tui.NewFlexLayout(
+		tui.OrientationHorizontal,
+		tui.NewSegment(1, contextMenu),
+		tui.NewSegment(1, namespaceMenu),
+		tui.NewSegment(3, shell),
+	)
 
-	contextTable.SetSelectedFunc(func(row, column int) {
-		if err := display.UpdateContextSelection(row, namespaceTable); err != nil {
+	app := tui.New(layout).SetFocus(shell)
+
+	contextMenu.SetSelectHandler(func(selectedIndex int, selectedItem string) {
+		if err := display.UpdateContextSelection(selectedItem, namespaceMenu); err != nil {
 			log.Fatal(err)
 		}
 
-		app.SetFocus(namespaceTable)
+		app.SetFocus(namespaceMenu)
 	})
 
-	namespaceTable.SetSelectedFunc(func(row, column int) {
-		if err := display.UpdateNamespaceSelection(row); err != nil {
+	namespaceMenu.SetSelectHandler(func(selectedIndex int, selectedItem string) {
+		if err := display.UpdateNamespaceSelection(selectedItem); err != nil {
 			log.Fatal(err)
 		}
 
-		app.SetFocus(term)
+		app.SetFocus(shell)
 	})
 
-	gridView.AddItem(contextTable, 0, 0, 1, 1, 0, 0, true)
-	gridView.AddItem(namespaceTable, 0, 1, 1, 1, 0, 0, true)
-	gridView.AddItem(term, 0, 2, 1, 1, 0, 0, true)
-
-	shell := os.Getenv("SHELL")
-	if shell == "" {
-		shell = "/bin/bash"
+	shellBin := os.Getenv("SHELL")
+	if shellBin == "" {
+		shellBin = "/bin/bash"
 	}
-	cmd := exec.Command(shell)
-	if err := term.Start(cmd); err != nil {
+	cmd := exec.Command(shellBin)
+	if err := shell.Start(app, cmd); err != nil {
 		log.Fatal(err)
 	}
 
-	app.SetInputCapture(func(event *tcell.EventKey) *tcell.EventKey {
-		switch event.Key() {
-		case tcell.KeyBacktab:
-			if contextTable.HasFocus() {
-				app.SetFocus(term)
-			} else if namespaceTable.HasFocus() {
-				app.SetFocus(contextTable)
-			} else {
-				app.SetFocus(namespaceTable)
-			}
-		case tcell.KeyTab:
-			if contextTable.HasFocus() {
-				app.SetFocus(namespaceTable)
-			} else if namespaceTable.HasFocus() {
-				app.SetFocus(term)
-			} else {
-				app.SetFocus(contextTable)
-			}
-		default:
-			return event
-		}
+	shell.CaptureInput("alias k='kubectl'\nclear\n")
 
-		return nil
-	})
-
-	if err := app.SetRoot(gridView, true).SetFocus(term).Run(); err != nil {
+	if err := app.Start(); err != nil {
 		log.Fatal(err)
 	}
 }
