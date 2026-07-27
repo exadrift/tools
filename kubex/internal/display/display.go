@@ -1,8 +1,8 @@
 package display
 
 import (
+	"github.com/exadrift/go/tui"
 	"github.com/exadrift/tools/kubex/internal/kubectl"
-	"github.com/rivo/tview"
 )
 
 var (
@@ -12,7 +12,7 @@ var (
 	curNamespace string
 )
 
-func InitializeDisplay(contextTable *tview.Table, namespaceTable *tview.Table) error {
+func InitializeDisplay(contextMenu *tui.Menu, namespaceMenu *tui.Menu) error {
 	var err error
 	if curContext, err = kubectl.GetCurrentContext(); err != nil {
 		return err
@@ -22,68 +22,57 @@ func InitializeDisplay(contextTable *tview.Table, namespaceTable *tview.Table) e
 		return err
 	}
 
-	if err = PopulateContexts(contextTable); err != nil {
+	if err = PopulateContexts(contextMenu); err != nil {
 		return err
 	}
 
-	if err = PopulateNamespaces(namespaceTable); err != nil {
+	if err = PopulateNamespaces(namespaceMenu); err != nil {
 		return err
 	}
+
+	contextMenu.SetSelectedItem(curContext)
+	namespaceMenu.SetSelectedItem(curNamespace)
 
 	return nil
 }
 
-func PopulateContexts(table *tview.Table) error {
+func PopulateContexts(menu *tui.Menu) error {
 	var err error
-	table.Clear()
 	contexts, err = kubectl.GetContexts()
 	if err != nil {
 		return err
 	}
-
-	for i, name := range contexts {
-		table.SetCell(i, 0, tview.NewTableCell(name))
-		if name == curContext {
-			table.Select(i, 0)
-		}
-	}
+	menu.SetContents(contexts...)
 
 	return nil
 }
 
-func PopulateNamespaces(table *tview.Table) error {
+func PopulateNamespaces(menu *tui.Menu) error {
 	var err error
 
 	if curNamespace, err = kubectl.GetCurrentNamespace(curContext); err != nil {
 		return err
 	}
 
-	table.Clear()
 	namespaces, err = kubectl.GetNamespaces()
 	if err != nil {
 		return err
 	}
-
-	for i, name := range namespaces {
-		table.SetCell(i, 0, tview.NewTableCell(name))
-		if name == curNamespace {
-			table.Select(i, 0)
-		}
-	}
+	menu.SetContents(namespaces...)
 
 	return nil
 }
 
-func UpdateContextSelection(index int, namespaceTable *tview.Table) error {
-	curContext = contexts[index]
-	if err := kubectl.SetCurrentContext(curContext); err != nil {
+func UpdateContextSelection(selectedContext string, namespaceMenu *tui.Menu) error {
+	curContext = selectedContext
+	if err := kubectl.SetCurrentContext(selectedContext); err != nil {
 		return err
 	}
 
-	return PopulateNamespaces(namespaceTable)
+	return PopulateNamespaces(namespaceMenu)
 }
 
-func UpdateNamespaceSelection(index int) error {
-	curNamespace = namespaces[index]
+func UpdateNamespaceSelection(selectedNamespace string) error {
+	curNamespace = selectedNamespace
 	return kubectl.SetCurrentNamespace(curNamespace)
 }
