@@ -30,6 +30,9 @@ func InitializeDisplay(contextMenu *tui.Menu, namespaceMenu *tui.Menu) error {
 		return err
 	}
 
+	contextMenu.SetSelectedItem(curContext)
+	namespaceMenu.SetSelectedItem(curNamespace)
+
 	return nil
 }
 
