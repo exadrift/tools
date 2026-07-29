@@ -1,3 +1,5 @@
+# v0.2.1
+- updated TUI with better scrolling
 # v0.2.0
 - switched to in-house TUI renderer
 - switched to exadrift fork of vt10x with render speed optimization

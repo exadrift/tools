@@ -1,7 +1,7 @@
 # github.com/creack/pty v1.1.24
 ## explicit; go 1.18
 github.com/creack/pty
-# github.com/exadrift/go/tui v0.0.1
+# github.com/exadrift/go/tui v0.0.3
 ## explicit; go 1.26.4
 github.com/exadrift/go/tui
 github.com/exadrift/go/tui/internal/terminal

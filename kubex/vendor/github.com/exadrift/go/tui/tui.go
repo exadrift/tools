@@ -20,6 +20,7 @@ type Widget interface {
 	GetFocalWidgets(me Widget, focalWidgets *FocalWidgets)
 	CanHaveFocus() bool
 	AbsorbsInput(input string) bool
+	ResetScrollPosition()
 }
 
 type FocalWidgets struct {

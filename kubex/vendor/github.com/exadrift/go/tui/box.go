@@ -44,10 +44,17 @@ type Box struct {
 	// alignment         Alignment
 	dimensions        Dimensions
 	contentDimensions Dimensions
+	scrollWindow      *ScrollWindow
 }
 
 func NewBox() *Box {
-	return &Box{}
+	return &Box{
+		scrollWindow: NewScrollWindow(),
+	}
+}
+
+func (b *Box) Reset() {
+	b.scrollWindow.Reset()
 }
 
 func (b *Box) Box() *Box {
@@ -84,10 +91,23 @@ func (b *Box) SetDimensions(left int, top int, width int, height int) {
 		b.contentDimensions.Width = width
 		b.contentDimensions.Height = height
 	}
+
+	b.scrollWindow.SetDimensions(b.contentDimensions.Left, b.contentDimensions.Top, b.contentDimensions.Width, b.contentDimensions.Height)
 }
 
 func (b *Box) GetBox() *Box {
 	return b
+}
+
+func (b *Box) RenderWithScroll(mode RenderMode, focusItem Widget, contentRows int, focusPosition int, callback func(index int) string) {
+	// render the base box first
+	if focusPosition == -1 {
+		focusPosition = b.scrollWindow.scrollPosition
+	}
+
+	b.Render(mode, focusItem)
+	b.scrollWindow.SetFocusPosition(focusPosition)
+	b.scrollWindow.Render(contentRows, callback)
 }
 
 func (b *Box) Render(mode RenderMode, focusItem Widget) {
@@ -198,4 +218,8 @@ func (b *Box) Collect(me Widget) []Widget {
 	}
 
 	return widgets
+}
+
+func (b *Box) ResetScrollPosition() {
+	b.scrollWindow.Reset()
 }
