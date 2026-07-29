@@ -50,14 +50,15 @@ const (
 	ShiftTab  = "\x1b[Z"
 
 	RenderFullCode = "\x1b[RENDER"
+	StyleReset     = "\x1b[0m"
 )
 
-func StyleFg(color int, text string) string {
-	return fmt.Sprintf("\x1b[%dm%s\x1b[0m", color, text)
+func StyleFg(color int) string {
+	return fmt.Sprintf("\x1b[%dm", color)
 }
 
-func StyleFgBg(fgColor int, bgColor int, text string) string {
-	return fmt.Sprintf("\x1b[%d;%dm%s\x1b[0m", fgColor, bgColor+10, text)
+func StyleFgBg(fgColor int, bgColor int) string {
+	return fmt.Sprintf("\x1b[%d;%dm", fgColor, bgColor+10)
 }
 
 func StripAnsiCodes(text string) string {
