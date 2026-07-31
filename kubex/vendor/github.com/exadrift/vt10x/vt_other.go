@@ -1,3 +1,4 @@
+//go:build plan9 || nacl || windows
 // +build plan9 nacl windows
 
 package vt10x
@@ -15,7 +16,7 @@ type terminal struct {
 }
 
 func newTerminal(info TerminalInfo) *terminal {
-	t := &terminal{newState(info.w)}
+	t := &terminal{newState(info.w, info.historyLength)}
 	t.init(info.cols, info.rows)
 	return t
 }

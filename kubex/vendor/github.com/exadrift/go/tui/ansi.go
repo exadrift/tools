@@ -7,7 +7,8 @@ import (
 )
 
 var ansiEscStripper = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
-var textWrapTokenizer = regexp.MustCompile(`(\x1b\[[0-9;]*[a-zA-Z])|(\n)`)
+var textWrapTokenizerNewline = regexp.MustCompile(`(\x1b\[[0-9;]*[a-zA-Z])|(\n)`)
+var spaces = strings.Repeat(" ", 10000)
 
 type TokenType int
 
@@ -48,6 +49,8 @@ const (
 	CtrlC     = string(rune(3))
 	Tab       = "\x09"
 	ShiftTab  = "\x1b[Z"
+	CtrlPgUp  = "\x1b[5;5~"
+	CtrlPgDn  = "\x1b[6;5~"
 
 	RenderFullCode = "\x1b[RENDER"
 	StyleReset     = "\x1b[0m"
@@ -65,10 +68,10 @@ func StripAnsiCodes(text string) string {
 	return ansiEscStripper.ReplaceAllString(text, "")
 }
 
-// SplitAtAnsiTokens splits text into a slice of StringTokens which represent either
+// SplitAtAnsiTokensAndNewline splits text into a slice of StringTokens which represent either
 // regular text, or an ANSI escape sequence
-func SplitAtAnsiTokens(text string) []*StringToken {
-	matches := textWrapTokenizer.FindAllStringIndex(text, -1)
+func SplitAtAnsiTokensAndNewline(text string) []*StringToken {
+	matches := ansiEscStripper.FindAllStringIndex(text, -1)
 	if len(matches) == 0 {
 		return []*StringToken{{
 			Text:      text,
@@ -112,6 +115,88 @@ func SplitAtAnsiTokens(text string) []*StringToken {
 	}
 
 	return tokens
+}
+
+// SplitAtAnsiTokens splits text into a slice of StringTokens which represent either
+// regular text, or an ANSI escape sequence
+func SplitAtAnsiTokens(text string) []*StringToken {
+	matches := textWrapTokenizerNewline.FindAllStringIndex(text, -1)
+	if len(matches) == 0 {
+		return []*StringToken{{
+			Text:      text,
+			TokenType: TokenTypeText,
+		}}
+	}
+
+	var tokens []*StringToken
+	prevEnd := 0
+	for _, match := range matches {
+		start, end := match[0], match[1]
+		var ty TokenType
+		switch text[start] {
+		case '\n':
+			ty = TokenTypeNewline
+		default:
+			ty = TokenTypeAnsiCode
+		}
+		if start-prevEnd > 0 {
+			tokens = append(tokens, &StringToken{
+				Text:      text[prevEnd:start],
+				TokenType: TokenTypeText,
+			}, &StringToken{
+				Text:      text[start:end],
+				TokenType: ty,
+			})
+		} else {
+			tokens = append(tokens, &StringToken{
+				Text:      text[start:end],
+				TokenType: ty,
+			})
+		}
+		prevEnd = end
+	}
+
+	if len(text) > prevEnd {
+		tokens = append(tokens, &StringToken{
+			Text:      text[prevEnd:],
+			TokenType: TokenTypeText,
+		})
+	}
+
+	return tokens
+}
+
+func ConstrainAnsiFullWidth(text string, width int) string {
+	var remaining int
+	totalWidth := 0
+	var stringBuilder strings.Builder
+	stringBuilder.Grow(len(text))
+	tokens := SplitAtAnsiTokens(text)
+	for _, token := range tokens {
+		switch token.TokenType {
+		case TokenTypeAnsiCode:
+			stringBuilder.WriteString(token.Text)
+		default:
+			remaining = width - totalWidth
+			if remaining == 0 {
+				continue
+			}
+			strLen := len(token.Text)
+			if strLen < remaining {
+				stringBuilder.WriteString(token.Text)
+				totalWidth += strLen
+			} else {
+				stringBuilder.WriteString(token.Text[:remaining])
+				totalWidth += remaining
+			}
+		}
+	}
+
+	if totalWidth < width {
+		stringBuilder.WriteString(spaces[:width-totalWidth])
+	}
+
+	return stringBuilder.String()
 }
 
 // Returns an array of text which separates each line of text at the wrapping point (width)

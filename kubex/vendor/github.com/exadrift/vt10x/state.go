@@ -6,6 +6,8 @@ import (
 	"log"
 	"strings"
 	"sync"
+
+	"github.com/exadrift/go/ringbuf"
 )
 
 const (
@@ -105,12 +107,15 @@ type State struct {
 	tabs          []bool
 	title         string
 	colorOverride map[Color]Color
+	historyBuffer *ringbuf.RingBuffer[string]
+	historyTarget []string
 }
 
-func newState(w io.Writer) *State {
+func newState(w io.Writer, historyLength int) *State {
 	return &State{
 		w:             w,
 		colorOverride: make(map[Color]Color),
+		historyBuffer: ringbuf.New[string](historyLength),
 	}
 }
 
@@ -160,51 +165,55 @@ func (t *State) Cell(x, y int) Glyph {
 	return cell
 }
 
+func (t *State) AnsiRow(builder *strings.Builder, rowNum int, prevFg *Color, prevBg *Color) string {
+	var fg, bg Color
+	var cell *Glyph
+	builder.Grow(MaxLen)
+	for x := 0; x < t.cols; x++ {
+		// eliminate the copying of the glyph, this really slows down the render
+		cell = &t.lines[rowNum][x]
+
+		if ovrFg, ok := t.colorOverride[cell.FG]; ok {
+			fg = ovrFg
+		} else {
+			fg = cell.FG
+		}
+
+		if ovrBg, ok := t.colorOverride[cell.BG]; ok {
+			bg = ovrBg
+		} else {
+			bg = cell.BG
+		}
+
+		if *prevFg != fg {
+			fmt.Fprintf(builder, "\x1b[%dm", 30+ansiColorMap[fg])
+			*prevFg = fg
+		}
+		if *prevBg != bg {
+			fmt.Fprintf(builder, "\x1b[%dm", 40+ansiColorMap[bg])
+			*prevBg = bg
+		}
+
+		builder.WriteRune(cell.Char)
+	}
+	builder.WriteString(AnsiReset)
+	ret := builder.String()
+	builder.Reset()
+
+	return ret
+}
+
 // AnsiRows returns the contents as a list of ANSI strings
 func (t *State) AnsiRows() []string {
 	var retRows = make([]string, t.rows)
-	var fg, bg Color
 
-	var cell *Glyph
 	var builder strings.Builder
 
 	prevFg := DefaultFG
 	prevBg := DefaultBG
 
 	for y := 0; y < t.rows; y++ {
-		// if we trip this max len, it just means the builder will have to dynamically allocate, it's not so bad,
-		// plus 1000 chars is pretty wide, so it's unlikely to hit that limit
-		builder.Grow(MaxLen)
-		for x := 0; x < t.cols; x++ {
-			// eliminate the copying of the glyph, this really slows down the render
-			cell = &t.lines[y][x]
-
-			if ovrFg, ok := t.colorOverride[cell.FG]; ok {
-				fg = ovrFg
-			} else {
-				fg = cell.FG
-			}
-
-			if ovrBg, ok := t.colorOverride[cell.BG]; ok {
-				bg = ovrBg
-			} else {
-				bg = cell.BG
-			}
-
-			if prevFg != fg {
-				fmt.Fprintf(&builder, "\x1b[%dm", 30+ansiColorMap[fg])
-				prevFg = fg
-			}
-			if prevBg != bg {
-				fmt.Fprintf(&builder, "\x1b[%dm", 40+ansiColorMap[bg])
-				prevBg = bg
-			}
-
-			builder.WriteRune(cell.Char)
-		}
-		builder.WriteString(AnsiReset)
-		retRows[y] = builder.String()
-		builder.Reset()
+		retRows[y] = t.AnsiRow(&builder, y, &prevFg, &prevBg)
 	}
 
 	return retRows
@@ -285,6 +294,11 @@ func (t *State) putTab(forward bool) {
 func (t *State) newline(firstCol bool) {
 	y := t.cur.Y
 	if y == t.bottom {
+		// put the last row of the screen buffer in the scrollback
+		prevFg := DefaultFG
+		prevBg := DefaultBG
+		t.historyBuffer.Push(t.AnsiRow(&strings.Builder{}, 0, &prevFg, &prevBg))
+
 		cur := t.cur
 		t.cur = t.defaultCursor()
 		t.scrollUp(t.top, 1)
@@ -309,6 +323,35 @@ var gfxCharTable = [62]rune{
 	'␤', '␋', '┘', '┐', '┌', '└', '┼', '⎺', // h - o
 	'⎻', '─', '⎼', '⎽', '├', '┤', '┴', '┬', // p - w
 	'│', '≤', '≥', 'π', '≠', '£', '·', // x - ~
+}
+
+// History returns the history buffer starting from a negative offset point from the present moment.  An offset of zero
+// represents the current moment in time, which will represent the last row in the returned array.  The returned array will
+// contain one vertical terminal worth of rows.
+func (t *State) History(offset int) []string {
+	var builder strings.Builder
+	curRow := 0
+	offset = offset - t.rows
+	for i := 0; i < t.rows; i++ {
+		finalOffset := offset + i
+		if finalOffset < -t.rows {
+			// if the offset is beyond t.rows as a negative number, then this comes from the history buffer
+			t.historyTarget[curRow] = t.historyBuffer.Item(finalOffset + t.rows)
+		} else {
+			prevFg := DefaultFG
+			prevBg := DefaultBG
+			t.historyTarget[curRow] = t.AnsiRow(&builder, t.rows+finalOffset, &prevFg, &prevBg)
+		}
+
+		curRow++
+	}
+
+	return t.historyTarget
+}
+
+// HistoryBufferLength returns the length of the history buffer, including the active termninal height
+func (t *State) HistoryBufferLength() int {
+	return t.rows + t.historyBuffer.Length()
 }
 
 func (t *State) setChar(c rune, attr *Glyph, x, y int) {
@@ -410,6 +453,8 @@ func (t *State) resize(cols, rows int) bool {
 		}
 		t.swapScreen()
 	}
+	// this is where a render of the history buffer gets but
+	t.historyTarget = make([]string, t.rows)
 	return slide > 0
 }
 

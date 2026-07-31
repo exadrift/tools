@@ -29,6 +29,8 @@ func (t *Text) Render(mode RenderMode, focusItem Widget) {
 	dimensions := t.GetContentDimensions()
 	lines := WrapTextBasic(t.Contents, dimensions.Width)
 
+	t.scrollWindow.scrollHandleEnabled = len(lines) > dimensions.Height
+
 	t.RenderWithScroll(mode, focusItem, len(lines), -1, func(index int) string {
 		return Pad(lines[index], dimensions.Width)
 	})

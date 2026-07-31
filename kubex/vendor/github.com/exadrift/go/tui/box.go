@@ -2,6 +2,7 @@ package tui
 
 import (
 	"fmt"
+	"math"
 
 	"github.com/exadrift/go/tui/internal/terminal"
 )
@@ -45,6 +46,7 @@ type Box struct {
 	dimensions        Dimensions
 	contentDimensions Dimensions
 	scrollWindow      *ScrollWindow
+	contentRows       int
 }
 
 func NewBox() *Box {
@@ -58,6 +60,13 @@ func (b *Box) Reset() {
 }
 
 func (b *Box) Box() *Box {
+	return b
+}
+
+// EnableScrollHandle causes the scroll handle to be drawn when enabled.  The scroll handle
+// can only be drawn when a border is rendered.
+func (b *Box) EnableScrollHandle(enable bool) *Box {
+	b.scrollWindow.ScrollHandleEnabled(enable)
 	return b
 }
 
@@ -105,14 +114,21 @@ func (b *Box) RenderWithScroll(mode RenderMode, focusItem Widget, contentRows in
 		focusPosition = b.scrollWindow.scrollPosition
 	}
 
-	b.Render(mode, focusItem)
+	b.contentRows = contentRows
+
 	b.scrollWindow.SetFocusPosition(focusPosition)
+	b.scrollWindow.AdjustScrollPostition(contentRows)
+	b.Render(mode, focusItem)
 	b.scrollWindow.Render(contentRows, callback)
 }
 
 func (b *Box) Render(mode RenderMode, focusItem Widget) {
-	if mode == RenderModeAll || mode == RenderModeBorder {
-		if b.hasBorder && b.dimensions.Width >= 3 && b.dimensions.Height >= 3 {
+	sw := b.scrollWindow
+	if mode == RenderModeAll || mode == RenderModeBorder || sw.scrollHandleEnabled {
+		dimensions := b.dimensions
+		if b.hasBorder && dimensions.Width >= 3 && dimensions.Height >= 3 {
+			inFocus := focusItem != nil && b == focusItem.GetBox()
+
 			var (
 				topLeft     string
 				horiz       string
@@ -122,7 +138,7 @@ func (b *Box) Render(mode RenderMode, focusItem Widget) {
 				bottomRight string
 			)
 
-			if focusItem != nil && b == focusItem.GetBox() {
+			if inFocus {
 				topLeft = BorderDoubleTopLeftCorner
 				horiz = BorderDoubleHoriz
 				topRight = BorderDoubleTopRightCorner
@@ -138,36 +154,52 @@ func (b *Box) Render(mode RenderMode, focusItem Widget) {
 				bottomRight = BorderSingleBottomRightCorner
 			}
 
-			terminal.SetCursorPos(b.dimensions.Left, b.dimensions.Top)
+			terminal.SetCursorPos(dimensions.Left, dimensions.Top)
 			fmt.Print(topLeft)
-			for i := 1; i < b.dimensions.Width-1; i++ {
+			for i := 1; i < dimensions.Width-1; i++ {
 				fmt.Print(horiz)
 			}
 			fmt.Print(topRight)
-			for i := 1; i < b.dimensions.Height-1; i++ {
-				terminal.SetCursorPos(b.dimensions.Left, b.dimensions.Top+i)
+
+			// represents what portion of the total content is visible
+			contentHeight := b.contentDimensions.Height
+			startFraction := float64(sw.scrollPosition) / float64(b.contentRows)
+			endFraction := float64(sw.scrollPosition+contentHeight) / float64(b.contentRows)
+			startRow := int(math.Round(startFraction * float64(contentHeight)))
+			endRow := int(math.Round(endFraction * float64(contentHeight)))
+
+			contentRow := 0
+			for i := 1; i < dimensions.Height-1; i++ {
+				terminal.SetCursorPos(dimensions.Left, dimensions.Top+i)
 				fmt.Print(vert)
 
 				if mode == RenderModeAll {
-					for i := 1; i < b.dimensions.Width-1; i++ {
+					for i := 1; i < dimensions.Width-1; i++ {
 						fmt.Print(" ")
 					}
 				} else {
-					terminal.SetCursorPos(b.dimensions.Left+b.dimensions.Width-1, b.dimensions.Top+i)
+					terminal.SetCursorPos(dimensions.Left+dimensions.Width-1, dimensions.Top+i)
 				}
 
-				fmt.Print(vert)
+				if sw.scrollHandleEnabled && contentRow >= startRow && contentRow <= endRow {
+					// draw the scroll handle if it's visible
+					fmt.Printf("▒")
+				} else {
+					fmt.Print(vert)
+				}
+
+				contentRow++
 			}
-			terminal.SetCursorPos(b.dimensions.Left, b.dimensions.Top+b.dimensions.Height-1)
+			terminal.SetCursorPos(dimensions.Left, dimensions.Top+dimensions.Height-1)
 			fmt.Print(bottomLeft)
-			for i := 1; i < b.dimensions.Width-1; i++ {
+			for i := 1; i < dimensions.Width-1; i++ {
 				fmt.Print(horiz)
 			}
 			fmt.Print(bottomRight)
 
 			if b.title != "" {
-				terminal.SetCursorPos(b.dimensions.Left+2, b.dimensions.Top)
-				avail := b.dimensions.Width - 4
+				terminal.SetCursorPos(dimensions.Left+2, dimensions.Top)
+				avail := dimensions.Width - 4
 				if avail > 2 {
 					fmt.Print(Constrain(b.title, avail))
 				}

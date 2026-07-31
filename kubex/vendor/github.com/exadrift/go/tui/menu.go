@@ -74,7 +74,10 @@ func (m *Menu) SetSelectedItem(item string) *Menu {
 }
 
 func (m *Menu) Render(mode RenderMode, focusItem Widget) {
-	m.RenderWithScroll(mode, focusItem, len(m.contents), m.selectedIndex, func(index int) string {
+	contentLength := len(m.contents)
+	m.EnableScrollHandle(contentLength > m.contentDimensions.Height)
+
+	m.RenderWithScroll(mode, focusItem, contentLength, m.selectedIndex, func(index int) string {
 		menuLabel := Pad(Constrain(m.contents[index], m.contentDimensions.Width), m.contentDimensions.Width)
 		switch index {
 		case m.selectedIndex:
