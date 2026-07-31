@@ -1,3 +1,5 @@
+# v0.0.4
+- add scrollback and history buffer render method
 # v0.0.3
 - ensure that initial color is not set if default
 # v0.0.2

@@ -1,12 +1,15 @@
 # github.com/creack/pty v1.1.24
 ## explicit; go 1.18
 github.com/creack/pty
-# github.com/exadrift/go/tui v0.0.3
+# github.com/exadrift/go/ringbuf v0.0.1
+## explicit; go 1.26.4
+github.com/exadrift/go/ringbuf
+# github.com/exadrift/go/tui v0.0.4
 ## explicit; go 1.26.4
 github.com/exadrift/go/tui
 github.com/exadrift/go/tui/internal/terminal
-# github.com/exadrift/vt10x v0.0.3
-## explicit; go 1.26
+# github.com/exadrift/vt10x v0.0.4
+## explicit; go 1.26.4
 github.com/exadrift/vt10x
 # golang.org/x/sys v0.47.0
 ## explicit; go 1.25.0

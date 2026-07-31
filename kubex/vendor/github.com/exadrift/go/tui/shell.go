@@ -14,14 +14,15 @@ import (
 
 type Shell struct {
 	*Box
-	term       vt10x.Terminal
-	ptyFile    *os.File
-	renderChan chan string
+	term         vt10x.Terminal
+	ptyFile      *os.File
+	renderChan   chan string
+	scrollOffest int
 }
 
 func NewShell() *Shell {
 	return &Shell{
-		Box:        NewBox(),
+		Box:        NewBox().EnableScrollHandle(true),
 		term:       vt10x.New(vt10x.WithSize(40, 25)),
 		renderChan: make(chan string, 1000),
 	}
@@ -77,11 +78,27 @@ func (s *Shell) Render(mode RenderMode, focusItem Widget) {
 		}
 	}
 
-	s.Box.Render(mode, focusItem)
+	historyLength := s.term.HistoryBufferLength()
 
-	for y, ansiRow := range s.term.AnsiRows() {
-		terminal.SetCursorPos(contentDims.Left, contentDims.Top+y)
-		fmt.Print(ansiRow)
+	zeroScroll := historyLength - contentDims.Height
+	if zeroScroll+s.scrollOffest < 0 {
+		s.scrollOffest = 0 - zeroScroll
+	}
+
+	s.scrollWindow.scrollPosition = zeroScroll + s.scrollOffest
+	if s.scrollOffest == 0 {
+		s.RenderWithScroll(mode, focusItem, historyLength, -1, nil)
+		for y, ansiRow := range s.term.AnsiRows() {
+			terminal.SetCursorPos(contentDims.Left, contentDims.Top+y)
+			fmt.Print(ansiRow)
+		}
+	} else {
+		hist := s.term.History(0 + s.scrollOffest)
+		s.RenderWithScroll(mode, focusItem, historyLength, -1, func(index int) string {
+			// index here is going to be based from the beginning of history, so we need to account for that by subtracting the scroll position
+			// the history buffer width could be different from the current terminal width, and thus we must constrain the width
+			return ConstrainAnsiFullWidth(hist[index-s.scrollWindow.scrollPosition], contentDims.Width)
+		})
 	}
 
 	if s == focusItem {
@@ -93,7 +110,19 @@ func (s *Shell) Render(mode RenderMode, focusItem Widget) {
 }
 
 func (s *Shell) CaptureInput(r string) string {
-	_, _ = s.ptyFile.Write([]byte(r))
+	switch r {
+	case CtrlPgUp:
+		s.scrollOffest -= s.dimensions.Height / 2
+	case CtrlPgDn:
+		s.scrollOffest += s.dimensions.Height / 2
+		if s.scrollOffest > 0 {
+			s.scrollOffest = 0
+		}
+	default:
+		s.scrollOffest = 0
+		_, _ = s.ptyFile.Write([]byte(r))
+	}
+
 	return ""
 }
 

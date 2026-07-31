@@ -6,6 +6,8 @@ import (
 	"io"
 )
 
+const DefaultHistoryBufferSize int = 10000
+
 // Terminal represents the virtual terminal emulator.
 type Terminal interface {
 	// View displays the virtual terminal.
@@ -44,6 +46,13 @@ type View interface {
 	// AnsiRows returns the contents as a list of ANSI strings
 	AnsiRows() []string
 
+	// History returns a viewport sized array of lines representing the scrollback history, starting from offset.
+	// An offset of zero represents the current moment in time
+	History(offset int) []string
+
+	// HistoryBufferLength returns the length of the history buffer, including the active termninal height
+	HistoryBufferLength() int
+
 	// Cursor returns the current position of the cursor.
 	Cursor() Cursor
 
@@ -60,8 +69,9 @@ type View interface {
 type TerminalOption func(*TerminalInfo)
 
 type TerminalInfo struct {
-	w          io.Writer
-	cols, rows int
+	w             io.Writer
+	cols, rows    int
+	historyLength int
 }
 
 func WithWriter(w io.Writer) TerminalOption {
@@ -77,12 +87,19 @@ func WithSize(cols, rows int) TerminalOption {
 	}
 }
 
+func WithHistoryBuffer(historyLength int) TerminalOption {
+	return func(info *TerminalInfo) {
+		info.historyLength = historyLength
+	}
+}
+
 // New returns a new virtual terminal emulator.
 func New(opts ...TerminalOption) Terminal {
 	info := TerminalInfo{
-		w:    io.Discard,
-		cols: 80,
-		rows: 24,
+		w:             io.Discard,
+		cols:          80,
+		rows:          24,
+		historyLength: DefaultHistoryBufferSize,
 	}
 	for _, opt := range opts {
 		opt(&info)

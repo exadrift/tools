@@ -7,8 +7,9 @@ import (
 )
 
 type ScrollWindow struct {
-	scrollPosition int
-	dimensions     Dimensions
+	scrollPosition      int
+	dimensions          Dimensions
+	scrollHandleEnabled bool
 }
 
 func NewScrollWindow() *ScrollWindow {
@@ -17,6 +18,11 @@ func NewScrollWindow() *ScrollWindow {
 
 func (sw *ScrollWindow) Reset() {
 	sw.scrollPosition = 0
+}
+
+func (sw *ScrollWindow) ScrollHandleEnabled(enabled bool) *ScrollWindow {
+	sw.scrollHandleEnabled = enabled
+	return sw
 }
 
 func (sw *ScrollWindow) SetDimensions(left int, top int, width int, height int) {
@@ -43,7 +49,7 @@ func (sw *ScrollWindow) SetFocusPosition(focusIndex int) {
 	}
 }
 
-func (sw *ScrollWindow) Render(contentRows int, callback func(index int) string) {
+func (sw *ScrollWindow) AdjustScrollPostition(contentRows int) {
 	dimensions := sw.dimensions
 
 	// adjust the scroll position to the given dimensions, ensuring that we aren't over scrolled
@@ -59,14 +65,20 @@ func (sw *ScrollWindow) Render(contentRows int, callback func(index int) string)
 	} else if sw.scrollPosition < 0 {
 		sw.scrollPosition = 0
 	}
+}
 
-	curRow := 0
-	for i := sw.scrollPosition; i < contentRows; i++ {
-		if curRow >= dimensions.Height {
-			break
+func (sw *ScrollWindow) Render(contentRows int, callback func(index int) string) {
+	dimensions := sw.dimensions
+
+	if callback != nil {
+		curRow := 0
+		for i := sw.scrollPosition; i < contentRows; i++ {
+			if curRow >= dimensions.Height {
+				break
+			}
+			terminal.SetCursorPos(dimensions.Left, dimensions.Top+curRow)
+			fmt.Print(callback(i))
+			curRow++
 		}
-		terminal.SetCursorPos(dimensions.Left, dimensions.Top+curRow)
-		fmt.Print(callback(i))
-		curRow++
 	}
 }

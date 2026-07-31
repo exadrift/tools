@@ -1,3 +1,5 @@
+# v0.2.2
+- updated terminal with integrated history buffer
 # v0.2.1
 - updated TUI with better scrolling
 # v0.2.0
