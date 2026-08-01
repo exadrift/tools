@@ -1,3 +1,5 @@
+# v0.2.3
+- fixed title redraw artifacting
 # v0.2.2
 - updated terminal with integrated history buffer
 # v0.2.1

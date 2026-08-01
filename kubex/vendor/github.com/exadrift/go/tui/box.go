@@ -3,6 +3,7 @@ package tui
 import (
 	"fmt"
 	"math"
+	"strings"
 
 	"github.com/exadrift/go/tui/internal/terminal"
 )
@@ -155,11 +156,24 @@ func (b *Box) Render(mode RenderMode, focusItem Widget) {
 			}
 
 			terminal.SetCursorPos(dimensions.Left, dimensions.Top)
-			fmt.Print(topLeft)
-			for i := 1; i < dimensions.Width-1; i++ {
-				fmt.Print(horiz)
+			topString := []rune(strings.Repeat(horiz, dimensions.Width))
+			topString[0] = []rune(topLeft)[0]
+			topString[len(topString)-1] = []rune(topRight)[0]
+			topStringLen := len(topString)
+
+			if b.title != "" {
+				avail := dimensions.Width - 4
+				if avail > 2 {
+					titleString := []rune(Constrain(b.title, avail))
+					tsLen := len(titleString)
+					for i := 0; i < len(titleString); i++ {
+						if i < tsLen && i+2 < topStringLen {
+							topString[i+2] = titleString[i]
+						}
+					}
+				}
 			}
-			fmt.Print(topRight)
+			fmt.Print(string(topString))
 
 			// represents what portion of the total content is visible
 			contentHeight := b.contentDimensions.Height
@@ -196,14 +210,6 @@ func (b *Box) Render(mode RenderMode, focusItem Widget) {
 				fmt.Print(horiz)
 			}
 			fmt.Print(bottomRight)
-
-			if b.title != "" {
-				terminal.SetCursorPos(dimensions.Left+2, dimensions.Top)
-				avail := dimensions.Width - 4
-				if avail > 2 {
-					fmt.Print(Constrain(b.title, avail))
-				}
-			}
 		}
 	}
 }
