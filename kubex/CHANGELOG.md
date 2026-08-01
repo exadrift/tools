@@ -1,3 +1,5 @@
+# v0.2.4
+- setup multi-architecture builds intially
 # v0.2.3
 - fixed title redraw artifacting
 # v0.2.2

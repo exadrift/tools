@@ -6,8 +6,11 @@ GO_IMAGE := golang:$(GO_VERSION)-alpine
 MOUNT ?=
 DOCKER_CMD := docker run --network host --rm -e CGO_ENABLED=0 -e HOME=$$HOME -v $$HOME:$$HOME -v $(shell pwd):/build -v /tmp:/tmp -v /var/run/docker.sock:/var/run/docker.sock $(MOUNT) -w /build
 GO_RUN_USER := $(DOCKER_CMD) -u $(shell id -u):$(shell id -g) $(GO_IMAGE) go
+BUILD_ARGS := -u $(shell id -u):$(shell id -g) $(GO_IMAGE) go build -trimpath -ldflags="-s -w -X 'main.Version=$(VERSION)'" -mod=vendor
 GO_RUN_ROOT := $(DOCKER_CMD) $(GO_IMAGE) go
 GO_FILES := $(shell find . -type f -path **/*.go -not -path "./vendor/*")
+OS ?= $(shell uname -s | tr '[:upper:]' '[:lower:]')
+ARCH ?= $(shell uname -m | sed 's/x86_64/amd64/')
 IMAGE_NAME := exadrift/$(NAME)
 IMAGE_TAG := $(IMAGE_NAME):$(VERSION)
 
@@ -29,28 +32,26 @@ lint-check:
 	docker run -t --rm -v $(shell pwd):/app -w /app golangci/golangci-lint:v$(LINTER_VERSION) golangci-lint run
 
 .PHONY: build
-build: build-docker
+build:
+	# build all supported os/architectures
+	OS=linux ARCH=amd64 make -f ../Makefile-go build-one
+	OS=darwin ARCH=amd64 make -f ../Makefile-go build-one
+	OS=darwin ARCH=arm64 make -f ../Makefile-go build-one
 
-.PHONY: build-docker
-build-docker: bin/$(NAME)
-	docker build --build-arg NAME=$(NAME) -t $(IMAGE_TAG) .
+.PHONY: build-one
+build-one: bin/$(NAME)-$(OS)-$(ARCH)
 
-.PHONY: publish
-publish: build-docker
-	docker push $(IMAGE_TAG)
-
-bin/$(NAME): $(GO_FILES)
-	$(GO_RUN_USER) build -trimpath -ldflags="-s -w -X 'main.Version=$(VERSION)'" -mod=vendor -o ./bin/$(NAME) *.go
+bin/$(NAME)-$(OS)-$(ARCH):
+	$(DOCKER_CMD) -e GOOS=$(OS) -e GOARCH=$(ARCH) $(BUILD_ARGS) -o ./bin/$(NAME)-$(OS)-$(ARCH) *.go
 
 .PHONY: install
-install: bin/$(NAME)
-	cp ./bin/$(NAME) /usr/local/bin/
+install: build-one
+	cp ./bin/$(NAME)-$(OS)-$(ARCH) /usr/local/bin/
 
 .PHONY: run
-run: bin/$(NAME)
-	./bin/$(NAME)
+run: build-one
+	./bin/$(NAME)-$(OS)-$(ARCH)
 
 .PHONY: clean
 clean:
 	rm -rf bin
-	docker image rm -f $(IMAGE_TAG)
