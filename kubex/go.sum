@@ -4,8 +4,8 @@ github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/exadrift/go/ringbuf v0.0.1 h1:8XL/++4CuR4/nakry0hiN2H6RVW6NN5fiEl6NPrbrXE=
 github.com/exadrift/go/ringbuf v0.0.1/go.mod h1:NrzM7Kipwul9lUtUn/5s0pJl3rWPFuhxCLaZo+mDrW4=
-github.com/exadrift/go/tui v0.0.4 h1:5pGLmJo/TZFDEhj9nHP3lPef8Uuz2XBUS84u1dDOInU=
-github.com/exadrift/go/tui v0.0.4/go.mod h1:Qdd5Cuasgscap/AuHdKk5sr3x/3yoHmWYy3qapGAqSM=
+github.com/exadrift/go/tui v0.0.5 h1:srwaJIH9qQSPntR1iImGGM8Ti0QVhNtsi/vuikNofNs=
+github.com/exadrift/go/tui v0.0.5/go.mod h1:Qdd5Cuasgscap/AuHdKk5sr3x/3yoHmWYy3qapGAqSM=
 github.com/exadrift/vt10x v0.0.4 h1:zllyyuTW5kxC2MtIbsouaUhiWSNmFkFmsB5y1ZyyR9M=
 github.com/exadrift/vt10x v0.0.4/go.mod h1:qYAyIFYbEJfcebJJFplWL/gc+RxkQiuElYMiRkjak0c=
 github.com/pmezard/go-difflib v1.0.0 h1:4DBwDE0NGyQoBHbLQYPwSUPoCMWR5BEzIk/f1lZbAQM=

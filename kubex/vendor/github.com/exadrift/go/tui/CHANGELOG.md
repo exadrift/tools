@@ -1,3 +1,5 @@
+# v0.0.5
+- eliminate redraw of title
 # v0.0.4
 - added scroll handle rendering
 - added ring buffer support for shell
