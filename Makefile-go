@@ -17,19 +17,23 @@ ARCH ?= $(shell uname -m | sed 's/x86_64/amd64/')
 IMAGE_NAME := exadrift/$(NAME)
 IMAGE_TAG := $(IMAGE_NAME):$(VERSION)
 
+/tmp/runner:
+	mkdir -p /tmp/runner
+	chown -R $(USERID):$($GROUPID) /tmp/runner
+
 .PHONY: build-test-containers
 build-test-containers:
 	../build-test-containers
 
 .PHONY: go-shell
-go-shell:
+go-shell: /tmp/runner
 	$(DOCKER_CMD) -it $(GO_IMAGE) sh
 
 .PHONY: tidy
-tidy:
+tidy: /tmp/runner
 	$(DOCKER_CMD) $(PRE_BUILD_ARGS) go mod tidy
 
-vendor:
+vendor: /tmp/runner
 	$(DOCKER_CMD) $(PRE_BUILD_ARGS) go mod vendor
 
 .PHONY: test
@@ -62,9 +66,7 @@ build-bins:
 .PHONY: build-one
 build-one: bin/$(NAME)-$(OS)-$(ARCH)
 
-bin/$(NAME)-$(OS)-$(ARCH):
-	mkdir -p /tmp/runner
-	chown -R $(USERID):$(GROUPID) /tmp/runner
+bin/$(NAME)-$(OS)-$(ARCH): /tmp/runner
 	$(DOCKER_CMD) -e GOOS=$(OS) -e GOARCH=$(ARCH) $(BUILD_ARGS) -o ./bin/$(NAME)-$(OS)-$(ARCH) *.go
 
 .PHONY: install
