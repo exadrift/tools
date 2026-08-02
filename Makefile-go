@@ -6,8 +6,8 @@ GO_IMAGE := golang:$(GO_VERSION)-alpine
 HOME=$(shell echo $$HOME)
 MOUNT ?=
 DOCKER_CMD := docker run --network host --rm -e GOCACHE=/tmp/go-build -e CGO_ENABLED=0 -e HOME=$$HOME -v $$HOME:$$HOME -v $(shell pwd):/build -v $(HOME)/tmp:/tmp -v /var/run/docker.sock:/var/run/docker.sock $(MOUNT) -w /build
-USERID := $(shell id -u)
-GROUPID := $(shell id -g)
+USERID ?= $(shell id -u)
+GROUPID ?= $(shell id -g)
 DOCKER_CMD_USER := $(DOCKER_CMD) -u $(USERID):$(GROUPID)
 PRE_BUILD_ARGS := $(GO_IMAGE)
 BUILD_ARGS := $(PRE_BUILD_ARGS) go build -trimpath -ldflags="-s -w -X 'main.Version=$(VERSION)'" -mod=mod
