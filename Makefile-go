@@ -31,6 +31,9 @@ test: build-test-containers
 lint-check:
 	docker run -t --rm -v $(shell pwd):/app -w /app golangci/golangci-lint:v$(LINTER_VERSION) golangci-lint run
 
+.PHONY: build
+build: build-docker
+
 .PHONY: build-docker
 build-docker: build-bins
 	docker build --build-arg NAME=$(NAME) -t $(IMAGE_TAG) .
