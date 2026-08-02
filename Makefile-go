@@ -18,10 +18,11 @@ ARCH ?= $(shell uname -m | sed 's/x86_64/amd64/')
 IMAGE_NAME := exadrift/$(NAME)
 IMAGE_TAG := $(IMAGE_NAME):$(VERSION)
 
-$(HOME)/tmp:
+$(HOME)/tmp/go-build:
 	whoami
-	mkdir -p $(HOME)/tmp
-	chmod 777 $(HOME)/tmp
+	mkdir -p $(HOME)/tmp/go-build
+	chmod 777 -R $(HOME)/tmp
+	chown -R $(USERID):$(GROUPID) $(HOME)/tmp
 	ls -la $(HOME)/tmp
 
 .PHONY: build-test-containers
@@ -71,7 +72,6 @@ build-one: bin/$(NAME)-$(OS)-$(ARCH)
 
 bin/$(NAME)-$(OS)-$(ARCH): $(HOME)/tmp
 	$(DOCKER_CMD_USER) $(GO_IMAGE) ls -la /tmp
-	$(DOCKER_CMD_USER) $(GO_IMAGE) whoami
 	$(DOCKER_CMD_USER) -e GOOS=$(OS) -e GOARCH=$(ARCH) $(BUILD_ARGS) -o ./bin/$(NAME)-$(OS)-$(ARCH) *.go
 
 .PHONY: install
