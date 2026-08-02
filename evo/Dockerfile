@@ -5,5 +5,5 @@ FROM scratch
 ARG NAME=
 COPY --from=certs /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 
-COPY ./bin/${NAME} /${NAME}
+COPY ./bin/${NAME}-linux-amd64 /${NAME}
 ENTRYPOINT [ "/${NAME}", "/migrations" ]
