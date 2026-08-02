@@ -44,6 +44,8 @@ publish: build-docker
 
 .PHONY: build-bins
 build-bins:
+	ls -la /usr/local/go/src/crypto/x509/internal
+	ls -la /usr/local/go/src/crypto/x509/internal/macos
 	# build all supported os/architectures
 	OS=linux ARCH=amd64 make -f ../Makefile-go build-one
 	OS=darwin ARCH=amd64 make -f ../Makefile-go build-one
