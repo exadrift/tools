@@ -3,8 +3,9 @@ GO_VERSION := 1.26
 LINTER_VERSION := 2.12.2
 VERSION ?= local
 GO_IMAGE := golang:$(GO_VERSION)-alpine
+HOME=$(shell echo $$HOME)
 MOUNT ?=
-DOCKER_CMD := docker run --network host --rm -e GOCACHE=/tmp/go-build -e CGO_ENABLED=0 -e HOME=$$HOME -v $$HOME:$$HOME -v $(shell pwd):/build -v /tmp/runner:/tmp -v /var/run/docker.sock:/var/run/docker.sock $(MOUNT) -w /build
+DOCKER_CMD := docker run --network host --rm -e GOCACHE=/tmp/go-build -e CGO_ENABLED=0 -e HOME=$$HOME -v $$HOME:$$HOME -v $(shell pwd):/build -v $(HOME)/tmp:/tmp -v /var/run/docker.sock:/var/run/docker.sock $(MOUNT) -w /build
 USERID := $(shell id -u)
 GROUPID := $(shell id -g)
 DOCKER_CMD_USER := $(DOCKER_CMD) -u $(USERID):$(GROUPID)
@@ -17,23 +18,22 @@ ARCH ?= $(shell uname -m | sed 's/x86_64/amd64/')
 IMAGE_NAME := exadrift/$(NAME)
 IMAGE_TAG := $(IMAGE_NAME):$(VERSION)
 
-/tmp/runner:
-	mkdir -p /tmp/runner
-	chown -R $(USERID):$($GROUPID) /tmp/runner
+$(HOME)/tmp:
+	mkdir -p $(HOME)/tmp
 
 .PHONY: build-test-containers
 build-test-containers:
 	../build-test-containers
 
 .PHONY: go-shell
-go-shell: /tmp/runner
+go-shell: $(HOME)/tmp
 	$(DOCKER_CMD_USER) -it $(GO_IMAGE) sh
 
 .PHONY: tidy
-tidy: /tmp/runner
+tidy: $(HOME)/tmp
 	$(DOCKER_CMD_USER) $(PRE_BUILD_ARGS) go mod tidy
 
-vendor: /tmp/runner
+vendor: $(HOME)/tmp
 	$(DOCKER_CMD_USER) $(PRE_BUILD_ARGS) go mod vendor
 
 .PHONY: test
@@ -66,7 +66,7 @@ build-bins:
 .PHONY: build-one
 build-one: bin/$(NAME)-$(OS)-$(ARCH)
 
-bin/$(NAME)-$(OS)-$(ARCH): /tmp/runner
+bin/$(NAME)-$(OS)-$(ARCH): $(HOME)/tmp
 	$(DOCKER_CMD_USER) -e GOOS=$(OS) -e GOARCH=$(ARCH) $(BUILD_ARGS) -o ./bin/$(NAME)-$(OS)-$(ARCH) *.go
 
 .PHONY: install
