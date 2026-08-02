@@ -31,8 +31,16 @@ test: build-test-containers
 lint-check:
 	docker run -t --rm -v $(shell pwd):/app -w /app golangci/golangci-lint:v$(LINTER_VERSION) golangci-lint run
 
-.PHONY: build
-build:
+.PHONY: build-docker
+build-docker: build-bins
+	docker build --build-arg NAME=$(NAME) -t $(IMAGE_TAG) .
+
+.PHONY: publish
+publish: build-docker
+	docker push $(IMAGE_TAG)
+
+.PHONY: build-bins
+build-bins:
 	# build all supported os/architectures
 	OS=linux ARCH=amd64 make -f ../Makefile-go build-one
 	OS=darwin ARCH=amd64 make -f ../Makefile-go build-one

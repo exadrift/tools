@@ -8,7 +8,7 @@ a minimalistic kubernetes explorer TUI
 ## install
 ```
 # run as sudo if you don't have root privileges in order to drop the binary in /usr/local/bin
-sh -c "curl https://raw.githubusercontent.com/exadrift/tools/refs/heads/main/install.sh | sh -s -- kubex v0"
+sh -c "curl https://raw.githubusercontent.com/exadrift/tools/refs/heads/main/install.sh | sh -s -- kubex"
 ```
 
 ## start TUI
