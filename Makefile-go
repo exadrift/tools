@@ -20,6 +20,7 @@ IMAGE_TAG := $(IMAGE_NAME):$(VERSION)
 
 $(HOME)/tmp:
 	mkdir -p $(HOME)/tmp
+	chmod 777 $(HOME)/tmp
 
 .PHONY: build-test-containers
 build-test-containers:
