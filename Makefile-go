@@ -47,7 +47,7 @@ publish: build-docker
 build-bins:
 	# build all supported os/architectures
 	OS=linux ARCH=amd64 make -f ../Makefile-go build-one
-	OS=darwin ARCH=amd64 make -f ../Makefile-go build-one
+	# OS=darwin ARCH=amd64 make -f ../Makefile-go build-one
 	OS=darwin ARCH=arm64 make -f ../Makefile-go build-one
 
 .PHONY: build-one
@@ -55,6 +55,7 @@ build-one: bin/$(NAME)-$(OS)-$(ARCH)
 
 bin/$(NAME)-$(OS)-$(ARCH):
 	$(DOCKER_CMD) -e GOOS=$(OS) -e GOARCH=$(ARCH) $(PRE_BUILD_ARGS) ls -la /usr/local/go/src/crypto/x509/internal/macos
+	$(DOCKER_CMD) -e GOOS=$(OS) -e GOARCH=$(ARCH) $(PRE_BUILD_ARGS) sh -c 'echo $GOROOT'
 	$(DOCKER_CMD) -e GOOS=$(OS) -e GOARCH=$(ARCH) $(BUILD_ARGS) -o ./bin/$(NAME)-$(OS)-$(ARCH) *.go
 
 .PHONY: install
