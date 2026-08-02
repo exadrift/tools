@@ -7,7 +7,7 @@ MOUNT ?=
 DOCKER_CMD := docker run --network host --rm -e CGO_ENABLED=0 -e HOME=$$HOME -v $$HOME:$$HOME -v $(shell pwd):/build -v /tmp:/tmp -v /var/run/docker.sock:/var/run/docker.sock $(MOUNT) -w /build
 GO_RUN_USER := $(DOCKER_CMD) -u $(shell id -u):$(shell id -g) $(GO_IMAGE) go
 PRE_BUILD_ARGS := -u $(shell id -u):$(shell id -g) $(GO_IMAGE)
-BUILD_ARGS := $(PRE_BUILD_ARGS) go build -trimpath -ldflags="-s -w -X 'main.Version=$(VERSION)'" -mod=vendor
+BUILD_ARGS := $(PRE_BUILD_ARGS) go build -trimpath -ldflags="-s -w -X 'main.Version=$(VERSION)'" -mod=mod
 GO_RUN_ROOT := $(DOCKER_CMD) $(GO_IMAGE) go
 GO_FILES := $(shell find . -type f -path **/*.go -not -path "./vendor/*")
 OS ?= $(shell uname -s | tr '[:upper:]' '[:lower:]')
@@ -61,7 +61,6 @@ build-bins:
 build-one: bin/$(NAME)-$(OS)-$(ARCH)
 
 bin/$(NAME)-$(OS)-$(ARCH):
-	$(DOCKER_CMD) -e GOOS=$(OS) -e GOARCH=$(ARCH) $(PRE_BUILD_ARGS) go env
 	$(DOCKER_CMD) -e GOOS=$(OS) -e GOARCH=$(ARCH) $(BUILD_ARGS) -o ./bin/$(NAME)-$(OS)-$(ARCH) *.go
 
 .PHONY: install
