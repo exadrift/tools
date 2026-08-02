@@ -7,7 +7,7 @@ MOUNT ?=
 DOCKER_CMD := docker run --network host --rm -e GOCACHE=/tmp/go-build -e CGO_ENABLED=0 -e HOME=$$HOME -v $$HOME:$$HOME -v $(shell pwd):/build -v /tmp/runner:/tmp -v /var/run/docker.sock:/var/run/docker.sock $(MOUNT) -w /build
 USERID := $(shell id -u)
 GROUPID := $(shell id -g)
-GO_RUN_USER := $(DOCKER_CMD) -u $(USERID):$(GROUPID) $(GO_IMAGE) go
+DOCKER_CMD_USER := $(DOCKER_CMD) -u $(USERID):$(GROUPID)
 PRE_BUILD_ARGS := -u $(USERID):$(GROUPID) $(GO_IMAGE)
 BUILD_ARGS := $(PRE_BUILD_ARGS) go build -trimpath -ldflags="-s -w -X 'main.Version=$(VERSION)'" -mod=mod
 GO_RUN_ROOT := $(DOCKER_CMD) $(GO_IMAGE) go
@@ -27,14 +27,14 @@ build-test-containers:
 
 .PHONY: go-shell
 go-shell: /tmp/runner
-	$(DOCKER_CMD) -it $(GO_IMAGE) sh
+	$(DOCKER_CMD_USER) -it $(GO_IMAGE) sh
 
 .PHONY: tidy
 tidy: /tmp/runner
-	$(DOCKER_CMD) $(PRE_BUILD_ARGS) go mod tidy
+	$(DOCKER_CMD_USER) $(PRE_BUILD_ARGS) go mod tidy
 
 vendor: /tmp/runner
-	$(DOCKER_CMD) $(PRE_BUILD_ARGS) go mod vendor
+	$(DOCKER_CMD_USER) $(PRE_BUILD_ARGS) go mod vendor
 
 .PHONY: test
 test: build-test-containers
@@ -67,7 +67,7 @@ build-bins:
 build-one: bin/$(NAME)-$(OS)-$(ARCH)
 
 bin/$(NAME)-$(OS)-$(ARCH): /tmp/runner
-	$(DOCKER_CMD) -e GOOS=$(OS) -e GOARCH=$(ARCH) $(BUILD_ARGS) -o ./bin/$(NAME)-$(OS)-$(ARCH) *.go
+	$(DOCKER_CMD_USER) -e GOOS=$(OS) -e GOARCH=$(ARCH) $(BUILD_ARGS) -o ./bin/$(NAME)-$(OS)-$(ARCH) *.go
 
 .PHONY: install
 install: build-one
