@@ -5,7 +5,7 @@ VERSION ?= local
 GO_IMAGE := golang:$(GO_VERSION)-alpine
 HOME=$(shell echo $$HOME)
 MOUNT ?=
-DOCKER_CMD := docker run --network host --rm -e GOCACHE=/tmp/go-build -e CGO_ENABLED=0 -e HOME=$$HOME -v $$HOME:$$HOME -v $(shell pwd):/build -v $(HOME)/tmp:/tmp -v /var/run/docker.sock:/var/run/docker.sock $(MOUNT) -w /build
+DOCKER_CMD := docker run --network host --rm -e CGO_ENABLED=0 -e HOME=$$HOME -v $$HOME:$$HOME -v $(shell pwd):/build -v /tmp:/tmp -v /var/run/docker.sock:/var/run/docker.sock $(MOUNT) -w /build
 USERID ?= $(shell id -u)
 GROUPID ?= $(shell id -g)
 DOCKER_CMD_USER := $(DOCKER_CMD) -u $(USERID):$(GROUPID)
@@ -18,35 +18,28 @@ ARCH ?= $(shell uname -m | sed 's/x86_64/amd64/')
 IMAGE_NAME := exadrift/$(NAME)
 IMAGE_TAG := $(IMAGE_NAME):$(VERSION)
 
-$(HOME)/tmp/go-build:
-	whoami
-	mkdir -p $(HOME)/tmp/go-build
-	chmod 777 -R $(HOME)/tmp
-	chown -R $(USERID):$(GROUPID) $(HOME)/tmp
-	ls -la $(HOME)/tmp
-
 .PHONY: build-test-containers
 build-test-containers:
 	../build-test-containers
 
 .PHONY: go-shell
-go-shell: $(HOME)/tmp/go-build
+go-shell:
 	$(DOCKER_CMD_USER) -it $(GO_IMAGE) sh
 
 .PHONY: tidy
-tidy: $(HOME)/tmp
+tidy:
 	$(DOCKER_CMD_USER) $(PRE_BUILD_ARGS) go mod tidy
 
-vendor: $(HOME)/tmp/go-build
+vendor:
 	$(DOCKER_CMD_USER) $(PRE_BUILD_ARGS) go mod vendor
 
 .PHONY: test
-test: $(HOME)/tmp/go-build build-test-containers
+test: build-test-containers
 	# tests are run as root for docker socket access within the container
 	$(GO_RUN_ROOT) test -cover -p 1 --timeout 10m ./...
 
 .PHONY: lint-check
-lint-check: $(HOME)/tmp/go-build
+lint-check:
 	docker run -t --rm -v $(shell pwd):/app -w /app golangci/golangci-lint:v$(LINTER_VERSION) golangci-lint run
 
 .PHONY: build
@@ -64,13 +57,13 @@ publish: build-docker
 build-bins:
 	# build all supported os/architectures
 	OS=linux ARCH=amd64 make -f ../Makefile-go build-one
-	if [ ! -f .linuxonly ]; then OS=darwin ARCH=amd64 make -f ../Makefile-go build-one; fi
-	if [ ! -f .linuxonly ]; then OS=darwin ARCH=arm64 make -f ../Makefile-go build-one; fi
+	OS=darwin ARCH=amd64 make -f ../Makefile-go build-one
+	OS=darwin ARCH=arm64 make -f ../Makefile-go build-one
 
 .PHONY: build-one
 build-one: bin/$(NAME)-$(OS)-$(ARCH)
 
-bin/$(NAME)-$(OS)-$(ARCH): $(HOME)/tmp/go-build
+bin/$(NAME)-$(OS)-$(ARCH):
 	$(DOCKER_CMD_USER) $(GO_IMAGE) ls -la /tmp
 	$(DOCKER_CMD_USER) -e GOOS=$(OS) -e GOARCH=$(ARCH) $(BUILD_ARGS) -o ./bin/$(NAME)-$(OS)-$(ARCH) *.go
 
