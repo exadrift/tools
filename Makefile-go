@@ -61,6 +61,15 @@ build-bins:
 build-one: bin/$(NAME)-$(OS)-$(ARCH)
 
 bin/$(NAME)-$(OS)-$(ARCH):
+	echo $$GOTOOLCHAIN
+	docker run --rm $(GO_IMAGE) go env GOTOOLCHAIN
+	docker run --rm $(GO_IMAGE) which go
+	docker run --rm $(GO_IMAGE) go env
+	docker run --rm $(GO_IMAGE) go version
+	docker run --rm $(GO_IMAGE) ls -R /usr/local/go/src/crypto/x509/internal
+	docker run --rm $(GO_IMAGE) ls -R /usr/local/go/src/internal
+	echo $$HOME
+
 	$(DOCKER_CMD) -e GOOS=$(OS) -e GOARCH=$(ARCH) $(BUILD_ARGS) -o ./bin/$(NAME)-$(OS)-$(ARCH) *.go
 
 .PHONY: install
