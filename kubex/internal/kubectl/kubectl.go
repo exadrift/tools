@@ -21,7 +21,13 @@ type Config struct {
 	Contexts []NamedContext `json:"contexts"`
 }
 
-func run_pre_split(name string, args ...string) ([]byte, error) {
+func KubectlInPath() bool {
+	cmd := exec.Command("kubectl")
+	err := cmd.Run()
+	return err == nil
+}
+
+func runPreSplit(name string, args ...string) ([]byte, error) {
 	cmd := exec.Command(name, args...)
 	b, err := cmd.Output()
 	if err != nil {
@@ -37,7 +43,7 @@ func run_pre_split(name string, args ...string) ([]byte, error) {
 }
 
 func run(name string, args ...string) ([]string, error) {
-	b, err := run_pre_split(name, args...)
+	b, err := runPreSplit(name, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +99,7 @@ func GetNamespaces() ([]string, error) {
 }
 
 func GetCurrentNamespace(curContext string) (string, error) {
-	jsonBytes, err := run_pre_split("kubectl", "config", "view", "--output", "json")
+	jsonBytes, err := runPreSplit("kubectl", "config", "view", "--output", "json")
 	if err != nil {
 		return "", err
 	}
