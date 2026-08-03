@@ -3,10 +3,14 @@ GO_VERSION := 1.26
 LINTER_VERSION := 2.12.2
 VERSION ?= local
 GO_IMAGE := golang:$(GO_VERSION)-alpine
+HOME=$(shell echo $$HOME)
 MOUNT ?=
 DOCKER_CMD := docker run --network host --rm -e CGO_ENABLED=0 -e HOME=$$HOME -v $$HOME:$$HOME -v $(shell pwd):/build -v /tmp:/tmp -v /var/run/docker.sock:/var/run/docker.sock $(MOUNT) -w /build
-GO_RUN_USER := $(DOCKER_CMD) -u $(shell id -u):$(shell id -g) $(GO_IMAGE) go
-BUILD_ARGS := -u $(shell id -u):$(shell id -g) $(GO_IMAGE) go build -trimpath -ldflags="-s -w -X 'main.Version=$(VERSION)'" -mod=vendor
+USERID ?= $(shell id -u)
+GROUPID ?= $(shell id -g)
+DOCKER_CMD_USER := $(DOCKER_CMD) -u $(USERID):$(GROUPID)
+PRE_BUILD_ARGS := $(GO_IMAGE)
+BUILD_ARGS := $(PRE_BUILD_ARGS) go build -trimpath -ldflags="-s -w -X 'main.Version=$(VERSION)'" -mod=mod
 GO_RUN_ROOT := $(DOCKER_CMD) $(GO_IMAGE) go
 GO_FILES := $(shell find . -type f -path **/*.go -not -path "./vendor/*")
 OS ?= $(shell uname -s | tr '[:upper:]' '[:lower:]')
@@ -20,7 +24,14 @@ build-test-containers:
 
 .PHONY: go-shell
 go-shell:
-	$(DOCKER_CMD) -it $(GO_IMAGE) sh
+	$(DOCKER_CMD_USER) -it $(GO_IMAGE) sh
+
+.PHONY: tidy
+tidy:
+	$(DOCKER_CMD_USER) $(PRE_BUILD_ARGS) go mod tidy
+
+vendor:
+	$(DOCKER_CMD_USER) $(PRE_BUILD_ARGS) go mod vendor
 
 .PHONY: test
 test: build-test-containers
@@ -32,7 +43,18 @@ lint-check:
 	docker run -t --rm -v $(shell pwd):/app -w /app golangci/golangci-lint:v$(LINTER_VERSION) golangci-lint run
 
 .PHONY: build
-build:
+build: build-docker
+
+.PHONY: build-docker
+build-docker: build-bins
+	docker build --build-arg NAME=$(NAME) -t $(IMAGE_TAG) .
+
+.PHONY: publish
+publish: build-docker
+	docker push $(IMAGE_TAG)
+
+.PHONY: build-bins
+build-bins:
 	# build all supported os/architectures
 	OS=linux ARCH=amd64 make -f ../Makefile-go build-one
 	OS=darwin ARCH=amd64 make -f ../Makefile-go build-one
@@ -42,7 +64,7 @@ build:
 build-one: bin/$(NAME)-$(OS)-$(ARCH)
 
 bin/$(NAME)-$(OS)-$(ARCH):
-	$(DOCKER_CMD) -e GOOS=$(OS) -e GOARCH=$(ARCH) $(BUILD_ARGS) -o ./bin/$(NAME)-$(OS)-$(ARCH) *.go
+	$(DOCKER_CMD_USER) -e GOOS=$(OS) -e GOARCH=$(ARCH) $(BUILD_ARGS) -o ./bin/$(NAME)-$(OS)-$(ARCH) *.go
 
 .PHONY: install
 install: build-one

@@ -8,9 +8,32 @@ import (
 
 	"github.com/exadrift/go/tui"
 	"github.com/exadrift/tools/kubex/internal/display"
+	"github.com/exadrift/tools/kubex/internal/kubectl"
 )
 
 var Version = ""
+
+var shellList = []string{
+	"/bin/zsh",
+	"/bin/bash",
+	"/bin/sh",
+}
+
+func findShell() (string, error) {
+	shellBin := os.Getenv("SHELL")
+	if shellBin != "" {
+		return shellBin, nil
+	}
+
+	for _, shell := range shellList {
+		_, err := os.Stat(shell)
+		if err == nil {
+			return shell, nil
+		}
+	}
+
+	return "", fmt.Errorf("unable to locate command shell binary")
+}
 
 func main() {
 	for _, arg := range os.Args {
@@ -28,6 +51,15 @@ func main() {
 			fmt.Printf("%s\n", Version)
 			os.Exit(0)
 		}
+	}
+
+	if !kubectl.KubectlInPath() {
+		log.Fatalf("unable to locate kubectl, please make sure it's in your execution path")
+	}
+
+	shellBin, err := findShell()
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	contextMenu := tui.NewMenu()
@@ -68,10 +100,6 @@ func main() {
 		app.SetFocus(shell)
 	})
 
-	shellBin := os.Getenv("SHELL")
-	if shellBin == "" {
-		shellBin = "/bin/bash"
-	}
 	cmd := exec.Command(shellBin)
 	if err := shell.Start(app, cmd); err != nil {
 		log.Fatal(err)

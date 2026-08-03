@@ -1,3 +1,5 @@
+# v0.2.5
+- updated installer and README.md
 # v0.2.4
 - setup multi-architecture builds intially
 # v0.2.3
