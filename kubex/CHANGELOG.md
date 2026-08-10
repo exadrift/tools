@@ -1,3 +1,5 @@
+# v0.2.6
+- upgrade to truecolor terminal
 # v0.2.5
 - updated installer and README.md
 # v0.2.4
