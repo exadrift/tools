@@ -1,3 +1,7 @@
+# v0.0.7
+- update to truecolor rendering terminal
+# v0.0.6
+- update to 256 color palette terminal
 # v0.0.5
 - eliminate redraw of title
 # v0.0.4

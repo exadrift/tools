@@ -97,7 +97,7 @@ func (s *Shell) Render(mode RenderMode, focusItem Widget) {
 		s.RenderWithScroll(mode, focusItem, historyLength, -1, func(index int) string {
 			// index here is going to be based from the beginning of history, so we need to account for that by subtracting the scroll position
 			// the history buffer width could be different from the current terminal width, and thus we must constrain the width
-			return ConstrainAnsiFullWidth(hist[index-s.scrollWindow.scrollPosition], contentDims.Width)
+			return hist[index-s.scrollWindow.scrollPosition]
 		})
 	}
 
