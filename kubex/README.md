@@ -16,6 +16,12 @@ sh -c "curl https://raw.githubusercontent.com/exadrift/tools/refs/heads/main/ins
 kubex
 ```
 
+## CLI help
+```
+kubex --help    # display the cli help
+kubex --config  # modify the config file (keybindings)
+```
+
 ## navigation / command
 - `k` alias to execute `kubectl`
 - `tab`/`shift+tab` switch pane right/left respectively
