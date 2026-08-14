@@ -60,7 +60,7 @@ func Load() (*Config, error) {
 		}
 	}
 
-	var config *Config = &Config{}
+	var config = &Config{}
 	configFilePath := filepath.Join(configDirPath, "kubex.json")
 	fileData, err := os.ReadFile(configFilePath)
 	if err == nil {
