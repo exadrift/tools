@@ -14,9 +14,9 @@ func NewText(contents string) *Text {
 
 func (t *Text) CaptureInput(r string) string {
 	switch r {
-	case UpArrow:
+	case appSingleton.keyBindings.ScrollUp:
 		t.scrollWindow.ScrollUp()
-	case DownArrow:
+	case appSingleton.keyBindings.ScrollDown:
 		t.scrollWindow.ScrollDown()
 	default:
 		return r

@@ -90,11 +90,11 @@ func (m *Menu) Render(mode RenderMode, focusItem Widget) {
 
 func (m *Menu) CaptureInput(r string) string {
 	switch r {
-	case UpArrow:
+	case appSingleton.keyBindings.SelectionPrev:
 		m.SetSelectedIndex(m.selectedIndex - 1)
-	case DownArrow:
+	case appSingleton.keyBindings.SelectionNext:
 		m.SetSelectedIndex(m.selectedIndex + 1)
-	case Enter:
+	case appSingleton.keyBindings.Trigger:
 		if m.selectHandler != nil {
 			m.selectHandler(m.selectedIndex, m.contents[m.selectedIndex])
 			return RenderFullCode

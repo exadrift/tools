@@ -1,3 +1,5 @@
+# v0.0.8
+- customizable key bindings for default behaviors
 # v0.0.7
 - update to truecolor rendering terminal
 # v0.0.6
