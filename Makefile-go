@@ -68,7 +68,7 @@ bin/$(NAME)-$(OS)-$(ARCH):
 
 .PHONY: install
 install: build-one
-	cp ./bin/$(NAME)-$(OS)-$(ARCH) /usr/local/bin/
+	sudo cp ./bin/$(NAME)-$(OS)-$(ARCH) /usr/local/bin/$(NAME)
 
 .PHONY: run
 run: build-one

@@ -36,11 +36,34 @@ const (
 	ApplicationOptionWithOnExit
 	ApplicationOptionExitSignals
 	ApplicationOptionInputHandler
+	ApplicationOptionKeyBindings
 )
 
 type Option struct {
 	optionType OptionType
 	data       any
+}
+
+type KeyBindings struct {
+	FocusNext     string
+	FocusPrev     string
+	SelectionNext string
+	SelectionPrev string
+	ScrollUp      string
+	ScrollDown    string
+	Trigger       string
+}
+
+func NewKeyBindings() *KeyBindings {
+	return &KeyBindings{
+		FocusNext:     Tab,
+		FocusPrev:     ShiftTab,
+		SelectionNext: DownArrow,
+		SelectionPrev: UpArrow,
+		ScrollUp:      CtrlPgUp,
+		ScrollDown:    CtrlPgDn,
+		Trigger:       Enter,
+	}
 }
 
 // Constrain will constrain the provided value to the provided length, adding ellipsis

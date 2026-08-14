@@ -41,5 +41,13 @@ func ShowCursor() {
 }
 
 func Clear() {
-	fmt.Print("\033[H\033[2J")
+	fmt.Print("\x1b[H\n\x1b[2J")
+}
+
+func SetAlternateScreen() {
+	fmt.Print("\x1b[?1049h")
+}
+
+func SetOriginalScreen() {
+	fmt.Print("\x1b[?1049l")
 }

@@ -6,7 +6,9 @@ import (
 	"os"
 	"os/exec"
 
+	"github.com/exadrift/go/ansi"
 	"github.com/exadrift/go/tui"
+	"github.com/exadrift/tools/kubex/internal/config"
 	"github.com/exadrift/tools/kubex/internal/display"
 	"github.com/exadrift/tools/kubex/internal/kubectl"
 )
@@ -36,14 +38,48 @@ func findShell() (string, error) {
 }
 
 func main() {
+	cfg, err := config.Load()
+	if err != nil {
+		log.Fatal(err)
+	}
+
 	for _, arg := range os.Args {
 		if arg == "--help" {
 			fmt.Println("kubex - kubernetes explorer")
-			fmt.Println("help:")
+			fmt.Println("  --help   - display help")
+			fmt.Println("  --keys   - display bindable key combinations (exclude basic keys)")
+			fmt.Println("  --config - edit the configuration (key bindings, etc.)")
 			fmt.Println()
-			fmt.Println("  k                   - invoke kubectl (terminal alias)")
-			fmt.Println("  <tab> / <shift-tab> - change focus through panes right / left")
-			fmt.Println("  <ctrl> + <p>        - execute command at prompt and send output to vi")
+			fmt.Println("tui help:")
+			fmt.Printf("  k                   - invoke kubectl (terminal alias)\n")
+			fmt.Printf("  %s / %s - change focus through panes right / left\n", cfg.KeyBindings.NavPrev.HumanName, cfg.KeyBindings.NavNext.HumanName)
+			os.Exit(0)
+		}
+
+		if arg == "--keys" {
+			for _, keyCombo := range ansi.AllKeys {
+				if len(keyCombo.HumanName) > 1 {
+					fmt.Printf("%s\n", keyCombo.HumanName)
+				}
+			}
+			os.Exit(0)
+		}
+
+		if arg == "--config" {
+			editor := os.Getenv("EDITOR")
+			if editor == "" {
+				editor = "vi"
+			}
+			fmt.Printf("attempting to edit configs at %s using %s\n", cfg.Location, editor)
+
+			cmd := exec.Command(editor, cfg.Location)
+			cmd.Stdin = os.Stdin
+			cmd.Stdout = os.Stdout
+			cmd.Stderr = os.Stderr
+			err = cmd.Run()
+			if err != nil {
+				log.Fatal(err)
+			}
 			os.Exit(0)
 		}
 
@@ -82,7 +118,14 @@ func main() {
 		tui.NewSegment(3, shell),
 	)
 
-	app := tui.New(layout).SetFocus(shell)
+	bindings := tui.NewKeyBindings()
+	bindings.FocusNext = cfg.KeyBindings.NavNext.Ansi
+	bindings.FocusPrev = cfg.KeyBindings.NavPrev.Ansi
+	bindings.SelectionPrev = cfg.KeyBindings.Up.Ansi
+	bindings.SelectionNext = cfg.KeyBindings.Down.Ansi
+	bindings.ScrollUp = cfg.KeyBindings.ScrollUp.Ansi
+	bindings.ScrollDown = cfg.KeyBindings.ScrollDown.Ansi
+	app := tui.New(layout, *tui.WithApplicationOptionKeyBindings(bindings)).SetFocus(shell)
 
 	contextMenu.SetSelectHandler(func(selectedIndex int, selectedItem string) {
 		if err := display.UpdateContextSelection(selectedItem, namespaceMenu); err != nil {

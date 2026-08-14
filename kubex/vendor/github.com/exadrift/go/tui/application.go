@@ -25,6 +25,7 @@ type Application struct {
 	closeChan    chan struct{}
 	wg           *sync.WaitGroup
 	root         Widget
+	keyBindings  *KeyBindings
 }
 
 func WithApplicationOptionInputHandler(handleInput func(string) string) *Option {
@@ -48,6 +49,13 @@ func WithApplicationOptionOnExit(onExit func()) *Option {
 	}
 }
 
+func WithApplicationOptionKeyBindings(keyBindings *KeyBindings) *Option {
+	return &Option{
+		optionType: ApplicationOptionKeyBindings,
+		data:       keyBindings,
+	}
+}
+
 func WithApplicationOptionExitSignals(signals ...syscall.Signal) *Option {
 	exitSignals := make([]syscall.Signal, len(signals))
 	copy(exitSignals, signals)
@@ -57,8 +65,18 @@ func WithApplicationOptionExitSignals(signals ...syscall.Signal) *Option {
 	}
 }
 
+var appSingleton *Application
+var appSingletonLock = sync.Mutex{}
+
 // New constructs and returns a new Application with a root widget specified.
 func New(root Widget, options ...Option) *Application {
+	appSingletonLock.Lock()
+	defer appSingletonLock.Unlock()
+
+	if appSingleton != nil {
+		panic("only one application instance is allowed throughout the process lifecycle")
+	}
+
 	var exitSignals []os.Signal
 
 	app := &Application{
@@ -68,6 +86,7 @@ func New(root Widget, options ...Option) *Application {
 		closeChan:  make(chan struct{}, 1),
 		redrawChan: make(chan Widget, 1000),
 	}
+	appSingleton = app
 
 	for _, option := range options {
 		switch option.optionType {
@@ -79,6 +98,8 @@ func New(root Widget, options ...Option) *Application {
 			exitSignals = option.data.([]os.Signal)
 		case ApplicationOptionInputHandler:
 			app.inputHandler = option.data.(func(string) string)
+		case ApplicationOptionKeyBindings:
+			app.keyBindings = option.data.(*KeyBindings)
 		default:
 			panic("unknown application option")
 		}
@@ -90,6 +111,11 @@ func New(root Widget, options ...Option) *Application {
 	if slices.Contains(exitSignals, os.Signal(syscall.SIGINT)) {
 		app.ctrlCExit = true
 	}
+
+	if app.keyBindings == nil {
+		app.keyBindings = NewKeyBindings()
+	}
+
 	signal.Notify(app.sigChan, exitSignals...)
 
 	return app
@@ -242,11 +268,17 @@ func (a *Application) Start() error {
 	termSizeChan := make(chan os.Signal, 100)
 	signal.Notify(termSizeChan, syscall.SIGWINCH)
 
+	terminal.SetAlternateScreen()
+	terminal.Clear()
+
+	defer terminal.SetOriginalScreen()
+
 	width, height, err := term.GetSize(a.termFd)
 	if err != nil {
 		return err
 	}
 	a.root.SetDimensions(0, 0, width, height)
+
 	a.renderAll()
 
 	// application event loop
@@ -270,12 +302,12 @@ func (a *Application) Start() error {
 			widget.Render(RenderModeContent, a.inFocus)
 		case c := <-inputChan:
 			switch c {
-			case Tab:
+			case a.keyBindings.FocusNext:
 				if a.inFocus != nil {
 					a.SetFocus(a.findFocusNext())
 					a.renderAllRefocus()
 				}
-			case ShiftTab:
+			case a.keyBindings.FocusPrev:
 				if a.inFocus != nil {
 					a.SetFocus(a.findFocusPrev())
 					a.renderAllRefocus()

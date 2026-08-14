@@ -1,3 +1,5 @@
+# v0.2.7
+- added config file with modifiable key bindings
 # v0.2.6
 - upgrade to truecolor terminal
 # v0.2.5
