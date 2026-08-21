@@ -271,6 +271,8 @@ func (a *Application) Start() error {
 	terminal.SetAlternateScreen()
 	terminal.Clear()
 
+	defer terminal.ShowCursor()
+
 	defer terminal.SetOriginalScreen()
 
 	width, height, err := term.GetSize(a.termFd)

@@ -1,3 +1,5 @@
+# v0.2.9
+- restore cursor on exit
 # v0.2.8
 - ci failure necessitated this
 # v0.2.7

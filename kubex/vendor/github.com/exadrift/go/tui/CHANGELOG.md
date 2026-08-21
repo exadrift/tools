@@ -1,3 +1,5 @@
+# v0.0.9
+- turn cursor back on, on application exit
 # v0.0.8
 - customizable key bindings for default behaviors
 # v0.0.7
