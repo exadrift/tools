@@ -1,3 +1,5 @@
+# v0.2.11
+- don't allow the header to be focussed
 # v0.2.10
 - add loader screen when context changes or namespace changes
 - add heading bar

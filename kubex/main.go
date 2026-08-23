@@ -114,6 +114,7 @@ func main() {
 
 	topBar := tui.NewText(fmt.Sprintf(" kubex %s - ctrl+c to exit (ctrl+d to exit shell)", Version))
 	topBar.EnableBorder(true).SetStyle(tui.StyleFg(tui.White), tui.StyleBg(tui.Blue))
+	topBar.SetFocusable(false)
 
 	selectableLayout := tui.NewFlexLayout(
 		tui.OrientationHorizontal,
