@@ -192,7 +192,9 @@ func main() {
 
 	namespaceMenu.SetSelectHandler(
 		func(selectedIndex int, selectedItem string) any {
-			kubectl.SetCurrentNamespace(selectedItem)
+			if err := kubectl.SetCurrentNamespace(selectedItem); err != nil {
+				app.Exit(err)
+			}
 			return nil
 		},
 		tui.WithBusyModal(
