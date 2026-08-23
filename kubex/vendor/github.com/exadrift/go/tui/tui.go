@@ -37,6 +37,7 @@ const (
 	ApplicationOptionExitSignals
 	ApplicationOptionInputHandler
 	ApplicationOptionKeyBindings
+	BusyModal
 )
 
 type Option struct {

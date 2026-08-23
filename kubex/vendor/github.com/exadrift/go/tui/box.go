@@ -48,11 +48,14 @@ type Box struct {
 	contentDimensions Dimensions
 	scrollWindow      *ScrollWindow
 	contentRows       int
+	canHaveFocus      bool
+	style             string
 }
 
 func NewBox() *Box {
 	return &Box{
 		scrollWindow: NewScrollWindow(),
+		canHaveFocus: true,
 	}
 }
 
@@ -80,7 +83,12 @@ func (b *Box) GetContentDimensions() *Dimensions {
 }
 
 func (b *Box) EnableBorder(enable bool) *Box {
-	b.hasBorder = true
+	b.hasBorder = enable
+	return b
+}
+
+func (b *Box) SetFocusable(canHaveFocus bool) *Box {
+	b.canHaveFocus = canHaveFocus
 	return b
 }
 
@@ -103,6 +111,11 @@ func (b *Box) SetDimensions(left int, top int, width int, height int) {
 	}
 
 	b.scrollWindow.SetDimensions(b.contentDimensions.Left, b.contentDimensions.Top, b.contentDimensions.Width, b.contentDimensions.Height)
+}
+
+func (b *Box) SetStyle(fgStyle string, bgStyle string) {
+	b.style = fgStyle + bgStyle
+	b.scrollWindow.style = b.style
 }
 
 func (b *Box) GetBox() *Box {
@@ -173,7 +186,13 @@ func (b *Box) Render(mode RenderMode, focusItem Widget) {
 					}
 				}
 			}
+			if b.style != "" {
+				fmt.Print(b.style)
+			}
 			fmt.Print(string(topString))
+			if b.style != "" {
+				fmt.Print(StyleReset)
+			}
 
 			// represents what portion of the total content is visible
 			contentHeight := b.contentDimensions.Height
@@ -185,6 +204,9 @@ func (b *Box) Render(mode RenderMode, focusItem Widget) {
 			contentRow := 0
 			for i := 1; i < dimensions.Height-1; i++ {
 				terminal.SetCursorPos(dimensions.Left, dimensions.Top+i)
+				if b.style != "" {
+					fmt.Print(b.style)
+				}
 				fmt.Print(vert)
 
 				if mode == RenderModeAll {
@@ -203,13 +225,23 @@ func (b *Box) Render(mode RenderMode, focusItem Widget) {
 				}
 
 				contentRow++
+
+				if b.style != "" {
+					fmt.Print(StyleReset)
+				}
 			}
 			terminal.SetCursorPos(dimensions.Left, dimensions.Top+dimensions.Height-1)
+			if b.style != "" {
+				fmt.Print(b.style)
+			}
 			fmt.Print(bottomLeft)
 			for i := 1; i < dimensions.Width-1; i++ {
 				fmt.Print(horiz)
 			}
 			fmt.Print(bottomRight)
+			if b.style != "" {
+				fmt.Print(StyleReset)
+			}
 		}
 	}
 }
@@ -242,7 +274,7 @@ func (b *Box) NextInFocus(inFocus Widget) Widget {
 }
 
 func (b *Box) CanHaveFocus() bool {
-	return true
+	return b.canHaveFocus
 }
 
 func (b *Box) AbsorbsInput(input string) bool {

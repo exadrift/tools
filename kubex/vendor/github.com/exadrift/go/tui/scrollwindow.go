@@ -10,6 +10,7 @@ type ScrollWindow struct {
 	scrollPosition      int
 	dimensions          Dimensions
 	scrollHandleEnabled bool
+	style               string
 }
 
 func NewScrollWindow() *ScrollWindow {
@@ -77,7 +78,14 @@ func (sw *ScrollWindow) Render(contentRows int, callback func(index int) string)
 				break
 			}
 			terminal.SetCursorPos(dimensions.Left, dimensions.Top+curRow)
-			fmt.Print(callback(i))
+			row := callback(i)
+			if sw.style != "" {
+				fmt.Print(sw.style)
+			}
+			fmt.Print(row)
+			if sw.style != "" {
+				fmt.Print(StyleReset)
+			}
 			curRow++
 		}
 	}

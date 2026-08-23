@@ -1,3 +1,6 @@
+# v0.2.10
+- add loader screen when context changes or namespace changes
+- add heading bar
 # v0.2.9
 - restore cursor on exit
 # v0.2.8

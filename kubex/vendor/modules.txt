@@ -7,7 +7,7 @@ github.com/exadrift/go/ansi
 # github.com/exadrift/go/ringbuf v0.0.1
 ## explicit; go 1.26.4
 github.com/exadrift/go/ringbuf
-# github.com/exadrift/go/tui v0.0.9
+# github.com/exadrift/go/tui v0.0.13
 ## explicit; go 1.26.4
 github.com/exadrift/go/tui
 github.com/exadrift/go/tui/internal/terminal

@@ -5,15 +5,27 @@ import (
 	"os/signal"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"syscall"
+	"time"
 
 	"github.com/exadrift/go/tui/internal/terminal"
 	"golang.org/x/term"
 )
 
+const (
+	LoaderTickInterval = time.Millisecond * 100
+)
+
+type RedrawRequest struct {
+	Widget     Widget
+	RenderMode RenderMode
+}
+
 type Application struct {
 	errorCond    error
-	redrawChan   chan Widget
+	redrawChan   chan RedrawRequest
+	safeOpChan   chan func()
 	inputHandler func(string) string
 	inFocus      Widget
 	ctrlCExit    bool
@@ -26,6 +38,10 @@ type Application struct {
 	wg           *sync.WaitGroup
 	root         Widget
 	keyBindings  *KeyBindings
+	dimensions   Dimensions
+	loader       *Loader
+
+	isBusy atomic.Bool
 }
 
 func WithApplicationOptionInputHandler(handleInput func(string) string) *Option {
@@ -65,8 +81,31 @@ func WithApplicationOptionExitSignals(signals ...syscall.Signal) *Option {
 	}
 }
 
+type BusyModalData struct {
+	Completer func(any)
+	Label     string
+}
+
+func WithBusyModal(busyMessage string, onComplete func(any)) *Option {
+	return &Option{
+		optionType: BusyModal,
+		data: &BusyModalData{
+			Completer: onComplete,
+			Label:     busyMessage,
+		},
+	}
+}
+
 var appSingleton *Application
 var appSingletonLock = sync.Mutex{}
+
+// GetApplication returns the application singleton instance
+func GetApplication() *Application {
+	appSingletonLock.Lock()
+	defer appSingletonLock.Unlock()
+
+	return appSingleton
+}
 
 // New constructs and returns a new Application with a root widget specified.
 func New(root Widget, options ...Option) *Application {
@@ -84,7 +123,9 @@ func New(root Widget, options ...Option) *Application {
 		root:       root,
 		sigChan:    make(chan os.Signal, 1),
 		closeChan:  make(chan struct{}, 1),
-		redrawChan: make(chan Widget, 1000),
+		redrawChan: make(chan RedrawRequest, 1000),
+		safeOpChan: make(chan func(), 1000),
+		loader:     NewLoader(),
 	}
 	appSingleton = app
 
@@ -205,8 +246,8 @@ func (a *Application) renderFocused() {
 	a.renderWidgets(RenderModeContent, a.inFocus)
 }
 
-func (a *Application) RequestRedrawComponent(component Widget) {
-	a.redrawChan <- component
+func (a *Application) RequestRedrawComponent(req RedrawRequest) {
+	a.redrawChan <- req
 }
 
 func (a *Application) renderWidgets(renderMode RenderMode, widgets ...Widget) {
@@ -222,6 +263,11 @@ func (a *Application) renderWidgets(renderMode RenderMode, widgets ...Widget) {
 	if a.inFocus != nil {
 		a.inFocus.Render(renderMode, a.inFocus)
 	}
+}
+
+// Async functions will block the UI thread, and thus should be quick operations
+func (a *Application) Async(f func()) {
+	a.safeOpChan <- f
 }
 
 // Start starts the application loop
@@ -279,7 +325,7 @@ func (a *Application) Start() error {
 	if err != nil {
 		return err
 	}
-	a.root.SetDimensions(0, 0, width, height)
+	a.SetDimensions(0, 0, width, height)
 
 	a.renderAll()
 
@@ -298,11 +344,23 @@ func (a *Application) Start() error {
 			if err != nil {
 				return err
 			}
-			a.root.SetDimensions(0, 0, width, height)
+			a.SetDimensions(0, 0, width, height)
 			a.renderAll()
-		case widget := <-a.redrawChan:
-			widget.Render(RenderModeContent, a.inFocus)
+		case req := <-a.redrawChan:
+			if req.Widget == nil {
+				a.renderAll()
+			} else {
+				req.Widget.Render(req.RenderMode, a.inFocus)
+			}
+		case op := <-a.safeOpChan:
+			// performs a UI blocking op w/o clobbering internal data
+			op()
 		case c := <-inputChan:
+			if a.isBusy.Load() {
+				// skip keystrokes when the application is busy
+				continue
+			}
+
 			switch c {
 			case a.keyBindings.FocusNext:
 				if a.inFocus != nil {
@@ -324,10 +382,10 @@ func (a *Application) Start() error {
 
 				if a.inputHandler != nil {
 					c = a.inputHandler(c)
-					if c == RenderFullCode {
-						a.renderAll()
-						continue
-					}
+					// if c == RenderFullCode {
+					// 	a.renderAll()
+					// 	continue
+					// }
 				}
 
 				c = a.handleInput(c)
@@ -340,4 +398,27 @@ func (a *Application) Start() error {
 			}
 		}
 	}
+}
+
+func (a *Application) SetDimensions(left int, top int, width int, height int) {
+	a.dimensions.Left = left
+	a.dimensions.Top = top
+	a.dimensions.Width = width
+	a.dimensions.Height = height
+
+	a.loader.SetDimensions(0, 0, width, height)
+	a.root.SetDimensions(0, 0, width, height)
+}
+
+// ShowLoader sets the busy status on the application component.  If becoming busy, a thread will be started with a UI
+// timer to set render events, if becoming not busy, the timer will stop
+func (a *Application) ShowLoader(message string) {
+	a.isBusy.Store(true)
+	a.loader.Show(message)
+}
+
+// HideLoader hides the loader and allows keyboard events again
+func (a *Application) HideLoader() {
+	a.loader.Hide()
+	a.isBusy.Store(false)
 }

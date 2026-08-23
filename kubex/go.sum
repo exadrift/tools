@@ -12,8 +12,10 @@ github.com/exadrift/go/ansi v0.0.1 h1:j1FqyRc7nzDKaHmUv1EIvAHp5YLyuqLzoH7eqL03uj
 github.com/exadrift/go/ansi v0.0.1/go.mod h1:WBTcjclFuAikw2HN7/mB6b6HQDmywkJ4HzW5G6jpXZk=
 github.com/exadrift/go/ringbuf v0.0.1 h1:8XL/++4CuR4/nakry0hiN2H6RVW6NN5fiEl6NPrbrXE=
 github.com/exadrift/go/ringbuf v0.0.1/go.mod h1:NrzM7Kipwul9lUtUn/5s0pJl3rWPFuhxCLaZo+mDrW4=
-github.com/exadrift/go/tui v0.0.9 h1:dqP2mXss17i7f/9ZPFWkUufCGiu9/HxW3vV/N2UTYGk=
-github.com/exadrift/go/tui v0.0.9/go.mod h1:apzREjldxYIZp/m9DxmsdyNCEc/D5WZc6+5u53ek92w=
+github.com/exadrift/go/tui v0.0.12 h1:K+TjkVmD/8NJjzYD10zqljo1kwHyENy6Kx1R4qjkQEI=
+github.com/exadrift/go/tui v0.0.12/go.mod h1:apzREjldxYIZp/m9DxmsdyNCEc/D5WZc6+5u53ek92w=
+github.com/exadrift/go/tui v0.0.13 h1:iETwfyp2ny491jwOilZIWXlBeLemlcYwrqJJWl2PGdw=
+github.com/exadrift/go/tui v0.0.13/go.mod h1:apzREjldxYIZp/m9DxmsdyNCEc/D5WZc6+5u53ek92w=
 github.com/exadrift/vt10x v0.0.9 h1:3luciH1EWAojS4lH2b388fij68YUF4KaKL6FDMmTRaY=
 github.com/exadrift/vt10x v0.0.9/go.mod h1:r9lNUHK/LKx5toRPVCJYbNsW5jf/Hjfyedvsu09k0BE=
 github.com/mattn/go-isatty v0.0.14 h1:yVuAays6BHfxijgZPzw+3Zlu5yQgKGP2/hcQbHb7S9Y=

@@ -56,7 +56,10 @@ func (s *Shell) Start(app *Application, cmd *exec.Cmd) error {
 			_, _ = s.term.Write(buf[:n])
 
 			// Enqueue a redraw request
-			app.RequestRedrawComponent(s)
+			app.RequestRedrawComponent(RedrawRequest{
+				Widget:     s,
+				RenderMode: RenderModeContent,
+			})
 		}
 	}()
 

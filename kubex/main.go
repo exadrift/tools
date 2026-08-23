@@ -9,16 +9,20 @@ import (
 	"github.com/exadrift/go/ansi"
 	"github.com/exadrift/go/tui"
 	"github.com/exadrift/tools/kubex/internal/config"
-	"github.com/exadrift/tools/kubex/internal/display"
 	"github.com/exadrift/tools/kubex/internal/kubectl"
 )
 
-var Version = ""
+var Version = "v0.0.0"
 
 var shellList = []string{
 	"/bin/zsh",
 	"/bin/bash",
 	"/bin/sh",
+}
+
+type Namespaces struct {
+	Selected string
+	All      []string
 }
 
 func findShell() (string, error) {
@@ -38,6 +42,7 @@ func findShell() (string, error) {
 }
 
 func main() {
+	fmt.Println("loading...")
 	cfg, err := config.Load()
 	if err != nil {
 		log.Fatal(err)
@@ -104,18 +109,23 @@ func main() {
 	namespaceMenu := tui.NewMenu()
 	namespaceMenu.EnableBorder(true).SetTitle("namespace")
 
-	if err := display.InitializeDisplay(contextMenu, namespaceMenu); err != nil {
-		log.Fatal(err)
-	}
-
 	shell := tui.NewShell()
 	shell.EnableBorder(true).SetTitle("terminal")
 
-	layout := tui.NewFlexLayout(
+	topBar := tui.NewText(fmt.Sprintf(" kubex %s - ctrl+c to exit (ctrl+d to exit shell)", Version))
+	topBar.EnableBorder(true).SetStyle(tui.StyleFg(tui.White), tui.StyleBg(tui.Blue))
+
+	selectableLayout := tui.NewFlexLayout(
 		tui.OrientationHorizontal,
 		tui.NewSegment(1, contextMenu),
 		tui.NewSegment(1, namespaceMenu),
 		tui.NewSegment(3, shell),
+	)
+
+	layout := tui.NewFlexLayout(
+		tui.OrientationVertical,
+		tui.NewSegment(1, topBar, tui.WithSegmentOptionMinChars(3)),
+		tui.NewSegment(1000, selectableLayout),
 	)
 
 	bindings := tui.NewKeyBindings()
@@ -127,21 +137,73 @@ func main() {
 	bindings.ScrollDown = cfg.KeyBindings.ScrollDown.Ansi
 	app := tui.New(layout, *tui.WithApplicationOptionKeyBindings(bindings)).SetFocus(shell)
 
-	contextMenu.SetSelectHandler(func(selectedIndex int, selectedItem string) {
-		if err := display.UpdateContextSelection(selectedItem, namespaceMenu); err != nil {
-			log.Fatal(err)
-		}
+	contexts, err := kubectl.GetContexts()
+	if err != nil {
+		log.Fatal(err)
+	}
+	curContext, err := kubectl.GetCurrentContext()
+	if err != nil {
+		log.Fatal(err)
+	}
+	namespaces, err := kubectl.GetNamespaces()
+	if err != nil {
+		log.Fatal(err)
+	}
+	curNamespace, err := kubectl.GetCurrentNamespace(curContext)
+	if err != nil {
+		log.Fatal(err)
+	}
 
-		app.SetFocus(namespaceMenu)
-	})
+	contextMenu.SetContents(contexts...).SetSelectedItem(curContext)
+	namespaceMenu.SetContents(namespaces...).SetSelectedItem(curNamespace)
 
-	namespaceMenu.SetSelectHandler(func(selectedIndex int, selectedItem string) {
-		if err := display.UpdateNamespaceSelection(selectedItem); err != nil {
-			log.Fatal(err)
-		}
+	contextMenu.SetSelectHandler(
+		func(selectedIndex int, selectedItem string) any {
+			err := kubectl.SetCurrentContext(selectedItem)
+			if err != nil {
+				app.Exit(err)
+			}
 
-		app.SetFocus(shell)
-	})
+			curNamespace, err := kubectl.GetCurrentNamespace(curContext)
+			if err != nil {
+				app.Exit(err)
+			}
+
+			namespaces, err := kubectl.GetNamespaces()
+			if err != nil {
+				app.Exit(err)
+			}
+
+			return Namespaces{
+				Selected: curNamespace,
+				All:      namespaces,
+			}
+		},
+		tui.WithBusyModal(
+			"switching context...",
+			func(a any) {
+				ns := a.(Namespaces)
+				namespaceMenu.SetContents(ns.All...)
+				namespaceMenu.SetSelectedItem(ns.Selected)
+				app.SetFocus(namespaceMenu)
+			},
+		),
+	)
+
+	namespaceMenu.SetSelectHandler(
+		func(selectedIndex int, selectedItem string) any {
+			if err := kubectl.SetCurrentNamespace(selectedItem); err != nil {
+				app.Exit(err)
+			}
+			return nil
+		},
+		tui.WithBusyModal(
+			"switching namespace...",
+			func(a any) {
+				app.SetFocus(shell)
+			},
+		),
+	)
 
 	cmd := exec.Command(shellBin)
 	if err := shell.Start(app, cmd); err != nil {

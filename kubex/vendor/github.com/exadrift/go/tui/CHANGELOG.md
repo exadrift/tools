@@ -1,3 +1,12 @@
+# v0.0.13
+- numerous measurement bug fixes
+- added styling to box
+# v0.0.12
+- expose application singleton
+# v0.0.11
+- added notion of async operations
+# v0.0.10
+- allow for asynchronous but UI input blocking loading events
 # v0.0.9
 - turn cursor back on, on application exit
 # v0.0.8
