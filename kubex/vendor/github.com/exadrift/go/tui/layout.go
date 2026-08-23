@@ -83,8 +83,22 @@ func (f *FlexLayout) GetChildren() []Widget {
 	return f.children
 }
 
+func adjustSize(size int, minSize int, maxSize int) int {
+	if minSize > 0 && size < minSize {
+		size = minSize
+	}
+
+	if maxSize > 0 && size > maxSize {
+		size = maxSize
+	}
+
+	return size
+}
+
 func (f *FlexLayout) SetDimensions(left int, top int, width int, height int) {
 	f.Box.SetDimensions(left, top, width, height)
+	initialTop := top
+	initialLeft := left
 	childLeft := left
 	childTop := top
 	for _, segment := range f.segments {
@@ -93,16 +107,18 @@ func (f *FlexLayout) SetDimensions(left int, top int, width int, height int) {
 		switch f.orientation {
 		case OrientationHorizontal:
 			size = int(math.Round(portion * float64(width)))
-			if childLeft+size > width {
-				size = width - childLeft
+			size = adjustSize(size, segment.minChars, segment.maxChars)
+			if childLeft+size-initialLeft > width {
+				size = width - (childLeft - initialLeft)
 			}
 			segment.child.SetDimensions(childLeft, top, size, height)
 			childLeft += size
 
 		case OrientationVertical:
 			size = int(math.Round(portion * float64(height)))
-			if childTop+size > height {
-				size = height - childTop
+			size = adjustSize(size, segment.minChars, segment.maxChars)
+			if childTop+size+initialTop > height {
+				size = height - (childTop - initialTop)
 			}
 			segment.child.SetDimensions(left, childTop, width, size)
 			childTop += size

@@ -64,6 +64,10 @@ func StyleFgBg(fgColor int, bgColor int) string {
 	return fmt.Sprintf("\x1b[%d;%dm", fgColor, bgColor+10)
 }
 
+func StyleBg(color int) string {
+	return fmt.Sprintf("\x1b[%dm", 10+color)
+}
+
 func StripAnsiCodes(text string) string {
 	return ansiEscStripper.ReplaceAllString(text, "")
 }

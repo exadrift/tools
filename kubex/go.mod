@@ -4,7 +4,7 @@ go 1.26.4
 
 require (
 	github.com/exadrift/go/ansi v0.0.1
-	github.com/exadrift/go/tui v0.0.9
+	github.com/exadrift/go/tui v0.0.13
 )
 
 require (

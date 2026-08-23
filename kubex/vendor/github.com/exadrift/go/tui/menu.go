@@ -1,13 +1,19 @@
 package tui
 
-import "fmt"
+import (
+	"fmt"
+	"sync"
+)
 
 type Menu struct {
 	*Box
-	contents         []string
-	index            map[string]int
-	selectedIndex    int
-	selectHandler    func(int, string)
+	contents      []string
+	index         map[string]int
+	selectedIndex int
+	selectHandler func(int, string) any
+	completer     func(any)
+	busyLabel     string
+
 	nonSelectedStyle string
 	selectedStyle    string
 }
@@ -24,8 +30,21 @@ func NewMenu(contents ...string) *Menu {
 	return menu
 }
 
-func (m *Menu) SetSelectHandler(h func(selectedIndex int, selectedItem string)) *Menu {
+// SetSelectHandler allows you to define a callback which will be executed when selection changes
+func (m *Menu) SetSelectHandler(h func(selectedIndex int, selectedItem string) any, options ...*Option) *Menu {
 	m.selectHandler = h
+
+	for _, option := range options {
+		switch option.optionType {
+		case BusyModal:
+			busyModalData := option.data.(*BusyModalData)
+			m.busyLabel = busyModalData.Label
+			m.completer = busyModalData.Completer
+		default:
+			panic(fmt.Errorf("unknown menu option: %v", option.optionType))
+		}
+	}
+
 	return m
 }
 
@@ -96,8 +115,28 @@ func (m *Menu) CaptureInput(r string) string {
 		m.SetSelectedIndex(m.selectedIndex + 1)
 	case appSingleton.keyBindings.Trigger:
 		if m.selectHandler != nil {
-			m.selectHandler(m.selectedIndex, m.contents[m.selectedIndex])
-			return RenderFullCode
+			if m.completer == nil {
+				m.selectHandler(m.selectedIndex, m.contents[m.selectedIndex])
+				return RenderFullCode
+			}
+
+			appSingleton.ShowLoader(m.busyLabel)
+			go func() {
+				// this is an async operation
+				wg := sync.WaitGroup{}
+				wg.Add(1)
+				var resp any
+				go func() {
+					defer wg.Done()
+					resp = m.selectHandler(m.selectedIndex, m.contents[m.selectedIndex])
+				}()
+				wg.Wait()
+				appSingleton.Async(func() {
+					m.completer(resp)
+					appSingleton.renderAll()
+					appSingleton.HideLoader()
+				})
+			}()
 		}
 	default:
 		return r
