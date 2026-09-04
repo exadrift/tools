@@ -1,7 +1,7 @@
 # espresso
 a decentralized package management tool
 
-## what do you mean decentralized?
+## what do you mean by decentralized?
 in a centralized package management tool, packages are stored in a centralized repository.  espresso is designed to manage packages from any source, focusing on installation and version tracking particulars
 
 ## usage

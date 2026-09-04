@@ -56,11 +56,11 @@ func FromFile(filename string) (*Manifest, error) {
 		}
 
 		if pkg.Version == "" {
-			return nil, fmt.Errorf("package %s does not specify a version")
+			return nil, fmt.Errorf("package %s does not specify a version", pkg.Name)
 		}
 
 		if pkg.GetVersion == "" {
-			return nil, fmt.Errorf("package %s does not specify a command to get the installed version")
+			return nil, fmt.Errorf("package %s does not specify a command to get the installed version", pkg.Name)
 		}
 
 		if pkg.Sync != "" && pkg.SyncScript != "" {
