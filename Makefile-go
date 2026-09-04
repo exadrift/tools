@@ -17,6 +17,7 @@ OS ?= $(shell uname -s | tr '[:upper:]' '[:lower:]')
 ARCH ?= $(shell uname -m | sed 's/x86_64/amd64/')
 IMAGE_NAME := exadrift/$(NAME)
 IMAGE_TAG := $(IMAGE_NAME):$(VERSION)
+ARGS ?= ""
 
 .PHONY: build-test-containers
 build-test-containers:
@@ -72,7 +73,7 @@ install: build-one
 
 .PHONY: run
 run: build-one
-	./bin/$(NAME)-$(OS)-$(ARCH)
+	./bin/$(NAME)-$(OS)-$(ARCH) $(ARGS)
 
 .PHONY: clean
 clean:
