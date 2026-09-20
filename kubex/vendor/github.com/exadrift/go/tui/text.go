@@ -1,23 +1,27 @@
 package tui
 
+import (
+	"github.com/exadrift/go/ansi/style"
+)
+
 type Text struct {
-	*Box
-	Contents string
+	*Container
+	Contents *style.TextBlock
 }
 
-func NewText(contents string) *Text {
+func NewText(contents *style.TextBlock) *Text {
 	return &Text{
-		Box:      NewBox(),
-		Contents: contents,
+		Container: NewContainer(),
+		Contents:  contents,
 	}
 }
 
 func (t *Text) CaptureInput(r string) string {
 	switch r {
 	case appSingleton.keyBindings.ScrollUp:
-		t.scrollWindow.ScrollUp()
+		t.ScrollUp()
 	case appSingleton.keyBindings.ScrollDown:
-		t.scrollWindow.ScrollDown()
+		t.ScrollDown()
 	default:
 		return r
 	}
@@ -25,13 +29,7 @@ func (t *Text) CaptureInput(r string) string {
 	return ""
 }
 
-func (t *Text) Render(mode RenderMode, focusItem Widget) {
-	dimensions := t.GetContentDimensions()
-	lines := WrapTextBasic(t.Contents, dimensions.Width)
-
-	t.scrollWindow.scrollHandleEnabled = len(lines) > dimensions.Height
-
-	t.RenderWithScroll(mode, focusItem, len(lines), -1, func(index int) string {
-		return Pad(lines[index], dimensions.Width)
-	})
+func (t *Text) Render(contentWindow *ContentWindow, focusItem Widget) {
+	cw := NewContentWindow(t.scrollPosition, t.GetContentDimensions(), WithContentWindowOptionTextBlock(t.Contents))
+	t.Container.Render(cw, focusItem)
 }

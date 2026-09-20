@@ -1,4 +1,4 @@
-package ansi
+package keys
 
 import (
 	"fmt"

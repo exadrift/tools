@@ -7,7 +7,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/exadrift/go/ansi"
+	"github.com/exadrift/go/ansi/keys"
 )
 
 type KeyBindingsDefintion struct {
@@ -20,12 +20,12 @@ type KeyBindingsDefintion struct {
 }
 
 type KeyBindings struct {
-	NavNext    *ansi.KeyCombo
-	NavPrev    *ansi.KeyCombo
-	Up         *ansi.KeyCombo
-	Down       *ansi.KeyCombo
-	ScrollUp   *ansi.KeyCombo
-	ScrollDown *ansi.KeyCombo
+	NavNext    *keys.KeyCombo
+	NavPrev    *keys.KeyCombo
+	Up         *keys.KeyCombo
+	Down       *keys.KeyCombo
+	ScrollUp   *keys.KeyCombo
+	ScrollDown *keys.KeyCombo
 }
 
 type Config struct {
@@ -96,22 +96,22 @@ func Load() (*Config, error) {
 	}
 
 	config.KeyBindings = &KeyBindings{}
-	if config.KeyBindings.NavNext, err = ansi.ParseHumanName(config.KeyBindingsDefintion.NavNext); err != nil {
+	if config.KeyBindings.NavNext, err = keys.ParseHumanName(config.KeyBindingsDefintion.NavNext); err != nil {
 		return nil, fmt.Errorf("navNext key binding was invalid: %s", config.KeyBindingsDefintion.NavNext)
 	}
-	if config.KeyBindings.NavPrev, err = ansi.ParseHumanName(config.KeyBindingsDefintion.NavPrev); err != nil {
+	if config.KeyBindings.NavPrev, err = keys.ParseHumanName(config.KeyBindingsDefintion.NavPrev); err != nil {
 		return nil, fmt.Errorf("navPrev key binding was invalid: %s", config.KeyBindingsDefintion.NavPrev)
 	}
-	if config.KeyBindings.Up, err = ansi.ParseHumanName(config.KeyBindingsDefintion.Up); err != nil {
+	if config.KeyBindings.Up, err = keys.ParseHumanName(config.KeyBindingsDefintion.Up); err != nil {
 		return nil, fmt.Errorf("up key binding was invalid: %s", config.KeyBindingsDefintion.Up)
 	}
-	if config.KeyBindings.Down, err = ansi.ParseHumanName(config.KeyBindingsDefintion.Down); err != nil {
+	if config.KeyBindings.Down, err = keys.ParseHumanName(config.KeyBindingsDefintion.Down); err != nil {
 		return nil, fmt.Errorf("down key binding was invalid: %s", config.KeyBindingsDefintion.Down)
 	}
-	if config.KeyBindings.ScrollUp, err = ansi.ParseHumanName(config.KeyBindingsDefintion.ScrollUp); err != nil {
+	if config.KeyBindings.ScrollUp, err = keys.ParseHumanName(config.KeyBindingsDefintion.ScrollUp); err != nil {
 		return nil, fmt.Errorf("scrollUp key binding was invalid: %s", config.KeyBindingsDefintion.ScrollUp)
 	}
-	if config.KeyBindings.ScrollDown, err = ansi.ParseHumanName(config.KeyBindingsDefintion.ScrollDown); err != nil {
+	if config.KeyBindings.ScrollDown, err = keys.ParseHumanName(config.KeyBindingsDefintion.ScrollDown); err != nil {
 		return nil, fmt.Errorf("scrollDown key binding was invalid: %s", config.KeyBindingsDefintion.ScrollDown)
 	}
 

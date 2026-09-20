@@ -8,21 +8,24 @@ import (
 	"syscall"
 
 	"github.com/creack/pty"
+	"github.com/exadrift/go/ansi/style"
 	"github.com/exadrift/go/tui/internal/terminal"
 	"github.com/exadrift/vt10x"
 )
 
 type Shell struct {
-	*Box
-	term         vt10x.Terminal
-	ptyFile      *os.File
-	renderChan   chan string
-	scrollOffest int
+	*Container
+	term       vt10x.Terminal
+	ptyFile    *os.File
+	renderChan chan string
+
+	// offset where 0 is the present moment in time, and anything < 0 is scrolled up by n lines
+	scrollOffset int
 }
 
 func NewShell() *Shell {
 	return &Shell{
-		Box:        NewBox().EnableScrollHandle(true),
+		Container:  NewContainer(),
 		term:       vt10x.New(vt10x.WithSize(40, 25)),
 		renderChan: make(chan string, 1000),
 	}
@@ -57,8 +60,7 @@ func (s *Shell) Start(app *Application, cmd *exec.Cmd) error {
 
 			// Enqueue a redraw request
 			app.RequestRedrawComponent(RedrawRequest{
-				Widget:     s,
-				RenderMode: RenderModeContent,
+				Widget: s,
 			})
 		}
 	}()
@@ -66,48 +68,45 @@ func (s *Shell) Start(app *Application, cmd *exec.Cmd) error {
 	return nil
 }
 
-func (s *Shell) Render(mode RenderMode, focusItem Widget) {
-	contentDims := s.GetContentDimensions()
-	termWidth, termHeight := s.term.Size()
-
-	if contentDims.Width != termWidth || contentDims.Height != termHeight {
-		s.term.Resize(contentDims.Width, contentDims.Height)
-		termWidth, termHeight = s.term.Size()
-		if err := pty.Setsize(s.ptyFile, &pty.Winsize{
-			Cols: uint16(termWidth),
-			Rows: uint16(termHeight),
-		}); err != nil {
-			panic(err)
-		}
-	}
-
+func (s *Shell) Render(contentWindow *ContentWindow, focusItem Widget) {
 	historyLength := s.term.HistoryBufferLength()
-
-	zeroScroll := historyLength - contentDims.Height
-	if zeroScroll+s.scrollOffest < 0 {
-		s.scrollOffest = 0 - zeroScroll
+	if historyLength < s.GetContentDimensions().Height {
+		historyLength = s.GetContentDimensions().Height
 	}
 
-	s.scrollWindow.scrollPosition = zeroScroll + s.scrollOffest
-	if s.scrollOffest == 0 {
-		s.RenderWithScroll(mode, focusItem, historyLength, -1, nil)
-		for y, ansiRow := range s.term.AnsiRows() {
-			terminal.SetCursorPos(contentDims.Left, contentDims.Top+y)
-			fmt.Print(ansiRow)
+	cw := NewContentWindow(0, s.GetContentDimensions(), WithContentWindowRowLoadCallback(historyLength, func(cw *ContentWindow) []*style.Text {
+		termWidth, termHeight := s.term.Size()
+		if cw.ContentDimensions.Width != termWidth || cw.ContentDimensions.Height != termHeight {
+			s.term.Resize(cw.ContentDimensions.Width, cw.ContentDimensions.Height)
+			if err := pty.Setsize(s.ptyFile, &pty.Winsize{
+				Cols: uint16(cw.ContentDimensions.Width),
+				Rows: uint16(cw.ContentDimensions.Height),
+			}); err != nil {
+				panic(err)
+			}
 		}
-	} else {
-		hist := s.term.History(0 + s.scrollOffest)
-		s.RenderWithScroll(mode, focusItem, historyLength, -1, func(index int) string {
-			// index here is going to be based from the beginning of history, so we need to account for that by subtracting the scroll position
-			// the history buffer width could be different from the current terminal width, and thus we must constrain the width
-			return hist[index-s.scrollWindow.scrollPosition]
-		})
-	}
 
-	if s == focusItem {
+		// this scrollOffset always should be <= 0
+		zeroScroll := historyLength - cw.ContentDimensions.Height
+		scrollPosition := zeroScroll + s.scrollOffset
+		if scrollPosition < 0 {
+			s.scrollOffset -= scrollPosition
+			scrollPosition = 0
+		}
+		cw.ScrollPosition = scrollPosition
+
+		if s.scrollOffset == 0 {
+			return s.term.TextRows()
+		}
+
+		return s.term.History(s.scrollOffset)
+	}))
+	s.Container.Render(cw, focusItem)
+
+	if s == focusItem && s.scrollOffset == 0 {
 		// if shell is in focus, place the cursor at the location
 		cur := s.term.Cursor()
-		terminal.SetCursorPos(contentDims.Left+cur.X, contentDims.Top+cur.Y)
+		terminal.SetCursorPos(cw.ContentDimensions.Left+cur.X, cw.ContentDimensions.Top+cur.Y)
 		terminal.ShowCursor()
 	}
 }
@@ -115,14 +114,14 @@ func (s *Shell) Render(mode RenderMode, focusItem Widget) {
 func (s *Shell) CaptureInput(r string) string {
 	switch r {
 	case CtrlPgUp:
-		s.scrollOffest -= s.dimensions.Height / 2
+		s.scrollOffset -= s.dimensions.Height / 2
 	case CtrlPgDn:
-		s.scrollOffest += s.dimensions.Height / 2
-		if s.scrollOffest > 0 {
-			s.scrollOffest = 0
+		s.scrollOffset += s.dimensions.Height / 2
+		if s.scrollOffset > 0 {
+			s.scrollOffset = 0
 		}
 	default:
-		s.scrollOffest = 0
+		s.scrollOffset = 0
 		_, _ = s.ptyFile.Write([]byte(r))
 	}
 

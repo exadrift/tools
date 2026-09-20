@@ -49,18 +49,20 @@ func NewSegment(portion int, child Widget, options ...*Option) *Segment {
 }
 
 type FlexLayout struct {
-	*Box
+	*Container
 	children    []Widget
 	orientation Orientation
 	segments    []*Segment
 	size        int
+	gutter      int
 }
 
 // NewFlexLayout returns a FlexLayout
-func NewFlexLayout(orientation Orientation, segments ...*Segment) *FlexLayout {
+func NewFlexLayout(orientation Orientation, gutterSize int, segments ...*Segment) *FlexLayout {
 	flexLayout := &FlexLayout{
-		Box:         NewBox(),
+		Container:   NewContainer(),
 		orientation: orientation,
+		gutter:      gutterSize,
 	}
 
 	flexLayout.segments = make([]*Segment, len(segments))
@@ -96,12 +98,13 @@ func adjustSize(size int, minSize int, maxSize int) int {
 }
 
 func (f *FlexLayout) SetDimensions(left int, top int, width int, height int) {
-	f.Box.SetDimensions(left, top, width, height)
+	f.Container.SetDimensions(left, top, width, height)
 	initialTop := top
 	initialLeft := left
 	childLeft := left
 	childTop := top
-	for _, segment := range f.segments {
+	accumSize := 0
+	for i, segment := range f.segments {
 		portion := float64(segment.portion) / float64(f.size)
 		var size int
 		switch f.orientation {
@@ -111,8 +114,20 @@ func (f *FlexLayout) SetDimensions(left int, top int, width int, height int) {
 			if childLeft+size-initialLeft > width {
 				size = width - (childLeft - initialLeft)
 			}
+
+			origSize := size
+			if i < len(f.segments)-1 {
+				size -= f.gutter
+			} else {
+				// for the last segment, make sure goes all the way to the right (overcome any rounding error)
+				size = width - accumSize
+			}
+
+			size = adjustSize(size, segment.minChars, segment.maxChars)
 			segment.child.SetDimensions(childLeft, top, size, height)
-			childLeft += size
+
+			childLeft += origSize
+			accumSize += origSize
 
 		case OrientationVertical:
 			size = int(math.Round(portion * float64(height)))
@@ -120,8 +135,20 @@ func (f *FlexLayout) SetDimensions(left int, top int, width int, height int) {
 			if childTop+size+initialTop > height {
 				size = height - (childTop - initialTop)
 			}
+
+			origSize := size
+			if i < len(f.segments)-1 {
+				size -= f.gutter
+			} else {
+				// for the last segment, make sure goes all the way to the right (overcome any rounding error)
+				size = height - accumSize
+			}
+
+			size = adjustSize(size, segment.minChars, segment.maxChars)
 			segment.child.SetDimensions(left, childTop, width, size)
-			childTop += size
+
+			accumSize += origSize
+			childTop += origSize
 		}
 	}
 }

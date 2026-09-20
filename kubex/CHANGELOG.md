@@ -1,3 +1,5 @@
+# v0.3.0
+- adopt new tui
 # v0.2.11
 - don't allow the header to be focussed
 # v0.2.10

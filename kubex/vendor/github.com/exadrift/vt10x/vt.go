@@ -4,6 +4,8 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+
+	"github.com/exadrift/go/ansi/style"
 )
 
 const DefaultHistoryBufferSize int = 10000
@@ -43,12 +45,12 @@ type View interface {
 	// background color at position (x, y) relative to the top left of the terminal.
 	Cell(x, y int) Glyph
 
-	// AnsiRows returns the contents as a list of ANSI strings
-	AnsiRows() []string
+	// TextRows returns the contents as a list of *style.Text items
+	TextRows() []*style.Text
 
 	// History returns a viewport sized array of lines representing the scrollback history, starting from offset.
 	// An offset of zero represents the current moment in time
-	History(offset int) []string
+	History(offset int) []*style.Text
 
 	// HistoryBufferLength returns the length of the history buffer, including the active termninal height
 	HistoryBufferLength() int
