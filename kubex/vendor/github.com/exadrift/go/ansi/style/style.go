@@ -171,6 +171,9 @@ func T(items ...any) *Text {
 			st := &StyledText{text: ty}
 			parts = append(parts, st)
 			length += st.Len()
+		case *Text:
+			parts = append(parts, ty.parts...)
+			length += ty.length
 		default:
 			panic(fmt.Errorf("unsupported type when initializing textline: %T", ty))
 		}

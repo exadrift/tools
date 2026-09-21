@@ -1,3 +1,5 @@
+# v0.0.16
+- add loader background
 # v0.0.15
 - update backgrounds
 # v0.0.14

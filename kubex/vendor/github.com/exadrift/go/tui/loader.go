@@ -1,7 +1,6 @@
 package tui
 
 import (
-	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -13,15 +12,20 @@ var LoaderImages = []string{"⣷", "⣯", "⣟", "⡿", "⢿", "⣻", "⣽", "�
 
 type Loader struct {
 	*Container
-	Label      *style.Text
-	lock       sync.Mutex
-	isBusyChan chan struct{}
+	Label         *style.Text
+	lock          sync.Mutex
+	isBusyChan    chan struct{}
+	borderStyles  style.Styles
+	spinnerStyles style.Styles
 }
 
 func NewLoader() *Loader {
-	return &Loader{
+	l := &Loader{
 		Container: NewContainer(),
 	}
+	l.SetBackgroundStyle(nil)
+	l.SetFocusedBackgroundStyle(nil)
+	return l
 }
 
 func (l *Loader) SetLabel(label any) {
@@ -30,23 +34,30 @@ func (l *Loader) SetLabel(label any) {
 	l.Label = ProcessToStyledText(label)
 }
 
+func (l *Loader) SetBorderStyles(styles ...*style.Style) *Loader {
+	l.borderStyles = styles
+	return l
+}
+
+func (l *Loader) SetSpinnerStyles(styles ...*style.Style) *Loader {
+	l.spinnerStyles = styles
+	return l
+}
+
 func (l *Loader) Render(contentWindow *ContentWindow, focusItem Widget) {
-	l.backgroundStyle = nil
-	l.focusBackgroundStyle = nil
 	l.lock.Lock()
 	defer l.lock.Unlock()
 
 	dimensions := l.GetDimensions()
 	width := l.Label.Len()
 
-	rendered, _ := l.Label.Render()
 	rows := []*style.Text{
-		style.T(strings.Repeat(" ", width+6)),
-		style.T(" ", strings.Repeat("█", width+4), " "),
-		style.T(" █", strings.Repeat(" ", width+2), "█ "),
-		style.T(" █ ", rendered, " █ "),
-		style.T(" █", strings.Repeat(" ", width+2), "█ "),
-		style.T(" ", strings.Repeat("█", width+4), " "),
+		style.T(style.S(strings.Repeat(" ", width+6), l.borderStyles...)),
+		style.T(" ", style.S(strings.Repeat("█", width+4), l.borderStyles...), " "),
+		style.T(style.S(" █", l.borderStyles...), strings.Repeat(" ", width+2), style.S("█ ", l.borderStyles...)),
+		style.T(style.S(" █ ", l.borderStyles...), l.Label, style.S(" █ ", l.borderStyles...)),
+		style.T(style.S(" █", l.borderStyles...), strings.Repeat(" ", width+2), style.S("█ ", l.borderStyles...)),
+		style.T(" ", style.S(strings.Repeat("█", width+4), l.borderStyles...), " "),
 		style.T(strings.Repeat(" ", width+6)),
 	}
 
@@ -65,7 +76,7 @@ func (l *Loader) Render(contentWindow *ContentWindow, focusItem Widget) {
 
 // SetBusy sets the busy status on the application component.  If becoming busy, a thread will be started with a UI
 // timer to set render events, if becoming not busy, the timer will stop
-func (l *Loader) Show(label string) {
+func (l *Loader) Show(label any) {
 	l.isBusyChan = make(chan struct{}, 1)
 	a := appSingleton
 
@@ -83,7 +94,7 @@ func (l *Loader) Show(label string) {
 				return
 			case <-ticker.C:
 				// update the label and send a redraw request
-				l.SetLabel(fmt.Sprintf("%s %s", LoaderImages[loaderFrame], label))
+				l.SetLabel(style.T(style.S(LoaderImages[loaderFrame], l.spinnerStyles...), " ", label))
 				a.RequestRedrawComponent(RedrawRequest{
 					Widget: l,
 				})

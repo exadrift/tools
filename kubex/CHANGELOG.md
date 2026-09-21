@@ -1,3 +1,5 @@
+# v0.3.1
+- style the loader
 # v0.3.0
 - adopt new tui
 # v0.2.11
