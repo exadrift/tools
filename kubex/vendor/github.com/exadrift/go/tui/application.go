@@ -38,7 +38,7 @@ type Application struct {
 	root         Widget
 	keyBindings  *KeyBindings
 	dimensions   Dimensions
-	loader       *Loader
+	Loader       *Loader
 
 	isBusy atomic.Bool
 }
@@ -124,7 +124,7 @@ func New(root Widget, options ...Option) *Application {
 		closeChan:  make(chan struct{}, 1),
 		redrawChan: make(chan RedrawRequest, 1000),
 		safeOpChan: make(chan func(), 1000),
-		loader:     NewLoader(),
+		Loader:     NewLoader(),
 	}
 	appSingleton = app
 
@@ -415,7 +415,7 @@ func (a *Application) SetDimensions(left int, top int, width int, height int) {
 	a.dimensions.Width = width
 	a.dimensions.Height = height
 
-	a.loader.SetDimensions(0, 0, width, height)
+	a.Loader.SetDimensions(0, 0, width, height)
 	a.root.SetDimensions(0, 0, width, height)
 }
 
@@ -423,11 +423,11 @@ func (a *Application) SetDimensions(left int, top int, width int, height int) {
 // timer to set render events, if becoming not busy, the timer will stop
 func (a *Application) ShowLoader(message string) {
 	a.isBusy.Store(true)
-	a.loader.Show(message)
+	a.Loader.Show(message)
 }
 
 // HideLoader hides the loader and allows keyboard events again
 func (a *Application) HideLoader() {
-	a.loader.Hide()
+	a.Loader.Hide()
 	a.isBusy.Store(false)
 }

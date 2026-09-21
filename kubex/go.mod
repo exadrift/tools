@@ -3,8 +3,8 @@ module github.com/exadrift/tools/kubex
 go 1.26.4
 
 require (
-	github.com/exadrift/go/ansi v0.0.26
-	github.com/exadrift/go/tui v0.0.15
+	github.com/exadrift/go/ansi v0.0.27
+	github.com/exadrift/go/tui v0.0.16
 )
 
 require (

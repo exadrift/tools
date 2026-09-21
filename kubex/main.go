@@ -147,6 +147,9 @@ func main() {
 	bindings.ScrollUp = cfg.KeyBindings.ScrollUp.Ansi
 	bindings.ScrollDown = cfg.KeyBindings.ScrollDown.Ansi
 	app := tui.New(layout, *tui.WithApplicationOptionKeyBindings(bindings)).SetFocus(shell)
+	app.Loader.SetBackgroundStyle(style.FromRgb(40, 40, 40).Bg())
+	app.Loader.SetBorderStyles(style.Blue.Fg())
+	app.Loader.SetSpinnerStyles(style.Green.Fg())
 
 	contexts, err := kubectl.GetContexts()
 	if err != nil {

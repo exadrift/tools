@@ -10,12 +10,16 @@ github.com/davecgh/go-spew v1.1.1 h1:vj9j/u1bqnvCEfJOwUhtlOARqs3+rkHYY13jYWTU97c
 github.com/davecgh/go-spew v1.1.1/go.mod h1:J7Y8YcW2NihsgmVo/mv3lAwl/skON4iLHjSsI+c5H38=
 github.com/exadrift/go/ansi v0.0.26 h1:LimNiwoeU1n1qccglCbUA/WjAa1HJYuWzQtMW/o1NsU=
 github.com/exadrift/go/ansi v0.0.26/go.mod h1:WBTcjclFuAikw2HN7/mB6b6HQDmywkJ4HzW5G6jpXZk=
+github.com/exadrift/go/ansi v0.0.27 h1:sGfv7dagVW7ndqHiwgWemD2mJMfw220DvXwC7xu8Nu0=
+github.com/exadrift/go/ansi v0.0.27/go.mod h1:WBTcjclFuAikw2HN7/mB6b6HQDmywkJ4HzW5G6jpXZk=
 github.com/exadrift/go/ringbuf v0.0.1 h1:8XL/++4CuR4/nakry0hiN2H6RVW6NN5fiEl6NPrbrXE=
 github.com/exadrift/go/ringbuf v0.0.1/go.mod h1:NrzM7Kipwul9lUtUn/5s0pJl3rWPFuhxCLaZo+mDrW4=
 github.com/exadrift/go/tui v0.0.14 h1:7qNXu0bosf1Mewn2qJ89y3Z7JT7W8cBd8zXS3Fcow+k=
 github.com/exadrift/go/tui v0.0.14/go.mod h1:6QMj7GRuT3U4cF52sp62hLWsMnyf/b97EPde1OFtLlY=
 github.com/exadrift/go/tui v0.0.15 h1:uAQYugX7grQkeoNkpjoVe/Se0bR2eFAoi6b08+PSSf4=
 github.com/exadrift/go/tui v0.0.15/go.mod h1:6QMj7GRuT3U4cF52sp62hLWsMnyf/b97EPde1OFtLlY=
+github.com/exadrift/go/tui v0.0.16 h1:Di9k22ykbnj5IW8JU32NWZIh4t1GzUsdF/UV7+IVkQk=
+github.com/exadrift/go/tui v0.0.16/go.mod h1:HAEFanSDliZJt8sdLxHulT4HHP0+e0UV5otVGRcNS10=
 github.com/exadrift/vt10x v0.0.14 h1:s1FUFSHTJcwnHnCMNt/ggYFEjII8E38rudUMa0HP/wk=
 github.com/exadrift/vt10x v0.0.14/go.mod h1:TI1JurlVplkeiXlg87EDYEgKbEr9rWwN6F1n72YGa7A=
 github.com/mattn/go-isatty v0.0.14 h1:yVuAays6BHfxijgZPzw+3Zlu5yQgKGP2/hcQbHb7S9Y=
