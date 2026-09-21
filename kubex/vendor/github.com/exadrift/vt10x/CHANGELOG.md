@@ -1,3 +1,13 @@
+# v0.0.14
+- fix issue with color changes not updating
+# v0.0.13
+- update style module
+# v0.0.12
+- return the terminal as a list of rows, not a block object
+# v0.0.11
+- update to the latest style system
+# v0.0.10
+- switched to style.Text based row renderer
 # v0.0.9
 - better distinguish between rgb and palette
 # v0.0.8

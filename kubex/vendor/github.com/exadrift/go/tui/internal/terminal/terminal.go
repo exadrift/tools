@@ -41,7 +41,7 @@ func ShowCursor() {
 }
 
 func Clear() {
-	fmt.Print("\x1b[H\n\x1b[2J")
+	fmt.Printf("\x1b[H\n\x1b[2J")
 }
 
 func SetAlternateScreen() {

@@ -18,8 +18,7 @@ const (
 )
 
 type RedrawRequest struct {
-	Widget     Widget
-	RenderMode RenderMode
+	Widget Widget
 }
 
 type Application struct {
@@ -235,33 +234,42 @@ func (a *Application) handleInput(input string) string {
 }
 
 func (a *Application) renderAll() {
-	a.renderWidgets(RenderModeAll, a.root.Collect(a.root)...)
+	a.renderWidgets(a.root.Collect(a.root)...)
 }
 
 func (a *Application) renderAllRefocus() {
-	a.renderWidgets(RenderModeBorder, a.root.Collect(a.root)...)
+	a.renderWidgets(a.root.Collect(a.root)...)
 }
 
 func (a *Application) renderFocused() {
-	a.renderWidgets(RenderModeContent, a.inFocus)
+	a.renderWidgets(a.inFocus)
 }
 
 func (a *Application) RequestRedrawComponent(req RedrawRequest) {
 	a.redrawChan <- req
 }
 
-func (a *Application) renderWidgets(renderMode RenderMode, widgets ...Widget) {
+func (a *Application) renderWidgets(widgets ...Widget) {
+	// make sure to render the in-focus item last, so that we can establish the cursor position
 	terminal.HideCursor()
 	for _, w := range widgets {
 		if w == a.inFocus {
 			continue
 		}
 
-		w.Render(renderMode, a.inFocus)
+		ctr := w.GetContainer()
+		ctrDims := ctr.GetContentDimensions()
+		if ctrDims.Width > 0 && ctrDims.Height > 0 {
+			w.Render(nil, a.inFocus)
+		}
 	}
 
 	if a.inFocus != nil {
-		a.inFocus.Render(renderMode, a.inFocus)
+		ctr := a.inFocus.GetContainer()
+		ctrDims := ctr.GetContentDimensions()
+		if ctrDims.Width > 0 && ctrDims.Height > 0 {
+			a.inFocus.Render(nil, a.inFocus)
+		}
 	}
 }
 
@@ -318,7 +326,6 @@ func (a *Application) Start() error {
 	terminal.Clear()
 
 	defer terminal.ShowCursor()
-
 	defer terminal.SetOriginalScreen()
 
 	width, height, err := term.GetSize(a.termFd)
@@ -345,12 +352,14 @@ func (a *Application) Start() error {
 				return err
 			}
 			a.SetDimensions(0, 0, width, height)
+			terminal.Clear()
 			a.renderAll()
 		case req := <-a.redrawChan:
 			if req.Widget == nil {
+				terminal.Clear()
 				a.renderAll()
 			} else {
-				req.Widget.Render(req.RenderMode, a.inFocus)
+				req.Widget.Render(nil, a.inFocus)
 			}
 		case op := <-a.safeOpChan:
 			// performs a UI blocking op w/o clobbering internal data

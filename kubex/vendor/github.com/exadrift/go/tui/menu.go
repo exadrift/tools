@@ -3,27 +3,29 @@ package tui
 import (
 	"fmt"
 	"sync"
+
+	"github.com/exadrift/go/ansi/style"
 )
 
 type Menu struct {
-	*Box
-	contents      []string
+	*Container
+	contents      [][]rune
 	index         map[string]int
 	selectedIndex int
 	selectHandler func(int, string) any
 	completer     func(any)
 	busyLabel     string
 
-	nonSelectedStyle string
-	selectedStyle    string
+	nonSelectedStyle style.Styles
+	selectedStyle    style.Styles
 }
 
 func NewMenu(contents ...string) *Menu {
 	menu := &Menu{
-		Box: NewBox(),
+		Container: NewContainer(),
 	}
 
-	menu.selectedStyle = StyleFgBg(White, Blue)
+	menu.selectedStyle = style.Styles{style.Blue.Bg(), style.White.Fg()}
 
 	menu.SetContents(contents...)
 
@@ -48,16 +50,20 @@ func (m *Menu) SetSelectHandler(h func(selectedIndex int, selectedItem string) a
 	return m
 }
 
-// SetStyle sets independent styles for the selected and non-selected states.  Each style is expected to be
-// represented as an ANSI escape sequence.  An empty string indicates no applied style.
-func (m *Menu) SetStyle(selected string, nonSelected string) *Menu {
-	m.selectedStyle = selected
-	m.nonSelectedStyle = nonSelected
+// SetSelectedStyle sets styles for the selected row
+func (m *Menu) SetSelectedStyle(styles ...*style.Style) *Menu {
+	m.selectedStyle = styles
+	return m
+}
+
+// SetNonSelectedStyle sets styles for the non-selected row
+func (m *Menu) SetNonSelectedStyle(styles ...*style.Style) *Menu {
+	m.nonSelectedStyle = styles
 	return m
 }
 
 func (m *Menu) SetContents(contents ...string) *Menu {
-	m.contents = make([]string, len(contents))
+	m.contents = make([][]rune, len(contents))
 	m.index = make(map[string]int, len(contents))
 	m.selectedIndex = 0
 
@@ -65,7 +71,7 @@ func (m *Menu) SetContents(contents ...string) *Menu {
 
 	for i, item := range contents {
 		// sorry, menus shouldn't have any ANSI codes in them
-		m.contents[i] = StripAnsiCodes(item)
+		m.contents[i] = []rune(StripAnsiCodes(item))
 	}
 	for i, val := range contents {
 		m.index[val] = i
@@ -92,19 +98,29 @@ func (m *Menu) SetSelectedItem(item string) *Menu {
 	return m
 }
 
-func (m *Menu) Render(mode RenderMode, focusItem Widget) {
-	contentLength := len(m.contents)
-	m.EnableScrollHandle(contentLength > m.contentDimensions.Height)
+func (m *Menu) Render(contentWindow *ContentWindow, focusItem Widget) {
+	dimensions := m.GetContentDimensions()
 
-	m.RenderWithScroll(mode, focusItem, contentLength, m.selectedIndex, func(index int) string {
-		menuLabel := Pad(Constrain(m.contents[index], m.contentDimensions.Width), m.contentDimensions.Width)
-		switch index {
-		case m.selectedIndex:
-			return fmt.Sprintf("%s%s%s", m.selectedStyle, menuLabel, StyleReset)
-		default:
-			return fmt.Sprintf("%s%s%s", m.nonSelectedStyle, menuLabel, StyleReset)
+	if m.selectedIndex-m.scrollPosition >= dimensions.Height {
+		m.scrollPosition = m.selectedIndex - dimensions.Height + 1
+	}
+
+	if m.selectedIndex < m.scrollPosition {
+		m.scrollPosition = m.selectedIndex
+	}
+
+	contentDimensions := m.GetContentDimensions()
+	cw := NewContentWindow(m.scrollPosition, contentDimensions, WithContentWindowRowCallback(len(m.contents), func(rowIndex int, yIndex int, width int) *style.Text {
+		if rowIndex >= len(m.contents) {
+			return nil
 		}
-	})
+		bareRow := Pad(m.contents[rowIndex], width)
+		if m.selectedIndex == rowIndex {
+			return style.T(style.S(bareRow, m.selectedStyle...))
+		}
+		return style.T(style.S(bareRow, m.nonSelectedStyle...))
+	}))
+	m.Container.Render(cw, focusItem)
 }
 
 func (m *Menu) CaptureInput(r string) string {
@@ -116,7 +132,7 @@ func (m *Menu) CaptureInput(r string) string {
 	case appSingleton.keyBindings.Trigger:
 		if m.selectHandler != nil {
 			if m.completer == nil {
-				m.selectHandler(m.selectedIndex, m.contents[m.selectedIndex])
+				m.selectHandler(m.selectedIndex, string(m.contents[m.selectedIndex]))
 				return RenderFullCode
 			}
 
@@ -128,7 +144,7 @@ func (m *Menu) CaptureInput(r string) string {
 				var resp any
 				go func() {
 					defer wg.Done()
-					resp = m.selectHandler(m.selectedIndex, m.contents[m.selectedIndex])
+					resp = m.selectHandler(m.selectedIndex, string(m.contents[m.selectedIndex]))
 				}()
 				wg.Wait()
 				appSingleton.Async(func() {

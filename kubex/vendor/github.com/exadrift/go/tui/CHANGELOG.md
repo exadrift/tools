@@ -1,3 +1,7 @@
+# v0.0.15
+- update backgrounds
+# v0.0.14
+- update the terminal
 # v0.0.13
 - numerous measurement bug fixes
 - added styling to box

@@ -6,7 +6,8 @@ import (
 	"os"
 	"os/exec"
 
-	"github.com/exadrift/go/ansi"
+	"github.com/exadrift/go/ansi/keys"
+	"github.com/exadrift/go/ansi/style"
 	"github.com/exadrift/go/tui"
 	"github.com/exadrift/tools/kubex/internal/config"
 	"github.com/exadrift/tools/kubex/internal/kubectl"
@@ -62,7 +63,7 @@ func main() {
 		}
 
 		if arg == "--keys" {
-			for _, keyCombo := range ansi.AllKeys {
+			for _, keyCombo := range keys.AllKeys {
 				if len(keyCombo.HumanName) > 1 {
 					fmt.Printf("%s\n", keyCombo.HumanName)
 				}
@@ -104,20 +105,28 @@ func main() {
 	}
 
 	contextMenu := tui.NewMenu()
-	contextMenu.EnableBorder(true).SetTitle("context")
+	contextMenu.SetTitle("context")
 
 	namespaceMenu := tui.NewMenu()
-	namespaceMenu.EnableBorder(true).SetTitle("namespace")
+	namespaceMenu.SetTitle("namespace")
 
 	shell := tui.NewShell()
-	shell.EnableBorder(true).SetTitle("terminal")
+	shell.SetTitle("terminal")
 
-	topBar := tui.NewText(fmt.Sprintf(" kubex %s - ctrl+c to exit (ctrl+d to exit shell)", Version))
-	topBar.EnableBorder(true).SetStyle(tui.StyleFg(tui.White), tui.StyleBg(tui.Blue))
+	topText := style.B(
+		style.T(
+			style.S("kubex ", style.White.Fg()),
+			style.S(Version, style.White.Fg()),
+			style.S(" - ctrl+c to exit (ctrl+d to exit shell)", style.Black.Fg()),
+		),
+	)
+	topBar := tui.NewText(topText)
 	topBar.SetFocusable(false)
+	topBar.SetBackgroundStyle(style.FromRgb(111, 25, 224).Bg())
 
 	selectableLayout := tui.NewFlexLayout(
 		tui.OrientationHorizontal,
+		1,
 		tui.NewSegment(1, contextMenu),
 		tui.NewSegment(1, namespaceMenu),
 		tui.NewSegment(3, shell),
@@ -125,7 +134,8 @@ func main() {
 
 	layout := tui.NewFlexLayout(
 		tui.OrientationVertical,
-		tui.NewSegment(1, topBar, tui.WithSegmentOptionMinChars(3)),
+		1,
+		tui.NewSegment(1, topBar, tui.WithSegmentOptionMinChars(1)),
 		tui.NewSegment(1000, selectableLayout),
 	)
 

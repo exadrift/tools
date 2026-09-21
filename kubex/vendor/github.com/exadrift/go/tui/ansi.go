@@ -8,7 +8,6 @@ import (
 
 var ansiEscStripper = regexp.MustCompile(`\x1b\[[0-9;]*[a-zA-Z]`)
 var textWrapTokenizerNewline = regexp.MustCompile(`(\x1b\[[0-9;]*[a-zA-Z])|(\n)`)
-var spaces = strings.Repeat(" ", 10000)
 
 type TokenType int
 
@@ -168,39 +167,6 @@ func SplitAtAnsiTokens(text string) []*StringToken {
 	}
 
 	return tokens
-}
-
-func ConstrainAnsiFullWidth(text string, width int) string {
-	var remaining int
-	totalWidth := 0
-	var stringBuilder strings.Builder
-	stringBuilder.Grow(len(text))
-	tokens := SplitAtAnsiTokens(text)
-	for _, token := range tokens {
-		switch token.TokenType {
-		case TokenTypeAnsiCode:
-			stringBuilder.WriteString(token.Text)
-		default:
-			remaining = width - totalWidth
-			if remaining == 0 {
-				continue
-			}
-			strLen := len(token.Text)
-			if strLen < remaining {
-				stringBuilder.WriteString(token.Text)
-				totalWidth += strLen
-			} else {
-				stringBuilder.WriteString(token.Text[:remaining])
-				totalWidth += remaining
-			}
-		}
-	}
-
-	if totalWidth < width {
-		stringBuilder.WriteString(spaces[:width-totalWidth])
-	}
-
-	return stringBuilder.String()
 }
 
 // Returns an array of text which separates each line of text at the wrapping point (width)

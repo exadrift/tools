@@ -92,24 +92,26 @@ for y := 0; y < term.rows; y++ {
 the second interface allows for rendering of ANSI strings to an external terminal emulator.  if the application is being executed within a terminal emulator, such as gnome terminal, it often makes sense to merely output ANSI escaped text line by line in raw terminal mode and for that, this interface is available:
 
 ```
-rows := term.AnsiRows()
+rows := term.TextRows()
 for y, row := range rows {
     // set cursor position at the top left of the current row
-    fmt.Print(row)
+    data, _ := row.Render()
+    fmt.Println(data)
 }
 ```
 
 lastly, a similar interface is also supported to render data from the history buffer.
 
 ```
-// the 0 offset means no offset from the present.  it will be similar to simply calling term.AnsiRows().  A negative offset indicates a position back in the history buffer.  For example -10 would start from 10 rows above the top line
+// the 0 offset means no offset from the present.  it will be similar to simply calling term.TextRows().  A negative offset indicates a position back in the history buffer.  For example -10 would start from 10 rows above the top line
 // the history buffer size (including what's not yet part of the history) can be obtained by calling
 
 maxRows := term.HistoryBufferLength()
 rows := term.History(0)
 for y, row := range rows {
     // set cursor position at the top left of the current row
-    fmt.Print(row)
+    data, _ := row.Render()
+    fmt.Println(data)
 }
 ```
 
