@@ -10,6 +10,7 @@ import (
 	"github.com/exadrift/go/statusline"
 	"github.com/exadrift/tools/arbiter/internal/config"
 	"github.com/exadrift/tools/arbiter/internal/crypto"
+	"github.com/exadrift/tools/arbiter/internal/shared"
 	"github.com/spf13/cobra"
 )
 
@@ -18,14 +19,15 @@ func Command() *cobra.Command {
 		Use:   "init",
 		Short: "initialize talos project",
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return initialize()
+			cmd.SilenceUsage = true
+			return initCmd()
 		},
 	}
 
 	return base
 }
 
-func initialize() error {
+func initCmd() error {
 	sl := statusline.NewStatusLine()
 	defer sl.Stop()
 
@@ -66,17 +68,19 @@ func initialize() error {
 				if len(projectName) == 0 {
 					sl.Emit("❌ invalid project name")
 				}
-
-				configDir, err = config.GetConfigDir(projectName)
-				if err != nil {
-					return err
-				}
-
-				if _, err = os.Stat(configDir); err == nil {
-					sl.Emit("❌ a project named \"%s\" already exists in the configuration location", projectName)
-					projectName = ""
-				}
 			}
+		}
+
+		configDir, err = config.GetConfigDir(projectName)
+		if err != nil {
+			return err
+		}
+
+		sl.Emit("configuration will be stored at %s", configDir)
+
+		if _, err = os.Stat(configDir); err == nil {
+			sl.Emit("❌ a project named \"%s\" already exists in the configuration location", projectName)
+			projectName = ""
 		}
 
 		ipAddress := ""
@@ -112,6 +116,10 @@ func initialize() error {
 
 	if err = cfg.Save(); err != nil {
 		return err
+	}
+
+	if err = os.WriteFile(filepath.Join(dir, shared.NameRefFile), []byte(projectName), 0644); err != nil {
+		return fmt.Errorf("unable to write name reference file: %w", err)
 	}
 
 	sl.Emit("✅ project created")
