@@ -10,7 +10,6 @@ import (
 	"github.com/exadrift/go/statusline"
 	"github.com/exadrift/tools/arbiter/internal/config"
 	"github.com/exadrift/tools/arbiter/internal/crypto"
-	"github.com/exadrift/tools/arbiter/internal/shared"
 	"github.com/spf13/cobra"
 )
 
@@ -57,33 +56,35 @@ func initCmd() error {
 			}
 		}
 
-		_, dirEnd := filepath.Split(dir)
-		projectName = strings.ToLower(dirEnd)
-		if !sl.Confirm(true, "project name \"%s\"", projectName) {
-			projectName = ""
-			for len(projectName) == 0 {
-				projectName = sl.Prompt(false, "name of project:")
-				projectName = strings.Trim(projectName, " ")
+		for projectName == "" {
+			_, dirEnd := filepath.Split(dir)
+			projectName = strings.ToLower(dirEnd)
+			if !sl.Confirm(true, "project name \"%s\"", projectName) {
+				projectName = ""
+				for len(projectName) == 0 {
+					projectName = sl.Prompt(false, "name of project:")
+					projectName = strings.Trim(projectName, " ")
 
-				if len(projectName) == 0 {
-					sl.Emit("❌ invalid project name")
+					if len(projectName) == 0 {
+						sl.Emit("❌ invalid project name")
+					}
 				}
+			}
+
+			configDir, err = config.GetConfigDir(projectName)
+			if err != nil {
+				return err
+			}
+
+			sl.Emit("configuration will be stored at %s", configDir)
+
+			if _, err = os.Stat(configDir); err == nil {
+				sl.Emit("❌ a project named \"%s\" already exists in the configuration location", projectName)
+				projectName = ""
 			}
 		}
 
-		configDir, err = config.GetConfigDir(projectName)
-		if err != nil {
-			return err
-		}
-
-		sl.Emit("configuration will be stored at %s", configDir)
-
-		if _, err = os.Stat(configDir); err == nil {
-			sl.Emit("❌ a project named \"%s\" already exists in the configuration location", projectName)
-			projectName = ""
-		}
-
-		ipAddress := ""
+		ipAddress = ""
 		for len(ipAddress) == 0 {
 			ipAddress = sl.Prompt(false, "ip address of the talos instance:")
 			ipAddress = strings.Trim(ipAddress, " ")
@@ -118,7 +119,7 @@ func initCmd() error {
 		return err
 	}
 
-	if err = os.WriteFile(filepath.Join(dir, shared.NameRefFile), []byte(projectName), 0644); err != nil {
+	if err = cfg.SaveNameRef(); err != nil {
 		return fmt.Errorf("unable to write name reference file: %w", err)
 	}
 

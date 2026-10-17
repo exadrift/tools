@@ -1,3 +1,5 @@
+# v0.0.10
+- added time, time holding, etc.
 # v0.0.9
 - added string formatting
 # v0.0.8

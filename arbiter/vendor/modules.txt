@@ -1,3 +1,6 @@
+# cel.dev/expr v0.25.2
+## explicit; go 1.23.0
+cel.dev/expr
 # github.com/ProtonMail/go-crypto v1.4.1
 ## explicit; go 1.23.0
 github.com/ProtonMail/go-crypto/bitcurves
@@ -36,6 +39,12 @@ github.com/ProtonMail/gopenpgp/v3/profile
 github.com/adrg/xdg
 github.com/adrg/xdg/internal/pathutil
 github.com/adrg/xdg/internal/userdirs
+# github.com/antlr4-go/antlr/v4 v4.13.1
+## explicit; go 1.22
+github.com/antlr4-go/antlr/v4
+# github.com/blang/semver/v4 v4.0.0
+## explicit; go 1.14
+github.com/blang/semver/v4
 # github.com/cenkalti/backoff/v4 v4.3.0
 ## explicit; go 1.18
 github.com/cenkalti/backoff/v4
@@ -89,7 +98,7 @@ github.com/cosi-project/runtime/pkg/state/protobuf/client
 # github.com/dustin/go-humanize v1.0.1
 ## explicit; go 1.16
 github.com/dustin/go-humanize
-# github.com/exadrift/go/statusline v0.0.9
+# github.com/exadrift/go/statusline v0.0.10
 ## explicit; go 1.26.4
 github.com/exadrift/go/statusline
 # github.com/gertd/go-pluralize v0.2.1
@@ -106,6 +115,40 @@ github.com/goccy/go-yaml/parser
 github.com/goccy/go-yaml/printer
 github.com/goccy/go-yaml/scanner
 github.com/goccy/go-yaml/token
+# github.com/google/cel-go v0.31.0
+## explicit; go 1.23.0
+github.com/google/cel-go/cel
+github.com/google/cel-go/cel/async
+github.com/google/cel-go/checker
+github.com/google/cel-go/checker/decls
+github.com/google/cel-go/common
+github.com/google/cel-go/common/ast
+github.com/google/cel-go/common/containers
+github.com/google/cel-go/common/debug
+github.com/google/cel-go/common/decls
+github.com/google/cel-go/common/env
+github.com/google/cel-go/common/functions
+github.com/google/cel-go/common/operators
+github.com/google/cel-go/common/overloads
+github.com/google/cel-go/common/runes
+github.com/google/cel-go/common/stdlib
+github.com/google/cel-go/common/types
+github.com/google/cel-go/common/types/pb
+github.com/google/cel-go/common/types/ref
+github.com/google/cel-go/common/types/traits
+github.com/google/cel-go/interpreter
+github.com/google/cel-go/parser
+github.com/google/cel-go/parser/gen
+# github.com/google/go-cmp v0.7.0
+## explicit; go 1.21
+github.com/google/go-cmp/cmp
+github.com/google/go-cmp/cmp/internal/diff
+github.com/google/go-cmp/cmp/internal/flags
+github.com/google/go-cmp/cmp/internal/function
+github.com/google/go-cmp/cmp/internal/value
+# github.com/google/go-containerregistry v0.21.7
+## explicit; go 1.25.0
+github.com/google/go-containerregistry/pkg/name
 # github.com/grpc-ecosystem/grpc-gateway/v2 v2.30.0
 ## explicit; go 1.25.0
 github.com/grpc-ecosystem/grpc-gateway/v2/internal/httprule
@@ -120,6 +163,26 @@ github.com/hashicorp/go-multierror
 # github.com/inconshreveable/mousetrap v1.1.0
 ## explicit; go 1.18
 github.com/inconshreveable/mousetrap
+# github.com/jsimonetti/rtnetlink/v2 v2.2.1-0.20260802200809-43bafec815b3
+## explicit; go 1.25.0
+github.com/jsimonetti/rtnetlink/v2
+github.com/jsimonetti/rtnetlink/v2/internal/unix
+# github.com/mdlayher/ethtool v0.6.1
+## explicit; go 1.25.0
+github.com/mdlayher/ethtool
+# github.com/mdlayher/genetlink v1.4.0
+## explicit; go 1.25.0
+github.com/mdlayher/genetlink
+# github.com/mdlayher/netlink v1.11.2
+## explicit; go 1.25.0
+github.com/mdlayher/netlink
+github.com/mdlayher/netlink/nlenc
+# github.com/mdlayher/socket v0.6.1
+## explicit; go 1.25.0
+github.com/mdlayher/socket
+# github.com/opencontainers/go-digest v1.0.0
+## explicit; go 1.13
+github.com/opencontainers/go-digest
 # github.com/opencontainers/runtime-spec v1.3.0
 ## explicit
 github.com/opencontainers/runtime-spec/specs-go
@@ -135,6 +198,9 @@ github.com/planetscale/vtprotobuf/protohelpers
 github.com/planetscale/vtprotobuf/types/known/anypb
 github.com/planetscale/vtprotobuf/types/known/durationpb
 github.com/planetscale/vtprotobuf/types/known/timestamppb
+# github.com/ryanuber/go-glob v1.0.0
+## explicit
+github.com/ryanuber/go-glob
 # github.com/sasha-s/go-deadlock v0.3.9
 ## explicit
 github.com/sasha-s/go-deadlock
@@ -145,8 +211,12 @@ github.com/siderolabs/crypto/x509
 ## explicit; go 1.24.0
 github.com/siderolabs/gen/channel
 github.com/siderolabs/gen/ensure
+github.com/siderolabs/gen/maps
 github.com/siderolabs/gen/optional
+github.com/siderolabs/gen/pair/ordered
+github.com/siderolabs/gen/value
 github.com/siderolabs/gen/xslices
+github.com/siderolabs/gen/xyaml
 # github.com/siderolabs/go-api-signature v0.3.13
 ## explicit; go 1.25.10
 github.com/siderolabs/go-api-signature/api/auth
@@ -161,6 +231,9 @@ github.com/siderolabs/go-api-signature/pkg/serviceaccount
 # github.com/siderolabs/go-pointer v1.0.1
 ## explicit; go 1.23
 github.com/siderolabs/go-pointer
+# github.com/siderolabs/net v0.4.0
+## explicit; go 1.19
+github.com/siderolabs/net
 # github.com/siderolabs/protoenc v0.2.4
 ## explicit; go 1.24.0
 github.com/siderolabs/protoenc
@@ -170,20 +243,82 @@ github.com/siderolabs/talos/pkg/machinery/api/cluster
 github.com/siderolabs/talos/pkg/machinery/api/common
 github.com/siderolabs/talos/pkg/machinery/api/inspect
 github.com/siderolabs/talos/pkg/machinery/api/machine
+github.com/siderolabs/talos/pkg/machinery/api/resource/definitions/block
+github.com/siderolabs/talos/pkg/machinery/api/resource/definitions/enums
+github.com/siderolabs/talos/pkg/machinery/api/resource/definitions/network
+github.com/siderolabs/talos/pkg/machinery/api/resource/definitions/runtime
 github.com/siderolabs/talos/pkg/machinery/api/storage
 github.com/siderolabs/talos/pkg/machinery/api/time
+github.com/siderolabs/talos/pkg/machinery/cel
+github.com/siderolabs/talos/pkg/machinery/cel/celenv
 github.com/siderolabs/talos/pkg/machinery/client
 github.com/siderolabs/talos/pkg/machinery/client/config
 github.com/siderolabs/talos/pkg/machinery/client/dialer
 github.com/siderolabs/talos/pkg/machinery/client/resolver
+github.com/siderolabs/talos/pkg/machinery/compatibility
+github.com/siderolabs/talos/pkg/machinery/compatibility/talos110
+github.com/siderolabs/talos/pkg/machinery/compatibility/talos111
+github.com/siderolabs/talos/pkg/machinery/compatibility/talos112
+github.com/siderolabs/talos/pkg/machinery/compatibility/talos113
+github.com/siderolabs/talos/pkg/machinery/compatibility/talos114
+github.com/siderolabs/talos/pkg/machinery/compatibility/talos12
+github.com/siderolabs/talos/pkg/machinery/compatibility/talos13
+github.com/siderolabs/talos/pkg/machinery/compatibility/talos14
+github.com/siderolabs/talos/pkg/machinery/compatibility/talos15
+github.com/siderolabs/talos/pkg/machinery/compatibility/talos16
+github.com/siderolabs/talos/pkg/machinery/compatibility/talos17
+github.com/siderolabs/talos/pkg/machinery/compatibility/talos18
+github.com/siderolabs/talos/pkg/machinery/compatibility/talos19
+github.com/siderolabs/talos/pkg/machinery/config
+github.com/siderolabs/talos/pkg/machinery/config/config
+github.com/siderolabs/talos/pkg/machinery/config/configloader
+github.com/siderolabs/talos/pkg/machinery/config/configloader/internal/decoder
+github.com/siderolabs/talos/pkg/machinery/config/container
+github.com/siderolabs/talos/pkg/machinery/config/encoder
+github.com/siderolabs/talos/pkg/machinery/config/generate
+github.com/siderolabs/talos/pkg/machinery/config/generate/secrets
+github.com/siderolabs/talos/pkg/machinery/config/internal/cis
+github.com/siderolabs/talos/pkg/machinery/config/internal/registry
+github.com/siderolabs/talos/pkg/machinery/config/machine
+github.com/siderolabs/talos/pkg/machinery/config/merge
+github.com/siderolabs/talos/pkg/machinery/config/types
+github.com/siderolabs/talos/pkg/machinery/config/types/block
+github.com/siderolabs/talos/pkg/machinery/config/types/block/blockhelpers
+github.com/siderolabs/talos/pkg/machinery/config/types/cluster
+github.com/siderolabs/talos/pkg/machinery/config/types/container
+github.com/siderolabs/talos/pkg/machinery/config/types/cri
+github.com/siderolabs/talos/pkg/machinery/config/types/hardware
+github.com/siderolabs/talos/pkg/machinery/config/types/k8s
+github.com/siderolabs/talos/pkg/machinery/config/types/meta
+github.com/siderolabs/talos/pkg/machinery/config/types/network
+github.com/siderolabs/talos/pkg/machinery/config/types/runtime
+github.com/siderolabs/talos/pkg/machinery/config/types/runtime/extensions
+github.com/siderolabs/talos/pkg/machinery/config/types/security
+github.com/siderolabs/talos/pkg/machinery/config/types/siderolink
+github.com/siderolabs/talos/pkg/machinery/config/types/storage
+github.com/siderolabs/talos/pkg/machinery/config/types/v1alpha1
+github.com/siderolabs/talos/pkg/machinery/config/validation
 github.com/siderolabs/talos/pkg/machinery/constants
+github.com/siderolabs/talos/pkg/machinery/extensions
 github.com/siderolabs/talos/pkg/machinery/gendata
+github.com/siderolabs/talos/pkg/machinery/imager/quirks
+github.com/siderolabs/talos/pkg/machinery/kernel
+github.com/siderolabs/talos/pkg/machinery/kubelet
+github.com/siderolabs/talos/pkg/machinery/labels
+github.com/siderolabs/talos/pkg/machinery/nethelpers
 github.com/siderolabs/talos/pkg/machinery/proto
+github.com/siderolabs/talos/pkg/machinery/resources/block
+github.com/siderolabs/talos/pkg/machinery/resources/k8s
+github.com/siderolabs/talos/pkg/machinery/resources/runtime
+github.com/siderolabs/talos/pkg/machinery/resources/storage
+github.com/siderolabs/talos/pkg/machinery/resources/v1alpha1
+github.com/siderolabs/talos/pkg/machinery/role
 github.com/siderolabs/talos/pkg/machinery/version
+github.com/siderolabs/talos/pkg/machinery/yamlutils
 # github.com/spf13/cobra v1.10.2
 ## explicit; go 1.15
 github.com/spf13/cobra
-# github.com/spf13/pflag v1.0.9
+# github.com/spf13/pflag v1.0.10
 ## explicit; go 1.12
 github.com/spf13/pflag
 # go.uber.org/multierr v1.11.0
@@ -200,6 +335,9 @@ go.uber.org/zap/internal/exit
 go.uber.org/zap/internal/pool
 go.uber.org/zap/internal/stacktrace
 go.uber.org/zap/zapcore
+# go.yaml.in/yaml/v3 v3.0.5
+## explicit; go 1.16
+go.yaml.in/yaml/v3
 # go.yaml.in/yaml/v4 v4.0.0-rc.6
 ## explicit; go 1.18
 go.yaml.in/yaml/v4
@@ -214,8 +352,12 @@ golang.org/x/crypto/cryptobyte
 golang.org/x/crypto/cryptobyte/asn1
 golang.org/x/crypto/hkdf
 golang.org/x/crypto/sha3
+# golang.org/x/exp v0.0.0-20260709172345-9ea1abe57597
+## explicit; go 1.25.0
+golang.org/x/exp/slices
 # golang.org/x/net v0.58.0
 ## explicit; go 1.25.0
+golang.org/x/net/bpf
 golang.org/x/net/http/httpguts
 golang.org/x/net/http/httpproxy
 golang.org/x/net/http2
@@ -227,6 +369,9 @@ golang.org/x/net/internal/socks
 golang.org/x/net/internal/timeseries
 golang.org/x/net/proxy
 golang.org/x/net/trace
+# golang.org/x/sync v0.22.0
+## explicit; go 1.25.0
+golang.org/x/sync/errgroup
 # golang.org/x/sys v0.49.0
 ## explicit; go 1.26.0
 golang.org/x/sys/cpu
@@ -247,6 +392,7 @@ golang.org/x/text/unicode/norm
 golang.org/x/time/rate
 # google.golang.org/genproto/googleapis/api v0.0.0-20260810153831-ec0a7760b754
 ## explicit; go 1.25.0
+google.golang.org/genproto/googleapis/api/expr/v1alpha1
 google.golang.org/genproto/googleapis/api/httpbody
 # google.golang.org/genproto/googleapis/rpc v0.0.0-20260810153831-ec0a7760b754
 ## explicit; go 1.25.0
@@ -328,6 +474,7 @@ google.golang.org/protobuf/internal/descfmt
 google.golang.org/protobuf/internal/descopts
 google.golang.org/protobuf/internal/detrand
 google.golang.org/protobuf/internal/editiondefaults
+google.golang.org/protobuf/internal/editionssupport
 google.golang.org/protobuf/internal/encoding/defval
 google.golang.org/protobuf/internal/encoding/json
 google.golang.org/protobuf/internal/encoding/messageset
@@ -347,11 +494,14 @@ google.golang.org/protobuf/internal/strs
 google.golang.org/protobuf/internal/version
 google.golang.org/protobuf/proto
 google.golang.org/protobuf/protoadapt
+google.golang.org/protobuf/reflect/protodesc
 google.golang.org/protobuf/reflect/protoreflect
 google.golang.org/protobuf/reflect/protoregistry
 google.golang.org/protobuf/runtime/protoiface
 google.golang.org/protobuf/runtime/protoimpl
 google.golang.org/protobuf/types/descriptorpb
+google.golang.org/protobuf/types/dynamicpb
+google.golang.org/protobuf/types/gofeaturespb
 google.golang.org/protobuf/types/known/anypb
 google.golang.org/protobuf/types/known/durationpb
 google.golang.org/protobuf/types/known/emptypb

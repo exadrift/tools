@@ -41,6 +41,9 @@ type StatusLine struct {
 	wg          sync.WaitGroup
 	options     StatusLineOptions
 	messageChan chan StatusMessage
+	startTime   time.Time
+	holdTimer   bool
+	lock        sync.Mutex
 }
 
 var defaultSpinner = []string{"⣷", "⣯", "⣟", "⡿", "⢿", "⣻", "⣽", "⣾"}
@@ -80,12 +83,37 @@ func (s *StatusLine) Stop() {
 	s.wg.Wait()
 }
 
+func (s *StatusLine) HoldTimer() {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	s.holdTimer = true
+}
+
+func (s *StatusLine) ReleaseTimer() {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	s.holdTimer = false
+}
+
 func (s *StatusLine) displayStatusMessage(roller string, message string) {
-	fmt.Printf("\r%s%s\x1b[0m %s\x1b[0m\x1b[K", s.options.SpinnerStyling, roller, message)
+	var since string
+	s.lock.Lock()
+	st := time.Since(s.startTime).Round(time.Millisecond * 10)
+	if st < time.Second {
+		since = fmt.Sprintf("%0.1fs", st.Seconds())
+	} else {
+		since = st.String()
+	}
+
+	s.lock.Unlock()
+
+	fmt.Printf("\r%s%s\x1b[0m \x1b[0;38;2;87;147;244;49m%s\x1b[0m %s\x1b[0m\x1b[K", s.options.SpinnerStyling, roller, since, message)
 }
 
 func (s *StatusLine) emitMessage(message string) {
-	fmt.Printf("\r\x1b[K%s\n", message)
+	fmt.Printf("\r\x1b[K\x1b[0;38;2;25;105;179;49m%s\x1b[0m %s\n", time.Now().Format(time.TimeOnly), message)
 }
 
 func (s *StatusLine) promptMessage(message string, secret bool) (string, error) {
@@ -216,6 +244,13 @@ func prepareMessage(message string, args ...any) string {
 // Status will not advance the current line when updated and thus status can be updated with new
 // messages on the same line as the status changees
 func (s *StatusLine) Status(message string, args ...any) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	if !s.holdTimer || s.startTime.IsZero() {
+		s.startTime = time.Now()
+	}
+
 	s.messageChan <- StatusMessage{prepareMessage(message, args...), MessageTypeStatus, nil, false, false}
 }
 
