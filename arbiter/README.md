@@ -25,6 +25,18 @@ first create a blank git repository and clone it locally.  this will store all y
 
 ```
 # from the directory of the git repository root
+
 arbiter init
 ```
 this will walk you through the configuration process (machine ip, etc.).  at the end of this process basic configuration will be established at `~/.arbiter/<project-name>`.  you will be prompted to back up the `config.yaml` which will be generated there.  this file contains the configuration but most importantly the keymaterial which will be used to manage the secrets you store in the github repository.  if you lose this file, you won't be able to encrypt/decrypt those secrets anymore, which means you won't be able to contact the talos cluster.
+
+### bootstrap talos
+```
+# if you're still in the git repo, or if not, just supply the project name as an argument
+
+arbiter bootstrap
+```
+you will be prompted for the install disk on the target machine, then the process will begin.  the machine may reboot while this is underway, so make sure your install media is not the first to boot by default, this could cause installation to hang indefinitely.
+
+### test kubectl
+at the end of the bootstrap process, arbiter will configure kubectl.  you can now interrogate the new cluster via kubectl

@@ -12,7 +12,7 @@ DOCKER_CMD_USER := $(DOCKER_CMD) -u $(USERID):$(GROUPID)
 PRE_BUILD_ARGS := $(GO_IMAGE)
 BUILD_ARGS := $(PRE_BUILD_ARGS) go build -trimpath -ldflags="-s -w -X 'main.Version=$(VERSION)'" -mod=vendor
 GO_RUN_ROOT := $(DOCKER_CMD) $(GO_IMAGE) go
-GO_FILES := $(shell find . -type f -path **/*.go -not -path "./vendor/*")
+GO_FILES := $(shell find . -type f -path "**/*.go" -not -path "./vendor/*")
 OS ?= $(shell uname -s | tr '[:upper:]' '[:lower:]')
 ARCH ?= $(shell uname -m | sed 's/x86_64/amd64/')
 IMAGE_NAME := exadrift/$(NAME)
@@ -69,7 +69,8 @@ bin/$(NAME)-$(OS)-$(ARCH): $(GO_FILES)
 
 .PHONY: install
 install: build-one
-	sudo cp ./bin/$(NAME)-$(OS)-$(ARCH) /usr/local/bin/$(NAME)
+	mkdir -p ~/.local/bin
+	cp ./bin/$(NAME)-$(OS)-$(ARCH) ~/.local/bin/$(NAME)
 
 .PHONY: run
 run: build-one
