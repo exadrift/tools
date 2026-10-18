@@ -16,7 +16,7 @@ func Command() *cobra.Command {
 		Long:  "restore talos config from config.yaml",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			cmd.SilenceErrors = true
+			cmd.SilenceUsage = true
 			return restoreCmd(args[0])
 		},
 	}

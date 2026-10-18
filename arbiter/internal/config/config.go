@@ -188,7 +188,7 @@ func (c *Config) EncryptAndStoreData(filename string, data []byte) error {
 		}
 	}
 
-	encString, err := c.Crypto.Encrypt(string(data))
+	encString, err := c.Crypto.Encrypt(data)
 	if err != nil {
 		return fmt.Errorf("unable to encrypt data: %w", err)
 	}
@@ -202,7 +202,7 @@ func (c *Config) DecryptStoredData(filename string) ([]byte, error) {
 		return nil, fmt.Errorf("unable to load encrypted file: %w", err)
 	}
 
-	dec, err := c.Crypto.Decrypt(string(encBytes))
+	dec, err := c.Crypto.Decrypt(encBytes)
 	if err != nil {
 		return nil, fmt.Errorf("unable to decrypt file: %w", err)
 	}

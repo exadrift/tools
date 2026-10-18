@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -44,7 +43,7 @@ func Command() *cobra.Command {
 				}
 			}
 
-			cmd.SilenceErrors = true
+			cmd.SilenceUsage = true
 			return bootstrapCmd(name)
 		},
 	}
@@ -80,18 +79,6 @@ func bootstrapCmd(name string) error {
 	}
 	sl.Emit("✅ node is in maintenance mode, running %s", versionContract.String())
 
-	secretsDir := filepath.Join(cfg.ProjectDir, "secrets")
-	configDir := filepath.Join(cfg.ProjectDir, "base")
-	baseConfigDir := filepath.Join(configDir, "base")
-
-	if err = os.MkdirAll(secretsDir, 0755); err != nil {
-		return fmt.Errorf("unable to make secrets directory: %w", err)
-	}
-
-	if err = os.MkdirAll(baseConfigDir, 0755); err != nil {
-		return fmt.Errorf("unable to make config base directory: %w", err)
-	}
-
 	var regenerate bool = true
 	sl.Status("checking machine configuration")
 	machineConfig, err := cfg.LoadMachineConfig()
@@ -120,11 +107,11 @@ func bootstrapCmd(name string) error {
 		}
 
 		var selectedDiskIndex int
-		sl.Emit("available disks:\n%s", strings.Join(choices, "\n"))
+		sl.Emit("available disks:\n%s\n", strings.Join(choices, "\n"))
 		for {
-			installDiskIndexStr := sl.Prompt(false, "on which disk should i install talos:")
+			installDiskIndexStr := sl.Prompt(false, "which disk should talos be installed on?")
 			installDiskNum, err := strconv.ParseInt(installDiskIndexStr, 10, 64)
-			if err != nil && installDiskNum > 0 && installDiskNum <= int64(len(dSelect)) {
+			if err == nil && installDiskNum > 0 && installDiskNum <= int64(len(dSelect)) {
 				selectedDiskIndex = int(installDiskNum - 1)
 				break
 			}
