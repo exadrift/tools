@@ -218,7 +218,9 @@ func (c *Config) LoadMachineSecrets() (*secrets.Bundle, error) {
 		return nil, fmt.Errorf("unable to retrieve machine secrets: %w", err)
 	}
 
-	bundle := &secrets.Bundle{}
+	bundle := &secrets.Bundle{
+		Clock: secrets.NewClock(),
+	}
 	decBytes := []byte(b)
 	if err = json.Unmarshal(decBytes, bundle); err != nil {
 		return nil, fmt.Errorf("unable to unmarshal secrets bundle: %w", err)

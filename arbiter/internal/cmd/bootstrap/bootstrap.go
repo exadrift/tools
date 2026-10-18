@@ -17,6 +17,8 @@ import (
 	"github.com/exadrift/tools/arbiter/templates"
 	"github.com/siderolabs/talos/pkg/machinery/api/storage"
 	"github.com/spf13/cobra"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func Command() *cobra.Command {
@@ -132,7 +134,7 @@ func bootstrapCmd(name string) error {
 		}
 
 		machineConfig, err = cfg.LoadMachineConfig()
-		if err == nil {
+		if err != nil {
 			return fmt.Errorf("unable to generate machine configs: %w", err)
 		}
 	}
@@ -173,8 +175,18 @@ func bootstrapCmd(name string) error {
 		return nil
 	}
 
-	if err = authClient.Bootstrap(ctx); err != nil {
-		return fmt.Errorf("bootstrap failed with an error: %w", err)
+	sl.Status("waiting for node to apply configs before bootstrap")
+	for {
+		if err = authClient.Bootstrap(ctx); err != nil {
+			if status.Code(err) == codes.FailedPrecondition {
+				time.Sleep(time.Second * 5)
+			} else {
+				return fmt.Errorf("bootstrap failed with an error: %w", err)
+			}
+		} else {
+			sl.Emit("✅ bootstrap initiated")
+			break
+		}
 	}
 
 	healthCtx, cancelHealth := context.WithTimeout(
