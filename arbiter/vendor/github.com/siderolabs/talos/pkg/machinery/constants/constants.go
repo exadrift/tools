@@ -20,7 +20,7 @@ var SupportedArchitectures = []string{
 
 const (
 	// DefaultKernelVersion is the default Linux kernel version.
-	DefaultKernelVersion = "6.18.54-talos"
+	DefaultKernelVersion = "6.18.56-talos"
 
 	// KernelParamConfig is the kernel parameter name for specifying the URL.
 	// to the config.
@@ -440,7 +440,7 @@ const (
 
 	// DefaultEtcdVersion is the default target version of etcd.
 	// renovate: datasource=docker depName=registry.k8s.io/etcd
-	DefaultEtcdVersion = "3.7.1"
+	DefaultEtcdVersion = "v3.7.2"
 
 	// EtcdRootTalosKey is the root etcd key for Talos-specific storage.
 	EtcdRootTalosKey = "talos:v1"
@@ -562,7 +562,7 @@ const (
 	TrustdUserID = 51
 
 	// DefaultContainerdVersion is the default container runtime version.
-	DefaultContainerdVersion = "2.3.6"
+	DefaultContainerdVersion = "2.3.7"
 
 	// RuncVersion is the runc version.
 	RuncVersion = "1.5.2"
@@ -1248,7 +1248,7 @@ const (
 	ProcModulesPath = "/proc/modules"
 
 	// GoVersion is the version of Go compiler this release was built with.
-	GoVersion = "go1.26.8"
+	GoVersion = "go1.26.9"
 
 	// KubernetesTalosAPIServiceName is the name of the Kubernetes service to access Talos API.
 	KubernetesTalosAPIServiceName = "talos"
@@ -1340,7 +1340,7 @@ const (
 	// KubeNetworkPoliciesVersion is the version of kube-network-policies when network policies are enabled for flannel.
 	//
 	// renovate: datasource=docker depName=registry.k8s.io/networking/kube-network-policies
-	KubeNetworkPoliciesVersion = "v1.1.1"
+	KubeNetworkPoliciesVersion = "v1.1.2"
 
 	// PlatformMetal is the name of the metal platform.
 	PlatformMetal = "metal"
@@ -1374,6 +1374,18 @@ const (
 
 	// KubePrismHealthCheckTimeout is the timeout for health checks for the KubePrism loadbalancer.
 	KubePrismHealthCheckTimeout = 15 * time.Second
+
+	// KubePrismLowScore is the lowest score for an upstream in the KubePrism loadbalancer.
+	//
+	// An upstream is used only when its score is non-negative, so the low score controls how many
+	// successful health checks are required for an upstream to be used again after it failed.
+	KubePrismLowScore = -1
+
+	// KubePrismHighScore is the highest score for an upstream in the KubePrism loadbalancer.
+	//
+	// The high score controls how many consecutive failed health checks (or dial errors) are required
+	// for an upstream to be taken out of rotation.
+	KubePrismHighScore = 3
 
 	// TalosAPIDefaultCertificateValidityDuration specifies default certificate duration for Talos API generated client certificates.
 	TalosAPIDefaultCertificateValidityDuration = time.Hour * 24 * 365

@@ -4,6 +4,8 @@ evo is a postgres compatible database migration tool, designed to operate as a s
 ## getting started
 install locally (necessary if only used in a non-containerized environment)
 ```
+# binary will be installed to ~/.local/bin
+# to install elsewhere, set BIN_DIR to the desired location
 sh -c "curl https://raw.githubusercontent.com/exadrift/tools/refs/heads/main/install.sh | sh -s -- evo"
 ```
 

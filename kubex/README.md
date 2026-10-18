@@ -6,8 +6,10 @@ a minimalistic kubernetes explorer TUI
 - execute commands in a shell to the side
 
 ## install
+## install
 ```
-# run as sudo if you don't have root privileges in order to drop the binary in /usr/local/bin
+# binary will be installed to ~/.local/bin
+# to install elsewhere, set BIN_DIR to the desired location
 sh -c "curl https://raw.githubusercontent.com/exadrift/tools/refs/heads/main/install.sh | sh -s -- kubex"
 ```
 

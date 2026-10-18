@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -13,6 +14,7 @@ import (
 	"github.com/dustin/go-humanize"
 	"github.com/exadrift/go/statusline"
 	"github.com/exadrift/tools/arbiter/internal/config"
+	"github.com/exadrift/tools/arbiter/internal/kube"
 	"github.com/exadrift/tools/arbiter/internal/talossdk"
 	"github.com/exadrift/tools/arbiter/templates"
 	"github.com/siderolabs/talos/pkg/machinery/api/storage"
@@ -60,7 +62,7 @@ func bootstrapCmd(name string) error {
 		return err
 	}
 
-	sl := statusline.NewStatusLine()
+	sl := statusline.NewStatusLine(statusline.WithSpinnerStyling("\x1b[0;38;2;255;31;87;49m"))
 	defer sl.Stop()
 
 	sl.Emit("bootstrapping \"%s\"", cfg.IpAddress)
@@ -202,14 +204,15 @@ func bootstrapCmd(name string) error {
 	if err != nil {
 		return fmt.Errorf("unable to initialize health check client: %w", err)
 	}
+outer:
 	for {
 		progress, err := stream.Recv()
 
 		switch {
 		case errors.Is(err, io.EOF):
 			// The server completed the health-check stream normally.
-			sl.Emit("✅ cluster is healthy - please securely back up cluster configuration (contains private keymaterial) located at ~/.arbiter/%s/config.yaml", name)
-			return nil
+			sl.Emit("✅ cluster is ready for use")
+			break outer
 
 		case err != nil:
 			// Includes RPC failures and context cancellation/deadline.
@@ -222,4 +225,41 @@ func bootstrapCmd(name string) error {
 			}
 		}
 	}
+	sl.ReleaseTimer()
+
+	sl.Status("preparing kubernetes configuration")
+
+	kubeConfig, err := authClient.KubeConfig(ctx)
+	if err != nil {
+		return fmt.Errorf("unable to provision kube config: %w", err)
+	}
+
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return err
+	}
+
+	kubeDir := filepath.Join(homeDir, ".kube")
+	if err = os.MkdirAll(kubeDir, 0700); err != nil {
+		return err
+	}
+
+	mergeKube := sl.Confirm(true, "would you like to merge kube config for this cluster with your existing kube config?")
+	if !mergeKube {
+		kubeConfigFile := filepath.Join(kubeDir, cfg.Name)
+		_ = os.Remove(kubeConfigFile)
+		if err = kube.MergeKubeconfig(kubeConfig, filepath.Join(kubeDir, kubeConfigFile), cfg.Name); err != nil {
+			return err
+		}
+		sl.Emit("✅ kube config created at %s", kubeConfigFile)
+
+		return nil
+	}
+
+	if err = kube.MergeKubeconfig(kubeConfig, filepath.Join(kubeDir, "config"), cfg.Name); err != nil {
+		return err
+	}
+
+	sl.Emit("✅ kube config updated with new context: %s", cfg.Name)
+	return nil
 }

@@ -5,8 +5,9 @@ a decentralized package management tool
 in a centralized package management tool, packages are stored in a centralized repository.  espresso is designed to manage packages from any source, focusing on installation and version tracking particulars
 
 ## usage
-start by installing espresso, you may need to run the command as `sudo` in order to place the contents in /usr/local/bin/
 ```
+# binary will be installed to ~/.local/bin
+# to install elsewhere, set BIN_DIR to the desired location
 sh -c "curl https://raw.githubusercontent.com/exadrift/tools/refs/heads/main/install.sh | sh -s -- espresso"
 ```
 

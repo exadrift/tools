@@ -1,3 +1,5 @@
+# v0.1.4
+- updated install instructions
 # v0.1.3
 - build multiple arch targets
 # v0.1.2

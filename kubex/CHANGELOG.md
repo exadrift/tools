@@ -1,3 +1,5 @@
+# v0.3.2
+- updated install instructions
 # v0.3.1
 - style the loader
 # v0.3.0

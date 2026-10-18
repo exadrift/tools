@@ -3,9 +3,12 @@ package statusline
 import (
 	"bufio"
 	"fmt"
+	"log"
 	"os"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"golang.org/x/term"
@@ -44,6 +47,7 @@ type StatusLine struct {
 	startTime   time.Time
 	holdTimer   bool
 	lock        sync.Mutex
+	width       int
 }
 
 var defaultSpinner = []string{"⣷", "⣯", "⣟", "⡿", "⢿", "⣻", "⣽", "⣾"}
@@ -78,6 +82,20 @@ func NewStatusLine(options ...Option) *StatusLine {
 	return s
 }
 
+func (s *StatusLine) GetWidth() int {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	return s.width
+}
+
+func (s *StatusLine) SetWidth(width int) {
+	s.lock.Lock()
+	defer s.lock.Unlock()
+
+	s.width = width
+}
+
 func (s *StatusLine) Stop() {
 	close(s.messageChan)
 	s.wg.Wait()
@@ -106,8 +124,18 @@ func (s *StatusLine) displayStatusMessage(roller string, message string) {
 	} else {
 		since = st.String()
 	}
+	width := s.width
 
 	s.lock.Unlock()
+
+	base := fmt.Sprintf("%s %s ", roller, since)
+	baseLen := len(base)
+	if len(message)+baseLen > width {
+		maxMsg := width - baseLen
+		if maxMsg > 0 {
+			message = message[:maxMsg]
+		}
+	}
 
 	fmt.Printf("\r%s%s\x1b[0m \x1b[0;38;2;87;147;244;49m%s\x1b[0m %s\x1b[0m\x1b[K", s.options.SpinnerStyling, roller, since, message)
 }
@@ -195,8 +223,23 @@ func (s *StatusLine) runLoop() {
 
 	fmt.Printf("\x1b[?25l")
 
+	width, _, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil {
+		log.Fatalf("unable to interrogate terminal for size: %v", err)
+	}
+	s.SetWidth(width)
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGWINCH)
+
 	for {
 		select {
+		case <-sigChan:
+			width, _, err := term.GetSize(int(os.Stdout.Fd()))
+			if err != nil {
+				log.Fatalf("unable to interrogate terminal for size: %v", err)
+			}
+			s.SetWidth(width)
 		case m, ok := <-s.messageChan:
 			// check if the channel has been closed
 			if !ok {

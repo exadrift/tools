@@ -124,6 +124,7 @@ func initCmd() error {
 	}
 
 	sl.Emit("✅ project created")
+	sl.Emit("please backup your config.yaml file located at ~/.arbiter/%s - it contains your keymaterial for secret en(de)cryption", projectName)
 
 	return nil
 }

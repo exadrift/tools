@@ -99,3 +99,7 @@ func (t *TalosClient) HealthCheck(ctx context.Context, cfg *config.Config) (clus
 		ControlPlaneNodes: []string{cfg.IpAddress},
 	})
 }
+
+func (t *TalosClient) KubeConfig(ctx context.Context) ([]byte, error) {
+	return t.client.Kubeconfig(ctx)
+}

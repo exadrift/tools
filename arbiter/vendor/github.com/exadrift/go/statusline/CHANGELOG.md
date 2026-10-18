@@ -1,3 +1,5 @@
+# v0.0.11
+- fixed long message cropping so that things don't go off the screen
 # v0.0.10
 - added time, time holding, etc.
 # v0.0.9
