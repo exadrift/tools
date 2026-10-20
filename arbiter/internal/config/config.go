@@ -16,6 +16,13 @@ import (
 	"github.com/siderolabs/talos/pkg/machinery/config/generate/secrets"
 )
 
+type PatchType string
+
+const (
+	PatchTypeHardware PatchType = "hardware"
+	PatchTypeSoftWare PatchType = "software"
+)
+
 const (
 	machineSecretsFilename     = "machine-secrets.encrypted"
 	controlPlaneSecretFilename = "controlplane.encrypted"
@@ -324,4 +331,13 @@ func (c *Config) SaveNameRef() error {
 		return fmt.Errorf("unable to update name reference file: %w", err)
 	}
 	return nil
+}
+
+func (c *Config) SavePatch(patchType PatchType, filename string, patchData []byte) error {
+	return c.StoreData(filepath.Join("config", "patches", string(patchType), filename), patchData)
+}
+
+func (c *Config) ExistsPatch(patchType PatchType, filename string) bool {
+	_, err := os.Stat(filepath.Join("config", "patches", string(patchType), filename))
+	return err == nil
 }

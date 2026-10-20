@@ -261,5 +261,6 @@ outer:
 	}
 
 	sl.Emit("✅ kube config updated with new context: %s", cfg.Name)
+	sl.Emit("to configure additional resources such as disk, etc., please run \"arbiter post-configure\"")
 	return nil
 }
