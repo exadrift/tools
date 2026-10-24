@@ -7,9 +7,9 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/exadrift/go/statusline"
 	"github.com/exadrift/tools/arbiter/internal/config"
 	"github.com/exadrift/tools/arbiter/internal/crypto"
+	"github.com/exadrift/tools/arbiter/internal/utils"
 	"github.com/spf13/cobra"
 )
 
@@ -27,7 +27,7 @@ func Command() *cobra.Command {
 }
 
 func initCmd() error {
-	sl := statusline.NewStatusLine()
+	sl := utils.NewStatusLine()
 	defer sl.Stop()
 
 	sl.Emit("initializing arbiter project")

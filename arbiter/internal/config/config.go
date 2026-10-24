@@ -148,12 +148,21 @@ func (c *Config) secretsPath() string {
 }
 
 func GetConfigDir(projectName string) (string, error) {
+	baseDir, err := GetConfigDirBase()
+	if err != nil {
+		return "", fmt.Errorf("unable to retrieve base directory: %w", err)
+	}
+
+	return filepath.Join(baseDir, projectName), nil
+}
+
+func GetConfigDirBase() (string, error) {
 	homedir, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("unable to retrieve home directory: %w", err)
 	}
 
-	return filepath.Join(homedir, ".arbiter", projectName), nil
+	return filepath.Join(homedir, ".arbiter"), nil
 }
 
 func Load(name string) (*Config, error) {

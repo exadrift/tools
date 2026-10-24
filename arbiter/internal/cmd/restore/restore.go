@@ -4,8 +4,8 @@ import (
 	"os"
 	"strings"
 
-	"github.com/exadrift/go/statusline"
 	"github.com/exadrift/tools/arbiter/internal/config"
+	"github.com/exadrift/tools/arbiter/internal/utils"
 	"github.com/spf13/cobra"
 )
 
@@ -31,7 +31,7 @@ func restoreCmd(path string) error {
 	}
 
 	var projectName string
-	sl := statusline.NewStatusLine()
+	sl := utils.NewStatusLine()
 	defer sl.Stop()
 
 	keep := sl.Confirm(true, "current project name is \"%s\" are do you want to keep it?", cfg.Name)

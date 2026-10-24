@@ -11,10 +11,10 @@ import (
 	"time"
 
 	"github.com/dustin/go-humanize"
-	"github.com/exadrift/go/statusline"
 	"github.com/exadrift/tools/arbiter/internal/config"
 	"github.com/exadrift/tools/arbiter/internal/kubeconfig"
 	"github.com/exadrift/tools/arbiter/internal/talossdk"
+	"github.com/exadrift/tools/arbiter/internal/utils"
 	"github.com/exadrift/tools/arbiter/templates"
 	"github.com/siderolabs/talos/pkg/machinery/api/storage"
 	"github.com/spf13/cobra"
@@ -61,7 +61,7 @@ func bootstrapCmd(name string) error {
 		return err
 	}
 
-	sl := statusline.NewStatusLine(statusline.WithSpinnerStyling("\x1b[0;38;2;255;31;87;49m"))
+	sl := utils.NewStatusLine()
 	defer sl.Stop()
 
 	sl.Emit("bootstrapping \"%s\"", cfg.IpAddress)

@@ -8,10 +8,10 @@ import (
 	"strings"
 
 	"github.com/dustin/go-humanize"
-	"github.com/exadrift/go/statusline"
 	"github.com/exadrift/tools/arbiter/internal/argocd"
 	"github.com/exadrift/tools/arbiter/internal/config"
 	"github.com/exadrift/tools/arbiter/internal/talossdk"
+	"github.com/exadrift/tools/arbiter/internal/utils"
 	"github.com/exadrift/tools/arbiter/templates"
 	"github.com/siderolabs/talos/pkg/machinery/api/storage"
 	"github.com/spf13/cobra"
@@ -61,7 +61,7 @@ func postConfigCmd(name string) error {
 		return fmt.Errorf("unable to analyze current patch directory: %w", err)
 	}
 
-	sl := statusline.NewStatusLine()
+	sl := utils.NewStatusLine()
 	defer sl.Stop()
 
 	if patchIndex > 0 {

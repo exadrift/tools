@@ -8,10 +8,10 @@ import (
 	"os"
 	"time"
 
-	"github.com/exadrift/go/statusline"
 	"github.com/exadrift/tools/arbiter/internal/config"
 	"github.com/exadrift/tools/arbiter/internal/kube"
 	"github.com/exadrift/tools/arbiter/internal/talossdk"
+	"github.com/exadrift/tools/arbiter/internal/utils"
 	"github.com/spf13/cobra"
 )
 
@@ -54,7 +54,7 @@ func applyCmd(name string) error {
 		return err
 	}
 
-	sl := statusline.NewStatusLine()
+	sl := utils.NewStatusLine()
 	defer sl.Stop()
 
 	machineConfig, err := cfg.LoadMachineConfig()
