@@ -52,8 +52,28 @@ func Command() *cobra.Command {
 func postConfigCmd(name string) error {
 	ctx := context.Background()
 	cfg, err := config.Load(name)
+	if err != nil {
+		return err
+	}
+
+	patchIndex, err := cfg.GetCurrentPatchIndex(config.PatchTypeTalos)
+	if err != nil {
+		return fmt.Errorf("unable to analyze current patch directory: %w", err)
+	}
+
 	sl := statusline.NewStatusLine()
 	defer sl.Stop()
+
+	if patchIndex > 0 {
+		wipePatches := sl.Confirm(false, "you already have system patches, would you like to erase them and start over?")
+		if wipePatches {
+			err = os.RemoveAll(cfg.GetPatchDir(config.PatchTypeTalos))
+			if err != nil {
+				return err
+			}
+		}
+	}
+
 	addStorage := sl.Confirm(true, "would you like to add any storage volumes to kubernetes?")
 
 	machineConfig, err := cfg.LoadMachineConfig()
@@ -61,6 +81,9 @@ func postConfigCmd(name string) error {
 		return err
 	}
 	client, err := talossdk.NewAuthenticatedClient(machineConfig)
+	if err != nil {
+		return err
+	}
 
 	for addStorage {
 		resp, err := client.Disks(ctx)
@@ -90,7 +113,7 @@ func postConfigCmd(name string) error {
 		}
 
 		disk := dSelect[selectedDiskIndex]
-		absMaxSize := disk.Size / 1024 * 1024 * 1024
+		absMaxSize := disk.Size / (1024 * 1024 * 1024)
 		minSize := 1
 		maxSize := 1
 
@@ -120,6 +143,8 @@ func postConfigCmd(name string) error {
 					break
 				}
 			}
+		} else {
+			maxSize = minSize
 		}
 
 		var volName string
@@ -141,7 +166,7 @@ func postConfigCmd(name string) error {
 			return fmt.Errorf("error rendering storage volume template: %w", err)
 		}
 
-		if err = cfg.SavePatch(config.PatchTypeHardware, fmt.Sprintf("storage-volume-%s", volName), volData); err != nil {
+		if err = cfg.SavePatch(config.PatchTypeTalos, fmt.Sprintf("%d-storage-volume-%s", volName), volData); err != nil {
 			return err
 		}
 
@@ -149,7 +174,7 @@ func postConfigCmd(name string) error {
 	}
 
 	var setupArgo bool
-	if !cfg.ExistsPatch(config.PatchTypeSoftWare, "argocd.yaml") {
+	if !cfg.ExistsPatch(config.PatchTypeKubernetes, "argocd.yaml") {
 		setupArgo = sl.Confirm(true, "would you like to setup argocd?")
 	} else {
 		setupArgo = sl.Confirm(true, "would you like to download the latest argocd install manifest?")
@@ -161,7 +186,7 @@ func postConfigCmd(name string) error {
 			return err
 		}
 
-		if err = cfg.SavePatch(config.PatchTypeSoftWare, "argocd.yaml", manifest); err != nil {
+		if err = cfg.SavePatch(config.PatchTypeKubernetes, "argocd.yaml", manifest); err != nil {
 			return err
 		}
 	}

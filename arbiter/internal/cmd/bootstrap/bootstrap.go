@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -14,7 +13,7 @@ import (
 	"github.com/dustin/go-humanize"
 	"github.com/exadrift/go/statusline"
 	"github.com/exadrift/tools/arbiter/internal/config"
-	"github.com/exadrift/tools/arbiter/internal/kube"
+	"github.com/exadrift/tools/arbiter/internal/kubeconfig"
 	"github.com/exadrift/tools/arbiter/internal/talossdk"
 	"github.com/exadrift/tools/arbiter/templates"
 	"github.com/siderolabs/talos/pkg/machinery/api/storage"
@@ -228,39 +227,9 @@ outer:
 	sl.ReleaseTimer()
 
 	sl.Status("preparing kubernetes configuration")
-
-	kubeConfig, err := authClient.KubeConfig(ctx)
-	if err != nil {
-		return fmt.Errorf("unable to provision kube config: %w", err)
-	}
-
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
+	if err = kubeconfig.DoKubeConfig(context.Background(), authClient, cfg, sl); err != nil {
 		return err
 	}
-
-	kubeDir := filepath.Join(homeDir, ".kube")
-	if err = os.MkdirAll(kubeDir, 0700); err != nil {
-		return err
-	}
-
-	mergeKube := sl.Confirm(true, "would you like to merge kube config for this cluster with your existing kube config?")
-	if !mergeKube {
-		kubeConfigFile := filepath.Join(kubeDir, cfg.Name)
-		_ = os.Remove(kubeConfigFile)
-		if err = kube.MergeKubeconfig(kubeConfig, filepath.Join(kubeDir, kubeConfigFile), cfg.Name); err != nil {
-			return err
-		}
-		sl.Emit("✅ kube config created at %s", kubeConfigFile)
-
-		return nil
-	}
-
-	if err = kube.MergeKubeconfig(kubeConfig, filepath.Join(kubeDir, "config"), cfg.Name); err != nil {
-		return err
-	}
-
-	sl.Emit("✅ kube config updated with new context: %s", cfg.Name)
 	sl.Emit("to configure additional resources such as disk, etc., please run \"arbiter post-configure\"")
 	return nil
 }

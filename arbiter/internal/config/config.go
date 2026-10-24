@@ -6,6 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/exadrift/tools/arbiter/internal/crypto"
@@ -13,14 +16,17 @@ import (
 	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
 	machineryconfig "github.com/siderolabs/talos/pkg/machinery/config"
 	"github.com/siderolabs/talos/pkg/machinery/config/configloader"
+	"github.com/siderolabs/talos/pkg/machinery/config/configpatcher"
 	"github.com/siderolabs/talos/pkg/machinery/config/generate/secrets"
 )
+
+var indexFileSplitter = regexp.MustCompile(`^(\d+)[^\d]*$`)
 
 type PatchType string
 
 const (
-	PatchTypeHardware PatchType = "hardware"
-	PatchTypeSoftWare PatchType = "software"
+	PatchTypeTalos      PatchType = "machine"
+	PatchTypeKubernetes PatchType = "kubernetes"
 )
 
 const (
@@ -34,12 +40,27 @@ const (
 )
 
 type Config struct {
-	configDir  string         `yaml:"-"`
-	Crypto     *crypto.Crypto `yaml:"-"`
-	Key        string         `yaml:"privateKey"`
-	ProjectDir string         `yaml:"projectDir"`
-	IpAddress  string         `yaml:"ipAddress"`
-	Name       string         `yaml:"-"`
+	configDir       string         `yaml:"-"`
+	Crypto          *crypto.Crypto `yaml:"-"`
+	Key             string         `yaml:"privateKey"`
+	ProjectDir      string         `yaml:"projectDir"`
+	IpAddress       string         `yaml:"ipAddress"`
+	Name            string         `yaml:"-"`
+	KubeConfigPath  string         `yaml:"kubeConfigPath"`
+	KubeContextName string         `yaml:"kubeContextName"`
+}
+
+func extractIndexFromFilename(filename string) (int, error) {
+	matches := indexFileSplitter.FindAllStringSubmatch(filename, -1)
+	if len(matches) == 0 {
+		return 0, nil
+	}
+	i, err := strconv.ParseInt(matches[0][1], 10, 64)
+	if err != nil {
+		return 0, err
+	}
+
+	return int(i), nil
 }
 
 type MachineConfig struct {
@@ -340,4 +361,104 @@ func (c *Config) SavePatch(patchType PatchType, filename string, patchData []byt
 func (c *Config) ExistsPatch(patchType PatchType, filename string) bool {
 	_, err := os.Stat(filepath.Join("config", "patches", string(patchType), filename))
 	return err == nil
+}
+
+func (c *Config) GetPatchDir(patchType PatchType) string {
+	return filepath.Join(c.ProjectDir, "config", "patches", string(patchType))
+}
+
+func (c *Config) GetCurrentPatchIndex(patchType PatchType) (int, error) {
+	parentDir := c.GetPatchDir(patchType)
+	_, err := os.Stat(parentDir)
+	if err != nil {
+		// dir doesn't exist
+		return 0, nil
+	}
+	patchGlob := filepath.Join(parentDir, "*.yaml")
+	yamlFiles, err := filepath.Glob(patchGlob)
+	if err != nil {
+		return 0, err
+	}
+	largestIndex := 0
+	for _, f := range yamlFiles {
+		_, fname := filepath.Split(f)
+		li, err := extractIndexFromFilename(fname)
+		if err != nil {
+			return 0, err
+		}
+
+		if li > largestIndex {
+			li = largestIndex
+		}
+	}
+
+	return largestIndex, nil
+}
+
+func (c *Config) LoadTalosPatchGroup() ([]byte, error) {
+	filenames, err := c.GetOrderedPatchGroupFilenames(PatchTypeTalos)
+	if err != nil {
+		return nil, err
+	}
+
+	mc, err := c.LoadMachineConfig()
+	if err != nil {
+		return nil, err
+	}
+
+	// convert to talos style file path
+	var patchInputs []string
+	for _, f := range filenames {
+		patchInputs = append(patchInputs, fmt.Sprintf("@%s", f))
+	}
+
+	patches, err := configpatcher.LoadPatches(patchInputs)
+	if err != nil {
+		return nil, fmt.Errorf("error processing patch inputs: %w", err)
+	}
+
+	controlPlaneYaml, err := mc.RenderControlPlane()
+	if err != nil {
+		return nil, err
+	}
+
+	machineConf, err := configpatcher.Apply(
+		configpatcher.WithBytes(controlPlaneYaml),
+		patches,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("error rendering full config: %w", err)
+	}
+
+	mBytes, err := machineConf.Bytes()
+	if err != nil {
+		return nil, fmt.Errorf("unable to render machine config: %w", err)
+	}
+
+	return mBytes, nil
+}
+
+func (c *Config) GetOrderedPatchGroupFilenames(patchType PatchType) ([]string, error) {
+	patchGlob := filepath.Join(c.GetPatchDir(patchType), "*.yaml")
+	yamlFiles, err := filepath.Glob(patchGlob)
+	if err != nil {
+		return nil, fmt.Errorf("unable to glob patch file group: %w", err)
+	}
+
+	var filenames []string
+	for _, f := range yamlFiles {
+		_, filename := filepath.Split(f)
+		filenames = append(filenames, filename)
+	}
+
+	slices.Sort(filenames)
+
+	// filenames are now in order
+	var patchInputs []string
+	patchDir := c.GetPatchDir(patchType)
+	for _, f := range filenames {
+		patchInputs = append(patchInputs, filepath.Join(patchDir, f))
+	}
+
+	return patchInputs, nil
 }
