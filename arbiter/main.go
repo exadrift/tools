@@ -11,6 +11,7 @@ import (
 	kubeconfigcmd "github.com/exadrift/tools/arbiter/internal/cmd/kubeconfig"
 	"github.com/exadrift/tools/arbiter/internal/cmd/list"
 	postconfigure "github.com/exadrift/tools/arbiter/internal/cmd/post-configure"
+	"github.com/exadrift/tools/arbiter/internal/cmd/remove"
 	"github.com/exadrift/tools/arbiter/internal/cmd/restore"
 	"github.com/spf13/cobra"
 )
@@ -34,5 +35,6 @@ func main() {
 	rootCmd.AddCommand(apply.Command())
 	rootCmd.AddCommand(kubeconfigcmd.Command())
 	rootCmd.AddCommand(list.Command())
+	rootCmd.AddCommand(remove.Command())
 	_ = rootCmd.Execute()
 }
