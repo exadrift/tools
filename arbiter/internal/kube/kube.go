@@ -42,19 +42,19 @@ func MergeKubeconfig(kubeConfig []byte, kubeconfigPath string, contextName strin
 	// Merge clusters, users, and contexts.
 	for name, cluster := range incoming.Clusters {
 		if _, exists := existing.Clusters[name]; exists {
-			return fmt.Errorf("cluster %q already exists", name)
+			continue
 		}
 		existing.Clusters[name] = cluster
 	}
 	for name, user := range incoming.AuthInfos {
 		if _, exists := existing.AuthInfos[name]; exists {
-			return fmt.Errorf("user %q already exists", name)
+			continue
 		}
 		existing.AuthInfos[name] = user
 	}
 	for name, kubeContext := range incoming.Contexts {
 		if _, exists := existing.Contexts[name]; exists {
-			return fmt.Errorf("context %q already exists", name)
+			continue
 		}
 		existing.Contexts[name] = kubeContext
 	}

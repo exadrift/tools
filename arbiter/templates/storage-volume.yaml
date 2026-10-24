@@ -4,5 +4,5 @@ name: "{{.Name}}"
 provisioning:
   diskSelector:
     match: disk.serial == "{{.Serial}}"
-  minSize: "{{.MinSize}}GB"
-  maxSize: "{{.MaxSize}}GB"
+  minSize: "{{.MinSize}}GiB"
+  maxSize: "{{.MaxSize}}GiB"

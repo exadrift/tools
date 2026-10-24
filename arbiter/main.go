@@ -5,8 +5,10 @@ import (
 	"os"
 	"slices"
 
+	"github.com/exadrift/tools/arbiter/internal/cmd/apply"
 	"github.com/exadrift/tools/arbiter/internal/cmd/bootstrap"
 	"github.com/exadrift/tools/arbiter/internal/cmd/initc"
+	kubeconfigcmd "github.com/exadrift/tools/arbiter/internal/cmd/kubeconfig"
 	postconfigure "github.com/exadrift/tools/arbiter/internal/cmd/post-configure"
 	"github.com/exadrift/tools/arbiter/internal/cmd/restore"
 	"github.com/spf13/cobra"
@@ -28,5 +30,7 @@ func main() {
 	rootCmd.AddCommand(bootstrap.Command())
 	rootCmd.AddCommand(restore.Command())
 	rootCmd.AddCommand(postconfigure.Command())
+	rootCmd.AddCommand(apply.Command())
+	rootCmd.AddCommand(kubeconfigcmd.Command())
 	_ = rootCmd.Execute()
 }

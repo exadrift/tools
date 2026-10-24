@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/exadrift/go/statusline"
+	"github.com/exadrift/tools/arbiter/internal/config"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -37,6 +39,11 @@ const (
 
 	inventoryVersion = 1
 )
+
+type BuildObject struct {
+	Object   *unstructured.Unstructured
+	Metadata *config.PatchMetadata
+}
 
 // ResourceID identifies a Kubernetes resource by its API resource,
 // namespace, and name. Version is retained for API access but excluded
@@ -109,6 +116,7 @@ type reconciler struct {
 // inventory. Separate manifest sets require separate inventory identities.
 func Reconcile(
 	ctx context.Context,
+	sl *statusline.StatusLine,
 	kubeConfigPath string,
 	contextName string,
 	manifestFiles []string,
@@ -179,7 +187,7 @@ func Reconcile(
 	}
 
 	// Parse every file before changing the cluster.
-	desired, err := loadManifests(manifestFiles)
+	desired, err := loadManifests(sl, manifestFiles)
 	if err != nil {
 		return report, fmt.Errorf("load manifests: %w", err)
 	}
@@ -187,8 +195,12 @@ func Reconcile(
 	// Validate duplicate manifest identities without requiring the
 	// resource types to already exist in cluster discovery.
 	rawIDs := make(map[string]struct{}, len(desired))
-	for _, obj := range desired {
+	for _, buildObj := range desired {
+		obj := buildObj.Object
 		key := rawIdentity(obj)
+		if sl != nil {
+			sl.Emit("checking %s", key)
+		}
 
 		if _, exists := rawIDs[key]; exists {
 			return report, fmt.Errorf("duplicate manifest resource: %s",
@@ -212,14 +224,15 @@ func Reconcile(
 	// Apply prerequisites first. CRDs must be installed before their
 	// custom resources can be resolved by discovery.
 	sort.SliceStable(desired, func(i, j int) bool {
-		return applyRank(desired[i]) < applyRank(desired[j])
+		return applyRank(desired[i].Object) < applyRank(desired[j].Object)
 	})
 
 	current := make(map[string]ResourceID, len(desired))
 
-	for _, obj := range desired {
+	for _, buildObj := range desired {
+		obj := buildObj.Object
 		// A CRD may have been installed earlier in this same run.
-		id, err := r.identity(obj)
+		id, err := r.identity(buildObj)
 		if err != nil {
 			return report, fmt.Errorf(
 				"resolve %s %s: %w",
@@ -324,10 +337,28 @@ func deleteRank(id ResourceID) int {
 	}
 }
 
-func loadManifests(paths []string) ([]*unstructured.Unstructured, error) {
-	var result []*unstructured.Unstructured
+func loadManifests(sl *statusline.StatusLine, paths []string) ([]*BuildObject, error) {
+	var result []*BuildObject
 
 	for _, path := range paths {
+		if sl != nil {
+			sl.Emit("examining %s...", path)
+		}
+		noExt := strings.TrimSuffix(path, ".yaml")
+		metaFile := fmt.Sprintf("%s.meta", noExt)
+
+		patchMeta := &config.PatchMetadata{}
+		if _, err := os.Stat(metaFile); err == nil {
+			mBytes, err := os.ReadFile(metaFile)
+			if err != nil {
+				return nil, fmt.Errorf("unable to read patch metadata: %w", err)
+			}
+
+			if err = yaml.Unmarshal(mBytes, patchMeta); err != nil {
+				return nil, fmt.Errorf("unable to unmarshal patch metadata: %w", err)
+			}
+		}
+
 		f, err := os.Open(path)
 		if err != nil {
 			return nil, fmt.Errorf("open %q: %w", path, err)
@@ -387,7 +418,12 @@ func loadManifests(paths []string) ([]*unstructured.Unstructured, error) {
 							path, docNumber, i, err,
 						)
 					}
-					result = append(result, itemObj)
+
+					bo := &BuildObject{
+						Object:   itemObj,
+						Metadata: patchMeta,
+					}
+					result = append(result, bo)
 				}
 				continue
 			}
@@ -398,7 +434,11 @@ func loadManifests(paths []string) ([]*unstructured.Unstructured, error) {
 					"%s document %d: %w", path, docNumber, err,
 				)
 			}
-			result = append(result, obj)
+			bo := &BuildObject{
+				Object:   obj,
+				Metadata: patchMeta,
+			}
+			result = append(result, bo)
 		}
 
 		if err := f.Close(); err != nil {
@@ -430,8 +470,9 @@ func validateObject(obj *unstructured.Unstructured) error {
 }
 
 func (r *reconciler) identity(
-	obj *unstructured.Unstructured,
+	buildObj *BuildObject,
 ) (ResourceID, error) {
+	obj := buildObj.Object
 	gv, err := schema.ParseGroupVersion(obj.GetAPIVersion())
 	if err != nil {
 		return ResourceID{}, err
@@ -450,7 +491,9 @@ func (r *reconciler) identity(
 
 	namespace := obj.GetNamespace()
 	if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
-		if namespace == "" {
+		if buildObj.Metadata.Namespace != "" {
+			namespace = buildObj.Metadata.Namespace
+		} else if namespace == "" {
 			namespace = "default"
 		}
 	} else if namespace != "" {

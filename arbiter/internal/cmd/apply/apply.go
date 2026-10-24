@@ -69,13 +69,23 @@ func applyCmd(name string) error {
 		return err
 	}
 
+	patchFiles, err := cfg.GetOrderedPatchGroupFilenames(config.PatchTypeTalos)
+	if err != nil {
+		return err
+	}
+	for _, patchFile := range patchFiles {
+		sl.Emit("preparing %s", patchFile)
+	}
+
 	if err = client.ApplyConfiguration(context.Background(), hardwareConfig, true); err != nil {
 		sl.Emit("❌ dry run failed - %s", err.Error())
 		return nil
 	}
 
+	sl.Emit("✅ dry run successful")
+
 	if err = client.ApplyConfiguration(context.Background(), hardwareConfig, false); err != nil {
-		sl.Emit("❌ failed to applyh configuration - %s", err.Error())
+		sl.Emit("❌ failed to apply configuration - %s", err.Error())
 		return nil
 	}
 
@@ -123,6 +133,7 @@ outer:
 	if len(manifestFiles) > 0 {
 		report, err := kube.Reconcile(
 			ctx,
+			sl,
 			cfg.KubeConfigPath,
 			cfg.KubeContextName,
 			manifestFiles,
@@ -133,16 +144,17 @@ outer:
 		}
 
 		for _, action := range report.Actions {
-			sl.Emit("%s: %s\n", action.Operation, action.Resource)
+			sl.Emit("%s: %s", action.Operation, action.Resource)
 		}
 
 		sl.Status("reconciling resources...")
 		_, err = kube.Reconcile(
 			ctx,
+			sl,
 			cfg.KubeConfigPath,
 			cfg.KubeContextName,
 			manifestFiles,
-			true,
+			false,
 		)
 		if err != nil {
 			return err

@@ -24,6 +24,10 @@ var indexFileSplitter = regexp.MustCompile(`^(\d+)[^\d]*$`)
 
 type PatchType string
 
+type PatchMetadata struct {
+	Namespace string `yaml:"namespace"`
+}
+
 const (
 	PatchTypeTalos      PatchType = "machine"
 	PatchTypeKubernetes PatchType = "kubernetes"
@@ -354,8 +358,25 @@ func (c *Config) SaveNameRef() error {
 	return nil
 }
 
-func (c *Config) SavePatch(patchType PatchType, filename string, patchData []byte) error {
-	return c.StoreData(filepath.Join("config", "patches", string(patchType), filename), patchData)
+func (c *Config) SavePatch(patchType PatchType, filename string, patchData []byte, patchMeta *PatchMetadata) error {
+	basePath := filepath.Join("config", "patches", string(patchType), filename)
+	yamlFile := fmt.Sprintf("%s.yaml", basePath)
+	if err := c.StoreData(yamlFile, patchData); err != nil {
+		return err
+	}
+
+	if patchMeta != nil {
+		metadataFile := fmt.Sprintf("%s.meta", basePath)
+		mBytes, err := yaml.Marshal(patchMeta)
+		if err != nil {
+			return err
+		}
+		if err := c.StoreData(metadataFile, mBytes); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
 
 func (c *Config) ExistsPatch(patchType PatchType, filename string) bool {
@@ -392,7 +413,7 @@ func (c *Config) GetCurrentPatchIndex(patchType PatchType) (int, error) {
 		}
 	}
 
-	return largestIndex, nil
+	return largestIndex + 1, nil
 }
 
 func (c *Config) LoadTalosPatchGroup() ([]byte, error) {

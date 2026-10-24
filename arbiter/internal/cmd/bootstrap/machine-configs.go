@@ -42,6 +42,7 @@ func generateMachineConfigs(cfg *abconfig.Config, versionContract *config.Versio
 		constants.DefaultKubernetesVersion,
 		generate.WithVersionContract(versionContract),
 		generate.WithSecretsBundle(secretsBundle),
+		generate.WithAllowSchedulingOnControlPlanes(true),
 		generate.WithEndpointList([]string{
 			cfg.IpAddress,
 		}),

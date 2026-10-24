@@ -65,7 +65,7 @@ func postConfigCmd(name string) error {
 	defer sl.Stop()
 
 	if patchIndex > 0 {
-		wipePatches := sl.Confirm(false, "you already have system patches, would you like to erase them and start over?")
+		wipePatches := sl.Confirm(false, "you already have talos patches, would you like to erase them all and start over?")
 		if wipePatches {
 			err = os.RemoveAll(cfg.GetPatchDir(config.PatchTypeTalos))
 			if err != nil {
@@ -124,7 +124,7 @@ func postConfigCmd(name string) error {
 				break
 			}
 			volSize, err := strconv.ParseInt(spaceStr, 10, 64)
-			if err != nil && volSize > 0 && volSize < int64(absMaxSize) {
+			if err == nil && volSize > 0 && volSize < int64(absMaxSize) {
 				minSize = int(volSize)
 				break
 			}
@@ -138,7 +138,7 @@ func postConfigCmd(name string) error {
 					break
 				}
 				volSize, err := strconv.ParseInt(spaceStr, 10, 64)
-				if err != nil && volSize > 0 && volSize < int64(absMaxSize) {
+				if err == nil && volSize > 0 && volSize < int64(absMaxSize) {
 					maxSize = int(volSize)
 					break
 				}
@@ -166,27 +166,41 @@ func postConfigCmd(name string) error {
 			return fmt.Errorf("error rendering storage volume template: %w", err)
 		}
 
-		if err = cfg.SavePatch(config.PatchTypeTalos, fmt.Sprintf("%d-storage-volume-%s", volName), volData); err != nil {
+		if err = cfg.SavePatch(config.PatchTypeTalos, fmt.Sprintf("%04d-storage-volume-%s", patchIndex, volName), volData, nil); err != nil {
 			return err
 		}
+		patchIndex++
 
 		addStorage = sl.Confirm(false, "add additional storage?")
 	}
 
 	var setupArgo bool
-	if !cfg.ExistsPatch(config.PatchTypeKubernetes, "argocd.yaml") {
-		setupArgo = sl.Confirm(true, "would you like to setup argocd?")
-	} else {
-		setupArgo = sl.Confirm(true, "would you like to download the latest argocd install manifest?")
-	}
-
+	setupArgo = sl.Confirm(true, "would you like to setup argocd?")
 	if setupArgo {
+		patchIndex, err := cfg.GetCurrentPatchIndex(config.PatchTypeKubernetes)
+		if err != nil {
+			return fmt.Errorf("unable to analyze current patch directory: %w", err)
+		}
+
+		if patchIndex > 0 {
+			wipePatches := sl.Confirm(false, "you already have kubernetes patches, would you like to erase them all and start over?")
+			if wipePatches {
+				err = os.RemoveAll(cfg.GetPatchDir(config.PatchTypeKubernetes))
+				if err != nil {
+					return err
+				}
+			}
+		}
+
 		manifest, err := argocd.GetArgoCdFullManifest()
 		if err != nil {
 			return err
 		}
 
-		if err = cfg.SavePatch(config.PatchTypeKubernetes, "argocd.yaml", manifest); err != nil {
+		patchMeta := &config.PatchMetadata{
+			Namespace: "argocd",
+		}
+		if err = cfg.SavePatch(config.PatchTypeKubernetes, fmt.Sprintf("%04d-argocd", patchIndex), manifest, patchMeta); err != nil {
 			return err
 		}
 	}
