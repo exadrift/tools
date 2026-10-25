@@ -63,6 +63,9 @@ func applyCmd(name string) error {
 	}
 
 	hardwareConfig, err := cfg.LoadTalosPatchGroup()
+	if err != nil {
+		return err
+	}
 
 	client, err := talossdk.NewAuthenticatedClient(machineConfig)
 	if err != nil {

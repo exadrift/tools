@@ -418,7 +418,7 @@ func (c *Config) GetCurrentPatchIndex(patchType PatchType) (int, error) {
 		}
 
 		if li > largestIndex {
-			li = largestIndex
+			largestIndex = li
 		}
 	}
 

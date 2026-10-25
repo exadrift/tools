@@ -174,8 +174,7 @@ func postConfigCmd(name string) error {
 		addStorage = sl.Confirm(false, "add additional storage?")
 	}
 
-	var setupArgo bool
-	setupArgo = sl.Confirm(true, "would you like to setup argocd?")
+	setupArgo := sl.Confirm(true, "would you like to setup argocd?")
 	if setupArgo {
 		patchIndex, err := cfg.GetCurrentPatchIndex(config.PatchTypeKubernetes)
 		if err != nil {

@@ -1,6 +1,6 @@
 NAME := $(shell basename $${PWD})
 GO_VERSION := 1.27
-LINTER_VERSION := 2.12.2
+LINTER_VERSION := 2.15.0
 VERSION ?= local
 GO_IMAGE := golang:$(GO_VERSION)-alpine
 HOME=$(shell echo $$HOME)

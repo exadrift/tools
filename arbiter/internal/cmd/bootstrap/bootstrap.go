@@ -82,7 +82,7 @@ func bootstrapCmd(name string) error {
 	}
 	sl.Emit("✅ node is in maintenance mode, running %s", versionContract.String())
 
-	var regenerate bool = true
+	var regenerate bool
 	sl.Status("checking machine configuration")
 	machineConfig, err := cfg.LoadMachineConfig()
 	if err == nil {

@@ -22,7 +22,9 @@ func fetchURL(client *http.Client, url string) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("GET %s: %w", url, err)
 	}
-	defer resp.Body.Close()
+	defer func() {
+		_ = resp.Body.Close()
+	}()
 
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GET %s: unexpected status %s", url, resp.Status)
