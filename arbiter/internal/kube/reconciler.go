@@ -240,6 +240,7 @@ func Reconcile(
 			)
 		}
 
+		sl.Emit("applying %s %s in ns \"%s\"", obj.GetKind(), obj.GetName(), id.Namespace)
 		action, err := r.apply(ctx, obj, id)
 		if err != nil {
 			return report, fmt.Errorf("apply %s: %w", id, err)
@@ -490,17 +491,21 @@ func (r *reconciler) identity(
 	}
 
 	namespace := obj.GetNamespace()
-	if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
-		if buildObj.Metadata.Namespace != "" {
-			namespace = buildObj.Metadata.Namespace
-		} else if namespace == "" {
-			namespace = "default"
+	if obj.GetKind() == "Namespace" {
+		namespace = ""
+	} else {
+		if mapping.Scope.Name() == meta.RESTScopeNameNamespace {
+			if buildObj.Metadata.Namespace != "" {
+				namespace = buildObj.Metadata.Namespace
+			} else if namespace == "" {
+				namespace = "default"
+			}
+		} else if namespace != "" {
+			return ResourceID{}, fmt.Errorf(
+				"cluster-scoped resource %s must not specify namespace",
+				obj.GetName(),
+			)
 		}
-	} else if namespace != "" {
-		return ResourceID{}, fmt.Errorf(
-			"cluster-scoped resource %s must not specify namespace",
-			obj.GetName(),
-		)
 	}
 
 	return ResourceID{
@@ -564,7 +569,9 @@ func (r *reconciler) apply(
 	options := metav1.PatchOptions{
 		FieldManager: fieldManager,
 	}
-	if r.dryRun {
+
+	// dry run everything but namespace creation
+	if r.dryRun && id.Resource != "namespaces" {
 		options.DryRun = []string{metav1.DryRunAll}
 	}
 

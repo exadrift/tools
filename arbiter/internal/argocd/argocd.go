@@ -65,5 +65,5 @@ func GetArgoCdFullManifest() ([]byte, error) {
 		return nil, err
 	}
 
-	return []byte(fmt.Sprintf("%s\n---\n%s\n", string(installMf), string(namespaceYaml))), nil
+	return fmt.Appendf(nil, "%s\n---\n%s\n", string(namespaceYaml), string(installMf)), nil
 }
