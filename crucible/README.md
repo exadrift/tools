@@ -4,8 +4,9 @@
 crucible is a powerful environment configuration tool which can be used to maintain one or many identical remote environments by focussing on the creation of reusable, idempotent action sequences.  what this means is that an action sequence can be configured to execute multiple times on the same system, and only the differences should be rectified between the machine state and the desired state.
 
 ## getting started
-download the latest version crucible your deployment control machine and place it in your path:
 ```
+# binary will be installed to ~/.local/bin
+# to install elsewhere, set BIN_DIR to the desired location
 sh -c "curl https://raw.githubusercontent.com/exadrift/tools/refs/heads/main/install.sh | sh -s -- crucible"
 ```
 once downloaded, run `crucible --help`

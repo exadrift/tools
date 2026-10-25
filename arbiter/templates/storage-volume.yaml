@@ -1,0 +1,8 @@
+apiVersion: v1alpha1
+kind: UserVolumeConfig
+name: "{{.Name}}"
+provisioning:
+  diskSelector:
+    match: disk.serial == "{{.Serial}}"
+  minSize: "{{.MinSize}}GiB"
+  maxSize: "{{.MaxSize}}GiB"
