@@ -56,7 +56,12 @@ func postConfigCmd(name string) error {
 		return err
 	}
 
-	patchIndex, err := cfg.GetCurrentPatchIndex(config.PatchTypeTalos)
+	talosPatchIndex, err := cfg.GetCurrentPatchIndex(config.PatchTypeTalos)
+	if err != nil {
+		return fmt.Errorf("unable to analyze current patch directory: %w", err)
+	}
+
+	kubePatchIndex, err := cfg.GetCurrentPatchIndex(config.PatchTypeKubernetes)
 	if err != nil {
 		return fmt.Errorf("unable to analyze current patch directory: %w", err)
 	}
@@ -64,13 +69,19 @@ func postConfigCmd(name string) error {
 	sl := utils.NewStatusLine()
 	defer sl.Stop()
 
-	if patchIndex > 0 {
-		wipePatches := sl.Confirm(false, "you already have talos patches, would you like to erase them all and start over?")
+	if talosPatchIndex > 1 || kubePatchIndex > 1 {
+		wipePatches := sl.Confirm(false, "you already have some kube/talos patches, should i erase them (if not new ones will be added)?")
 		if wipePatches {
 			err = os.RemoveAll(cfg.GetPatchDir(config.PatchTypeTalos))
 			if err != nil {
 				return err
 			}
+			err = os.RemoveAll(cfg.GetPatchDir(config.PatchTypeKubernetes))
+			if err != nil {
+				return err
+			}
+			talosPatchIndex = 1
+			kubePatchIndex = 1
 		}
 	}
 
@@ -166,31 +177,30 @@ func postConfigCmd(name string) error {
 			return fmt.Errorf("error rendering storage volume template: %w", err)
 		}
 
-		if err = cfg.SavePatch(config.PatchTypeTalos, fmt.Sprintf("%04d-storage-volume-%s", patchIndex, volName), volData, nil); err != nil {
+		if err = cfg.SavePatch(config.PatchTypeTalos, fmt.Sprintf("%04d-storage-volume-%s", talosPatchIndex, volName), volData, nil); err != nil {
 			return err
 		}
-		patchIndex++
+		talosPatchIndex++
+
+		pvData, err := templates.RenderPersistentVolumeTemplate(templates.PersistentVolumeConfig{
+			Name:     volName,
+			Size:     minSize,
+			Hostname: cfg.Name,
+		})
+		if err != nil {
+			return fmt.Errorf("error rendering persistent volume template: %w", err)
+		}
+
+		if err = cfg.SavePatch(config.PatchTypeKubernetes, fmt.Sprintf("%04d-persistent-volume-%s", kubePatchIndex, volName), pvData, nil); err != nil {
+			return err
+		}
+		kubePatchIndex++
 
 		addStorage = sl.Confirm(false, "add additional storage?")
 	}
 
 	setupArgo := sl.Confirm(true, "would you like to setup argocd?")
 	if setupArgo {
-		patchIndex, err := cfg.GetCurrentPatchIndex(config.PatchTypeKubernetes)
-		if err != nil {
-			return fmt.Errorf("unable to analyze current patch directory: %w", err)
-		}
-
-		if patchIndex > 0 {
-			wipePatches := sl.Confirm(false, "you already have kubernetes patches, would you like to erase them all and start over?")
-			if wipePatches {
-				err = os.RemoveAll(cfg.GetPatchDir(config.PatchTypeKubernetes))
-				if err != nil {
-					return err
-				}
-			}
-		}
-
 		manifest, err := argocd.GetArgoCdFullManifest()
 		if err != nil {
 			return err
@@ -199,7 +209,7 @@ func postConfigCmd(name string) error {
 		patchMeta := &config.PatchMetadata{
 			Namespace: "argocd",
 		}
-		if err = cfg.SavePatch(config.PatchTypeKubernetes, fmt.Sprintf("%04d-argocd", patchIndex), manifest, patchMeta); err != nil {
+		if err = cfg.SavePatch(config.PatchTypeKubernetes, fmt.Sprintf("%04d-argocd", kubePatchIndex), manifest, patchMeta); err != nil {
 			return err
 		}
 	}

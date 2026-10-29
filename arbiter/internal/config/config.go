@@ -402,7 +402,7 @@ func (c *Config) GetCurrentPatchIndex(patchType PatchType) (int, error) {
 	_, err := os.Stat(parentDir)
 	if err != nil {
 		// dir doesn't exist
-		return 0, nil
+		return 1, nil
 	}
 	patchGlob := filepath.Join(parentDir, "*.yaml")
 	yamlFiles, err := filepath.Glob(patchGlob)
