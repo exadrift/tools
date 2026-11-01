@@ -221,7 +221,9 @@ func listSecrets(cfg *config.Config) error {
 	}
 	for key, secret := range cfg.Secrets().Kv {
 		dur := time.Duration.Round(time.Since(secret.CreatedAt), time.Second)
-		fmt.Fprintf(w, "%s\t%s\n", key, dur)
+		if _, err := fmt.Fprintf(w, "%s\t%s\n", key, dur); err != nil {
+			return err
+		}
 	}
 
 	return w.Flush()
