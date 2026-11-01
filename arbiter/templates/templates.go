@@ -15,6 +15,12 @@ var storageVolumeTemplateStr string
 //go:embed persistent-volume.yaml
 var peristentVolumeTemplateStr string
 
+//go:embed secret.yaml
+var secretTemplateStr string
+
+//go:embed namespace.yaml
+var namespaceStr string
+
 var installDiskTemplate = template.Must(
 	template.New("install-disk").Option("missingkey=error").Parse(installDiskTemplateStr),
 )
@@ -25,6 +31,14 @@ var storageVolumeTemplate = template.Must(
 
 var persistentVolumeTemplate = template.Must(
 	template.New("persistent-volume").Option("missingkey=error").Parse(peristentVolumeTemplateStr),
+)
+
+var secretTemplate = template.Must(
+	template.New("secret").Option("missingkey=error").Parse(secretTemplateStr),
+)
+
+var namespaceTemplate = template.Must(
+	template.New("namespace").Option("missingkey=error").Parse(namespaceStr),
 )
 
 type installDiskTemplateConfig struct {
@@ -42,6 +56,16 @@ type PersistentVolumeConfig struct {
 	Name     string
 	Size     int
 	Hostname string
+}
+
+type SecretConfig struct {
+	Name      string
+	Namespace string
+	Data      map[string]string
+}
+
+type NamespaceConfig struct {
+	Name string
 }
 
 func RenderDiskTemplate(serial string) ([]byte, error) {
@@ -72,6 +96,28 @@ func RenderPersistentVolumeTemplate(pvConfig PersistentVolumeConfig) ([]byte, er
 	var buf bytes.Buffer
 
 	err := persistentVolumeTemplate.Execute(&buf, pvConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
+}
+
+func RenderSecretTemplate(secretConfig SecretConfig) ([]byte, error) {
+	var buf bytes.Buffer
+
+	err := secretTemplate.Execute(&buf, secretConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
+}
+
+func RenderNamespaceTemplate(namespaceConfig NamespaceConfig) ([]byte, error) {
+	var buf bytes.Buffer
+
+	err := namespaceTemplate.Execute(&buf, namespaceConfig)
 	if err != nil {
 		return nil, err
 	}

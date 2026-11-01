@@ -13,6 +13,7 @@ import (
 	postconfigure "github.com/exadrift/tools/arbiter/internal/cmd/post-configure"
 	"github.com/exadrift/tools/arbiter/internal/cmd/remove"
 	"github.com/exadrift/tools/arbiter/internal/cmd/restore"
+	"github.com/exadrift/tools/arbiter/internal/cmd/secrets"
 	"github.com/spf13/cobra"
 )
 
@@ -36,5 +37,6 @@ func main() {
 	rootCmd.AddCommand(kubeconfigcmd.Command())
 	rootCmd.AddCommand(list.Command())
 	rootCmd.AddCommand(remove.Command())
+	rootCmd.AddCommand(secrets.Command())
 	_ = rootCmd.Execute()
 }

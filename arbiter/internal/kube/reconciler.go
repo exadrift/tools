@@ -1,6 +1,7 @@
 package kube
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -31,7 +32,7 @@ import (
 const (
 	fieldManager = "kube-directory-reconciler"
 
-	managedAnnotation = "kube-directory-reconciler.openai.com/managed"
+	managedAnnotation = "reconciler.arbiter.com"
 
 	inventoryNamespace = "kube-system"
 	inventoryName      = "kube-directory-reconciler-inventory"
@@ -119,7 +120,7 @@ func Reconcile(
 	sl *statusline.StatusLine,
 	kubeConfigPath string,
 	contextName string,
-	manifestFiles []string,
+	manifestFiles map[string]any,
 	dryRun bool,
 ) (Report, error) {
 	report := Report{
@@ -137,7 +138,7 @@ func Reconcile(
 		)
 	}
 
-	for _, path := range manifestFiles {
+	for path, _ := range manifestFiles {
 		if strings.TrimSpace(path) == "" {
 			return report, fmt.Errorf("manifestFiles contains an empty path")
 		}
@@ -338,10 +339,23 @@ func deleteRank(id ResourceID) int {
 	}
 }
 
-func loadManifests(sl *statusline.StatusLine, paths []string) ([]*BuildObject, error) {
+func loadManifests(sl *statusline.StatusLine, manifests map[string]any) ([]*BuildObject, error) {
 	var result []*BuildObject
 
-	for _, path := range paths {
+	for path, manifestData := range manifests {
+		// skip metadata paths
+		if strings.HasSuffix(path, ".meta") {
+			continue
+		}
+
+		var isLoaded bool
+		switch manifestData.(type) {
+		case []byte:
+			isLoaded = true
+		default:
+			isLoaded = false
+		}
+
 		if sl != nil {
 			sl.Emit("examining %s...", path)
 		}
@@ -349,20 +363,37 @@ func loadManifests(sl *statusline.StatusLine, paths []string) ([]*BuildObject, e
 		metaFile := fmt.Sprintf("%s.meta", noExt)
 
 		patchMeta := &config.PatchMetadata{}
-		if _, err := os.Stat(metaFile); err == nil {
-			mBytes, err := os.ReadFile(metaFile)
-			if err != nil {
-				return nil, fmt.Errorf("unable to read patch metadata: %w", err)
+		var mBytes []byte
+		if isLoaded {
+			metaData, ok := manifests[metaFile]
+			if ok {
+				mBytes = metaData.([]byte)
+				if err := yaml.Unmarshal(mBytes, patchMeta); err != nil {
+					return nil, fmt.Errorf("unable to unmarshal patch metadata: %w", err)
+				}
 			}
+		} else {
+			if _, err := os.Stat(metaFile); err == nil {
+				mBytes, err = os.ReadFile(metaFile)
+				if err != nil {
+					return nil, fmt.Errorf("unable to read patch metadata: %w", err)
+				}
 
-			if err = yaml.Unmarshal(mBytes, patchMeta); err != nil {
-				return nil, fmt.Errorf("unable to unmarshal patch metadata: %w", err)
+				if err = yaml.Unmarshal(mBytes, patchMeta); err != nil {
+					return nil, fmt.Errorf("unable to unmarshal patch metadata: %w", err)
+				}
 			}
 		}
 
-		f, err := os.Open(path)
-		if err != nil {
-			return nil, fmt.Errorf("open %q: %w", path, err)
+		var f io.ReadCloser
+		if isLoaded {
+			f = io.NopCloser(bytes.NewReader(manifestData.([]byte)))
+		} else {
+			var err error
+			f, err = os.Open(path)
+			if err != nil {
+				return nil, fmt.Errorf("open %q: %w", path, err)
+			}
 		}
 
 		decoder := yaml.NewYAMLOrJSONDecoder(f, 4096)
