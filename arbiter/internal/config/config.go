@@ -2,6 +2,7 @@ package config
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -10,8 +11,10 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/exadrift/tools/arbiter/internal/crypto"
+	"github.com/exadrift/tools/arbiter/templates"
 	yaml "github.com/goccy/go-yaml"
 	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
 	machineryconfig "github.com/siderolabs/talos/pkg/machinery/config"
@@ -28,9 +31,18 @@ type PatchMetadata struct {
 	Namespace string `yaml:"namespace"`
 }
 
+type KubernetesSecretMapping struct {
+	Namespace string `yaml:"namespace"`
+	Name      string `yaml:"name"`
+	// key is the target key name in the secret to be created
+	// value is the key name in the arbiter secrets store
+	KeyMapping map[string]string `yaml:"keyMapping"`
+}
+
 const (
-	PatchTypeTalos      PatchType = "machine"
-	PatchTypeKubernetes PatchType = "kubernetes"
+	PatchTypeTalos             PatchType = "machine"
+	PatchTypeKubernetes        PatchType = "kubernetes"
+	PatchTypeKubernetesSecrets PatchType = "kubernetes-secrets"
 )
 
 const (
@@ -39,12 +51,15 @@ const (
 	talosConfigSecretFilename  = "talosconfig.encrypted"
 	renderedConfigsSubpath     = "rendered"
 	nameReferenceFilename      = ".nameref"
+	userSecrets                = "user-secrets.json"
 
 	InstallDiskFilename = "config/install-disk.yaml"
 )
 
 type Config struct {
-	configDir       string         `yaml:"-"`
+	configDir string  `yaml:"-"`
+	secrets   Secrets `yaml:"-"`
+
 	Crypto          *crypto.Crypto `yaml:"-"`
 	Key             string         `yaml:"privateKey"`
 	ProjectDir      string         `yaml:"projectDir"`
@@ -52,6 +67,82 @@ type Config struct {
 	Name            string         `yaml:"-"`
 	KubeConfigPath  string         `yaml:"kubeConfigPath"`
 	KubeContextName string         `yaml:"kubeContextName"`
+}
+
+type Secrets struct {
+	Kv     map[string]*Secret
+	path   string
+	crypto *crypto.Crypto
+}
+
+type Secret struct {
+	CreatedAt time.Time `json:"created_at"`
+	Value     string    `json:"value"`
+}
+
+func (s *Secrets) Load(path string) error {
+	s.path = path
+	jBytes, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+
+	// no error means load the secrets, error most likely means there aren't any
+	if err = json.Unmarshal(jBytes, &s.Kv); err != nil {
+		return fmt.Errorf("unable to load user defined secrets")
+	}
+
+	return nil
+}
+
+func (s *Secrets) Save() error {
+	dir, _ := filepath.Split(s.path)
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		return fmt.Errorf("unable to make secrets path: %w", err)
+	}
+
+	jBytes, err := json.Marshal(s.Kv)
+	if err != nil {
+		return err
+	}
+
+	return os.WriteFile(s.path, jBytes, 0600)
+}
+
+func (s *Secrets) Exists(key string) bool {
+	_, ok := s.Kv[key]
+	return ok
+}
+
+func (s *Secrets) Set(key string, value []byte) error {
+	cStr, err := s.crypto.Encrypt(value)
+	if err != nil {
+		return err
+	}
+	s.Kv[key] = &Secret{
+		CreatedAt: time.Now(),
+		Value:     cStr,
+	}
+
+	return nil
+}
+
+func (s *Secrets) Remove(key string) {
+	delete(s.Kv, key)
+}
+
+func (s *Secrets) Decrypt(key string) (string, error) {
+	secret := s.Kv[key]
+	if secret == nil {
+		return "", fmt.Errorf("secret does not exist: %s", key)
+	}
+
+	b, err := s.crypto.Decrypt([]byte(secret.Value))
+	if err != nil {
+		return "", err
+	}
+
+	return base64.StdEncoding.EncodeToString(b), nil
 }
 
 func extractIndexFromFilename(filename string) (int, error) {
@@ -119,6 +210,84 @@ func New(name string, projectDir string, ipAddress string, crypt *crypto.Crypto)
 	cr.Key = ser
 
 	return cr, nil
+}
+
+func (c *Config) WriteKubernetsSecret(ks *KubernetesSecretMapping) error {
+	kBytes, err := yaml.Marshal(ks)
+	if err != nil {
+		return err
+	}
+	return c.SavePatch(PatchTypeKubernetesSecrets, ks.Name, kBytes, nil)
+}
+
+func (c *Config) ReadKubernetsSecrets() (map[string]any, error) {
+	filenames, err := c.GetOrderedPatchGroupFilenames(PatchTypeKubernetesSecrets)
+	if err != nil {
+		return nil, err
+	}
+
+	namespaces := map[string]struct{}{}
+
+	manifests := map[string]any{}
+	for _, filename := range filenames {
+		b, err := os.ReadFile(filename)
+		if err != nil {
+			return nil, err
+		}
+
+		ksm := &KubernetesSecretMapping{}
+		if err = yaml.Unmarshal(b, ksm); err != nil {
+			return nil, fmt.Errorf("unable to parse secret %s: %w", filename, err)
+		}
+
+		_, hasNs := namespaces[ksm.Namespace]
+		if !hasNs {
+			// need a namespace to store the secret in
+			namespaces[ksm.Namespace] = struct{}{}
+			tBytes, err := templates.RenderNamespaceTemplate(templates.NamespaceConfig{Name: ksm.Namespace})
+			if err != nil {
+				return nil, err
+			}
+			manifests[fmt.Sprintf("_arbiter.%s.namespace.yaml", ksm.Namespace)] = tBytes
+		}
+
+		sc := templates.SecretConfig{
+			Name:      ksm.Name,
+			Namespace: ksm.Namespace,
+			Data:      map[string]string{},
+		}
+		for k, v := range ksm.KeyMapping {
+			secret, err := c.Secrets().Decrypt(v)
+			if err != nil {
+				return nil, fmt.Errorf("unable to decrypt secret %s in %s: %w", v, filename, err)
+			}
+
+			sc.Data[k] = secret
+		}
+
+		sBytes, err := templates.RenderSecretTemplate(sc)
+		if err != nil {
+			return nil, err
+		}
+
+		manifestFilename := fmt.Sprintf("_arbiter.secret.%s", filename)
+
+		manifests[manifestFilename] = sBytes
+		pm := &PatchMetadata{
+			Namespace: ksm.Namespace,
+		}
+		pBytes, err := yaml.Marshal(pm)
+		if err != nil {
+			return nil, err
+		}
+		manifests[manifestFilename+".meta"] = pBytes
+	}
+
+	return manifests, nil
+}
+
+func (c *Config) Secrets() *Secrets {
+	return &c.secrets
 }
 
 func (c *Config) Save() error {
@@ -193,6 +362,11 @@ func LoadFromAltLocation(configPath string, name string) (*Config, error) {
 		return nil, fmt.Errorf("unable to deserilize private key: %w", err)
 	}
 	cfg.Crypto = c
+
+	cfg.secrets.crypto = cfg.Crypto
+	if err = cfg.secrets.Load(filepath.Join(cfg.secretsPath(), userSecrets)); err != nil {
+		cfg.secrets.Kv = map[string]*Secret{}
+	}
 
 	return cfg, nil
 }

@@ -128,18 +128,45 @@ outer:
 	}
 	sl.ReleaseTimer()
 
-	manifestFiles, err := cfg.GetOrderedPatchGroupFilenames(config.PatchTypeKubernetes)
-	if err != nil {
-		return err
+	manifests := map[string]any{}
+	for _, patchType := range []config.PatchType{config.PatchTypeKubernetesSecrets, config.PatchTypeKubernetes} {
+		switch patchType {
+		case config.PatchTypeKubernetesSecrets:
+			mf, err := cfg.ReadKubernetsSecrets()
+			if err != nil {
+				return err
+			}
+			for k, v := range mf {
+				_, duplicate := manifests[k]
+				if duplicate {
+					return fmt.Errorf("conflicting manifest found: %s %s", patchType, k)
+				}
+				manifests[k] = v
+			}
+		default:
+			manifestFiles, err := cfg.GetOrderedPatchGroupFilenames(patchType)
+			if err != nil {
+				return err
+			}
+
+			for _, m := range manifestFiles {
+				_, duplicate := manifests[m]
+				if duplicate {
+					return fmt.Errorf("conflicting manifest found: %s %s", patchType, m)
+				}
+				manifests[m] = struct{}{}
+			}
+		}
 	}
-	sl.Status("planning dry run...")
-	if len(manifestFiles) > 0 {
+
+	sl.Status("planning dry run of resources...")
+	if len(manifests) > 0 {
 		report, err := kube.Reconcile(
 			ctx,
 			sl,
 			cfg.KubeConfigPath,
 			cfg.KubeContextName,
-			manifestFiles,
+			manifests,
 			true,
 		)
 		if err != nil {
@@ -156,7 +183,7 @@ outer:
 			sl,
 			cfg.KubeConfigPath,
 			cfg.KubeContextName,
-			manifestFiles,
+			manifests,
 			false,
 		)
 		if err != nil {

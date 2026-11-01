@@ -7,10 +7,9 @@ import (
 	"net/http"
 	"strings"
 	"time"
-)
 
-//go:embed namespace.yaml
-var namespaceYaml []byte
+	"github.com/exadrift/tools/arbiter/templates"
+)
 
 const (
 	versionURL  = "https://raw.githubusercontent.com/argoproj/argo-cd/stable/VERSION"
@@ -67,5 +66,10 @@ func GetArgoCdFullManifest() ([]byte, error) {
 		return nil, err
 	}
 
-	return fmt.Appendf(nil, "%s\n---\n%s\n", string(namespaceYaml), string(installMf)), nil
+	tBytes, err := templates.RenderNamespaceTemplate(templates.NamespaceConfig{Name: "argocd"})
+	if err != nil {
+		return nil, err
+	}
+
+	return fmt.Appendf(nil, "%s\n---\n%s\n", string(tBytes), string(installMf)), nil
 }
