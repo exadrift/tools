@@ -1,3 +1,5 @@
+# v0.0.4
+- updated readme
 # v0.0.3
 - added secret management
 # v0.0.2

@@ -54,3 +54,48 @@ arbiter apply
 ```
 
 this will apply an talos machine and/or kubernetes patches which were prepared wither during the post-configuration stage, or were simply manually added to the repo's `config/patches` section.  Patches should be alphabetically ordered for install preference.  `/machine` must contain only talos machine configuration, wheras `/kubernetes` must contain only kubernetes assets which are not to be managed by argocd, or other.
+
+### secret managment
+arbiter allows you to store secrets in git, and while secrets are not applied via gitops, they are applied just as normal kubernetes patches would be, using `arbiter apply`
+
+arbiter secrets have two components, the secret definition in arbiter, and the linkage to a kubernetes secret.
+
+#### defining a secret in arbiter
+```
+arbiter secrets set <key-name>
+```
+this allows you to set a secret from either a `--path` or will prompt for input from the stdin.
+
+#### listing defined secrets in arbiter
+```
+arbiter secrets list
+```
+
+#### creating a kubernetes secret that references arbiter
+```
+arbiter secrets apply <kube-secret-name> --namespace <ns>
+```
+this will guide you through the creation of a named kubernetes secret, which will be created in the specified namespace.  you will be prompted to enter the arbiter secret key-name and the target key in the kubernetes secret.  a patch file will be created in `<repo>/config/patches/kubernetes-secrets`
+
+the secrets look like this, and you can easily add them yourself.
+
+```
+# <repo>/config/patches/kubernetes-secrets/my-secret.yaml
+# arbiter.x.y are just example names, you can call them anything, but they refer exactly to the secret keys in arbiter, they do not require an arbiter. preifix
+
+namespace: cert-manager
+name: cert-authority
+keyMapping:
+  tls.crt: arbiter.tls.cert
+  tls.key: arbiter.tls.key
+```
+
+another example
+
+```
+namespace: my_namespace
+name: my_secret
+keyMapping:
+  username: users.me.name
+  password: users.me.password
+```
