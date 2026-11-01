@@ -138,7 +138,7 @@ func Reconcile(
 		)
 	}
 
-	for path, _ := range manifestFiles {
+	for path := range manifestFiles {
 		if strings.TrimSpace(path) == "" {
 			return report, fmt.Errorf("manifestFiles contains an empty path")
 		}

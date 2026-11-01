@@ -144,7 +144,7 @@ func Command() *cobra.Command {
 		}}
 
 	applyCmd.Flags().String("namespace", "", "namespace in which to install secret")
-	cobra.MarkFlagRequired(applyCmd.Flags(), "namespace")
+	_ = cobra.MarkFlagRequired(applyCmd.Flags(), "namespace")
 
 	base.PersistentFlags().StringVar(
 		&projectArg,
@@ -213,8 +213,12 @@ func removeSecret(cfg *config.Config, key string) error {
 
 func listSecrets(cfg *config.Config) error {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
-	fmt.Fprintln(w, "KEY\tAGE")
-	fmt.Fprintln(w, "---\t---")
+	if _, err := fmt.Fprintln(w, "KEY\tAGE"); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprintln(w, "---\t---"); err != nil {
+		return err
+	}
 	for key, secret := range cfg.Secrets().Kv {
 		dur := time.Duration.Round(time.Since(secret.CreatedAt), time.Second)
 		fmt.Fprintf(w, "%s\t%s\n", key, dur)
