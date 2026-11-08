@@ -12,7 +12,9 @@ func GetRemoteOriginURL(configPath string) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("could not open git config: %w", err)
 	}
-	defer file.Close()
+	defer func() {
+		_ = file.Close()
+	}()
 
 	scanner := bufio.NewScanner(file)
 	inRemoteOriginBlock := false

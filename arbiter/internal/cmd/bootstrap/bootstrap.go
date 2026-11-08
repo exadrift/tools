@@ -302,17 +302,17 @@ func getLatestVersion(settings *cli.EnvSettings, repoUrl string) (string, error)
 
 	httpGetter, err := getters.ByScheme("https")
 	if err != nil {
-		return "", fmt.Errorf("Failed to find getter for https: %w", err)
+		return "", fmt.Errorf("failed to find getter for https: %w", err)
 	}
 
 	res, err := httpGetter.Get(indexUrl)
 	if err != nil {
-		return "", fmt.Errorf("Failed to download index: %w", err)
+		return "", fmt.Errorf("failed to download index: %w", err)
 	}
 
 	indexFile := repo.NewIndexFile()
 	if err := yaml.Unmarshal(res.Bytes(), indexFile); err != nil {
-		return "", fmt.Errorf("Failed to unmarshal index YAML: %w", err)
+		return "", fmt.Errorf("failed to unmarshal index YAML: %w", err)
 	}
 	indexFile.SortEntries()
 
@@ -386,11 +386,11 @@ func installArgoCd(ctx context.Context, sl *statusline.StatusLine, cfg *config.C
 	hClient.Timeout = 5 * 60 * 1000000000 // 5 minutes
 
 	// Configure the chart repository.
-	hClient.ChartPathOptions.RepoURL = HelmRepoUrl
-	hClient.ChartPathOptions.Version = version
+	hClient.RepoURL = HelmRepoUrl
+	hClient.Version = version
 
 	// Download the chart.
-	chartPath, err := hClient.ChartPathOptions.LocateChart(
+	chartPath, err := hClient.LocateChart(
 		"argo-cd",
 		settings,
 	)
