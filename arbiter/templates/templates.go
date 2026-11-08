@@ -21,6 +21,12 @@ var secretTemplateStr string
 //go:embed namespace.yaml
 var namespaceStr string
 
+//go:embed bootstrap-application.yaml
+var bootstrapApplicationStr string
+
+//go:embed argocd-application.yaml
+var argoCdApplicationStr string
+
 var installDiskTemplate = template.Must(
 	template.New("install-disk").Option("missingkey=error").Parse(installDiskTemplateStr),
 )
@@ -39,6 +45,14 @@ var secretTemplate = template.Must(
 
 var namespaceTemplate = template.Must(
 	template.New("namespace").Option("missingkey=error").Parse(namespaceStr),
+)
+
+var bootstrapApplicationTemplate = template.Must(
+	template.New("bootstrap-application").Option("missingkey=error").Parse(bootstrapApplicationStr),
+)
+
+var argoCdApplicationStrTemplate = template.Must(
+	template.New("argocd-application").Option("missingkey=error").Parse(argoCdApplicationStr),
 )
 
 type installDiskTemplateConfig struct {
@@ -66,6 +80,17 @@ type SecretConfig struct {
 
 type NamespaceConfig struct {
 	Name string
+}
+
+type BootstrapApplicationConfig struct {
+	Name string
+	Repo string
+}
+
+type ArgoCdApplicationConfig struct {
+	HelmRepo string
+	Repo     string
+	Version  string
 }
 
 func RenderDiskTemplate(serial string) ([]byte, error) {
@@ -118,6 +143,28 @@ func RenderNamespaceTemplate(namespaceConfig NamespaceConfig) ([]byte, error) {
 	var buf bytes.Buffer
 
 	err := namespaceTemplate.Execute(&buf, namespaceConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
+}
+
+func RenderBootstrapApplicationTemplate(bootstrapConfig BootstrapApplicationConfig) ([]byte, error) {
+	var buf bytes.Buffer
+
+	err := bootstrapApplicationTemplate.Execute(&buf, bootstrapConfig)
+	if err != nil {
+		return nil, err
+	}
+
+	return buf.Bytes(), nil
+}
+
+func RenderArgoCdApplicationTemplate(argoConfig ArgoCdApplicationConfig) ([]byte, error) {
+	var buf bytes.Buffer
+
+	err := argoCdApplicationStrTemplate.Execute(&buf, argoConfig)
 	if err != nil {
 		return nil, err
 	}

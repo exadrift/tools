@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/exadrift/tools/arbiter/internal/crypto"
+	"github.com/exadrift/tools/arbiter/internal/git"
 	"github.com/exadrift/tools/arbiter/templates"
 	yaml "github.com/goccy/go-yaml"
 	clientconfig "github.com/siderolabs/talos/pkg/machinery/client/config"
@@ -665,4 +666,19 @@ func (c *Config) GetOrderedPatchGroupFilenames(patchType PatchType) ([]string, e
 	}
 
 	return patchInputs, nil
+}
+
+func (c *Config) WriteApplicationTemplate(dirName string, filename string, data []byte) error {
+	finalDir := filepath.Join(c.ProjectDir, "applications", dirName)
+	if err := os.MkdirAll(finalDir, 0755); err != nil {
+		return err
+	}
+
+	filePath := filepath.Join(finalDir, filename)
+	return os.WriteFile(filePath, data, 0644)
+}
+
+func (c *Config) GetGitUrl() (string, error) {
+	configPath := filepath.Join(c.ProjectDir, ".git", "config")
+	return git.GetRemoteOriginURL(configPath)
 }

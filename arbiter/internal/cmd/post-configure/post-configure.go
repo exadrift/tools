@@ -8,7 +8,6 @@ import (
 	"strings"
 
 	"github.com/dustin/go-humanize"
-	"github.com/exadrift/tools/arbiter/internal/argocd"
 	"github.com/exadrift/tools/arbiter/internal/config"
 	"github.com/exadrift/tools/arbiter/internal/talossdk"
 	"github.com/exadrift/tools/arbiter/internal/utils"
@@ -197,21 +196,6 @@ func postConfigCmd(name string) error {
 		kubePatchIndex++
 
 		addStorage = sl.Confirm(false, "add additional storage?")
-	}
-
-	setupArgo := sl.Confirm(true, "would you like to setup argocd?")
-	if setupArgo {
-		manifest, err := argocd.GetArgoCdFullManifest()
-		if err != nil {
-			return err
-		}
-
-		patchMeta := &config.PatchMetadata{
-			Namespace: "argocd",
-		}
-		if err = cfg.SavePatch(config.PatchTypeKubernetes, fmt.Sprintf("%04d-argocd", kubePatchIndex), manifest, patchMeta); err != nil {
-			return err
-		}
 	}
 
 	sl.Emit("✅ patches updated, run `arbiter apply` to apply changes")
