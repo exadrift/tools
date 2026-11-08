@@ -1,3 +1,6 @@
+# v0.0.5
+- install argo using helm sdk
+- prepare argo in application manifests
 # v0.0.4
 - updated readme
 # v0.0.3

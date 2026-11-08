@@ -5,12 +5,14 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/cosi-project/runtime/pkg/resource"
 	"github.com/exadrift/tools/arbiter/internal/config"
 	"github.com/siderolabs/talos/pkg/machinery/api/cluster"
 	"github.com/siderolabs/talos/pkg/machinery/api/machine"
 	"github.com/siderolabs/talos/pkg/machinery/api/storage"
 	"github.com/siderolabs/talos/pkg/machinery/client"
 	talosconfig "github.com/siderolabs/talos/pkg/machinery/config"
+	"github.com/siderolabs/talos/pkg/machinery/resources/network"
 )
 
 func NewMaintenanceClient(cfg *config.Config) (*TalosClient, error) {
@@ -51,6 +53,38 @@ func (t *TalosClient) Close() error {
 
 func (t *TalosClient) Disks(ctx context.Context) (*storage.DisksResponse, error) {
 	return t.client.Disks(ctx)
+}
+
+func (t *TalosClient) NetworkInterfaces(ctx context.Context) (*resource.List, error) {
+	kind := resource.NewMetadata(
+		network.NamespaceName,
+		network.LinkStatusType,
+		"",
+		resource.VersionUndefined,
+	)
+
+	links, err := t.client.COSI.List(ctx, kind)
+	if err != nil {
+		return nil, err
+	}
+
+	return &links, nil
+}
+
+func (t *TalosClient) NetworkAddresses(ctx context.Context) (*resource.List, error) {
+	kind := resource.NewMetadata(
+		network.NamespaceName,
+		network.AddressStatusType,
+		"",
+		resource.VersionUndefined,
+	)
+
+	links, err := t.client.COSI.List(ctx, kind)
+	if err != nil {
+		return nil, err
+	}
+
+	return &links, nil
 }
 
 func (t *TalosClient) GetVersion(ctx context.Context) (*talosconfig.VersionContract, error) {

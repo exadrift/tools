@@ -38,6 +38,8 @@ arbiter bootstrap
 ```
 you will be prompted for the install disk on the target machine, then the process will begin.  the machine may reboot while this is underway, so make sure your install media is not the first to boot by default, this could cause installation to hang indefinitely.
 
+this will automatically install argocd into the cluster, and create some additional manifest for an app-in-apps pattern in your git repository.
+
 ### test kubectl
 at the end of the bootstrap process, arbiter will configure kubectl.  you can now interrogate the new cluster via kubectl.  you may have to select the new context first, which will be named the same as your arbiter project.
 
@@ -46,7 +48,7 @@ at the end of the bootstrap process, arbiter will configure kubectl.  you can no
 arbiter post-configure
 ```
 
-this stage gives a guided process for adding additional resources such as disks as well as the option to prepare argocd for full gitops based deployment.
+this stage gives a guided process for adding additional resources such as disks.
 
 ### applying future changes
 ```

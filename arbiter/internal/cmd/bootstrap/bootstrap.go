@@ -5,21 +5,38 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
+	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/dustin/go-humanize"
+	"github.com/exadrift/go/statusline"
 	"github.com/exadrift/tools/arbiter/internal/config"
 	"github.com/exadrift/tools/arbiter/internal/kubeconfig"
 	"github.com/exadrift/tools/arbiter/internal/talossdk"
 	"github.com/exadrift/tools/arbiter/internal/utils"
 	"github.com/exadrift/tools/arbiter/templates"
+	"github.com/ghodss/yaml"
 	"github.com/siderolabs/talos/pkg/machinery/api/storage"
 	"github.com/spf13/cobra"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"helm.sh/helm/v3/pkg/action"
+	"helm.sh/helm/v3/pkg/chart/loader"
+	"helm.sh/helm/v3/pkg/cli"
+	"helm.sh/helm/v3/pkg/getter"
+	"helm.sh/helm/v3/pkg/repo"
+	"k8s.io/cli-runtime/pkg/genericclioptions"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/clientcmd"
+)
+
+const (
+	HelmRepoUrl = "https://argoproj.github.io/argo-helm"
 )
 
 func Command() *cobra.Command {
@@ -230,6 +247,187 @@ outer:
 	if err = kubeconfig.DoKubeConfig(context.Background(), authClient, cfg, sl); err != nil {
 		return err
 	}
+
+	gitUrl, err := cfg.GetGitUrl()
+	if err != nil {
+		return err
+	}
+
+	bootstrapBytes, err := templates.RenderBootstrapApplicationTemplate(templates.BootstrapApplicationConfig{
+		Name: strings.ToLower(cfg.Name) + "-applications",
+		Repo: gitUrl,
+	})
+	if err != nil {
+		return err
+	}
+
+	if err := os.WriteFile(filepath.Join(cfg.ProjectDir, "bootstrap.yaml"), bootstrapBytes, 0644); err != nil {
+		return err
+	}
+
+	sl.Status("installing argocd")
+	version, err := installArgoCd(ctx, sl, cfg)
+	if err != nil {
+		return fmt.Errorf("error installing argocd: %w", err)
+	}
+
+	argocdApplicationBytes, err := templates.RenderArgoCdApplicationTemplate(templates.ArgoCdApplicationConfig{
+		HelmRepo: HelmRepoUrl,
+		Repo:     gitUrl,
+		Version:  version,
+	})
+	if err != nil {
+		return err
+	}
+
+	if err = cfg.WriteApplicationTemplate("infra/argocd", "application.yaml", argocdApplicationBytes); err != nil {
+		return err
+	}
+
+	if err = cfg.WriteApplicationTemplate("infra/argocd", "values.yaml", nil); err != nil {
+		return err
+	}
+
 	sl.Emit("to configure additional resources such as disk, etc., please run \"arbiter post-configure\"")
 	return nil
+}
+
+func getLatestVersion(settings *cli.EnvSettings, repoUrl string) (string, error) {
+	indexUrl, err := url.JoinPath(repoUrl, "/index.yaml")
+	if err != nil {
+		return "", err
+	}
+
+	getters := getter.All(settings)
+
+	httpGetter, err := getters.ByScheme("https")
+	if err != nil {
+		return "", fmt.Errorf("failed to find getter for https: %w", err)
+	}
+
+	res, err := httpGetter.Get(indexUrl)
+	if err != nil {
+		return "", fmt.Errorf("failed to download index: %w", err)
+	}
+
+	indexFile := repo.NewIndexFile()
+	if err := yaml.Unmarshal(res.Bytes(), indexFile); err != nil {
+		return "", fmt.Errorf("failed to unmarshal index YAML: %w", err)
+	}
+	indexFile.SortEntries()
+
+	versions, exists := indexFile.Entries["argo-cd"]
+	if !exists || len(versions) == 0 {
+		return "", fmt.Errorf("argo-cd chart not found in repository index")
+	}
+
+	return versions[0].Version, nil
+}
+
+func installArgoCd(ctx context.Context, sl *statusline.StatusLine, cfg *config.Config) (string, error) {
+	machineConfig, err := cfg.LoadMachineConfig()
+	if err != nil {
+		return "", err
+	}
+
+	client, err := talossdk.NewAuthenticatedClient(machineConfig)
+	if err != nil {
+		return "", err
+	}
+
+	kubeClientConfigBytes, err := client.KubeConfig(ctx)
+	if err != nil {
+		return "", err
+	}
+
+	clientConfig, err := clientcmd.NewClientConfigFromBytes(kubeClientConfigBytes)
+	if err != nil {
+		return "", err
+	}
+
+	// Convert to Kubernetes REST config.
+	restConfig, err := clientConfig.ClientConfig()
+	if err != nil {
+		return "", err
+	}
+
+	// Configure Helm to use our in-memory REST config.
+	kubeConfig := genericclioptions.NewConfigFlags(false)
+	kubeConfig.WrapConfigFn = func(_ *rest.Config) *rest.Config {
+		return restConfig
+	}
+
+	// Initialize Helm's action configuration.
+	actionConfig := new(action.Configuration)
+
+	if err = actionConfig.Init(
+		kubeConfig,
+		"argocd",
+		os.Getenv("HELM_DRIVER"),
+		sl.Emit,
+	); err != nil {
+		return "", err
+	}
+
+	settings := cli.New()
+	version, err := getLatestVersion(settings, HelmRepoUrl)
+	if err != nil {
+		return "", fmt.Errorf("unable to retrieve latest manifest version: %w", err)
+	}
+	sl.Emit("installing version %s of argo cd", version)
+
+	// Create the Helm install action.
+	hClient := action.NewInstall(actionConfig)
+
+	hClient.ReleaseName = "argocd"
+	hClient.Namespace = "argocd"
+	hClient.CreateNamespace = true
+	hClient.Wait = true
+	hClient.Timeout = 5 * 60 * 1000000000 // 5 minutes
+
+	// Configure the chart repository.
+	hClient.RepoURL = HelmRepoUrl
+	hClient.Version = version
+
+	// Download the chart.
+	chartPath, err := hClient.LocateChart(
+		"argo-cd",
+		settings,
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Load the chart.
+	chart, err := loader.Load(chartPath)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	// Supply custom Helm values.
+	values := map[string]interface{}{
+		"configs": map[string]interface{}{
+			"params": map[string]interface{}{
+				"server.insecure": true,
+			},
+		},
+	}
+
+	// Install the chart.
+	release, err := hClient.RunWithContext(
+		context.Background(),
+		chart,
+		values,
+	)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	sl.Emit(
+		"✅ successfully installed release %s in namespace %s\n",
+		release.Name,
+		release.Namespace,
+	)
+
+	return version, nil
 }
