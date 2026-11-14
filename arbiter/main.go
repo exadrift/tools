@@ -7,6 +7,7 @@ import (
 
 	"github.com/exadrift/tools/arbiter/internal/cmd/apply"
 	"github.com/exadrift/tools/arbiter/internal/cmd/bootstrap"
+	"github.com/exadrift/tools/arbiter/internal/cmd/export"
 	"github.com/exadrift/tools/arbiter/internal/cmd/info"
 	"github.com/exadrift/tools/arbiter/internal/cmd/initc"
 	kubeconfigcmd "github.com/exadrift/tools/arbiter/internal/cmd/kubeconfig"
@@ -40,5 +41,6 @@ func main() {
 	rootCmd.AddCommand(remove.Command())
 	rootCmd.AddCommand(secrets.Command())
 	rootCmd.AddCommand(info.Command())
+	rootCmd.AddCommand(export.Command())
 	_ = rootCmd.Execute()
 }

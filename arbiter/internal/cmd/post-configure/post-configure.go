@@ -80,7 +80,7 @@ func postConfigCmd(name string) error {
 				return err
 			}
 			talosPatchIndex = 1
-			kubePatchIndex = 1
+			// kubePatchIndex = 1
 		}
 	}
 
@@ -181,19 +181,19 @@ func postConfigCmd(name string) error {
 		}
 		talosPatchIndex++
 
-		pvData, err := templates.RenderPersistentVolumeTemplate(templates.PersistentVolumeConfig{
-			Name:     volName,
-			Size:     minSize,
-			Hostname: cfg.Name,
-		})
-		if err != nil {
-			return fmt.Errorf("error rendering persistent volume template: %w", err)
-		}
+		// pvData, err := templates.RenderPersistentVolumeTemplate(templates.PersistentVolumeConfig{
+		// 	Name:     volName,
+		// 	Size:     minSize,
+		// 	Hostname: cfg.Name,
+		// })
+		// if err != nil {
+		// 	return fmt.Errorf("error rendering persistent volume template: %w", err)
+		// }
 
-		if err = cfg.SavePatch(config.PatchTypeKubernetes, fmt.Sprintf("%04d-persistent-volume-%s", kubePatchIndex, volName), pvData, nil); err != nil {
-			return err
-		}
-		kubePatchIndex++
+		// if err = cfg.SavePatch(config.PatchTypeKubernetes, fmt.Sprintf("%04d-persistent-volume-%s", kubePatchIndex, volName), pvData, nil); err != nil {
+		// 	return err
+		// }
+		// kubePatchIndex++
 
 		addStorage = sl.Confirm(false, "add additional storage?")
 	}

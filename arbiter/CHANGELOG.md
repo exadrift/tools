@@ -1,3 +1,5 @@
+# v0.0.6
+- added export so that we can use talosctl if need be
 # v0.0.5
 - install argo using helm sdk
 - prepare argo in application manifests

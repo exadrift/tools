@@ -6,6 +6,7 @@ require (
 	github.com/cosi-project/runtime v1.16.3
 	github.com/dustin/go-humanize v1.0.1
 	github.com/exadrift/go/statusline v0.0.11
+	github.com/ghodss/yaml v1.0.0
 	github.com/goccy/go-yaml v1.19.2
 	github.com/siderolabs/talos v1.14.4
 	github.com/siderolabs/talos/pkg/machinery v1.14.3
@@ -16,6 +17,7 @@ require (
 	helm.sh/helm/v3 v3.22.1
 	k8s.io/api v0.37.1
 	k8s.io/apimachinery v0.37.1
+	k8s.io/cli-runtime v0.37.1
 	k8s.io/client-go v0.37.1
 )
 
@@ -48,7 +50,6 @@ require (
 	github.com/fatih/color v1.19.0 // indirect
 	github.com/fxamacker/cbor/v2 v2.9.2 // indirect
 	github.com/gertd/go-pluralize v0.2.1 // indirect
-	github.com/ghodss/yaml v1.0.0 // indirect
 	github.com/go-errors/errors v1.5.1 // indirect
 	github.com/go-gorp/gorp/v3 v3.1.0 // indirect
 	github.com/go-logr/logr v1.4.4 // indirect
@@ -148,7 +149,6 @@ require (
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	k8s.io/apiextensions-apiserver v0.37.1 // indirect
 	k8s.io/apiserver v0.37.1 // indirect
-	k8s.io/cli-runtime v0.37.1 // indirect
 	k8s.io/component-base v0.37.1 // indirect
 	k8s.io/klog/v2 v2.140.0 // indirect
 	k8s.io/kube-openapi v0.0.0-20260721132016-d427ff9ee9ad // indirect
