@@ -13,10 +13,14 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// Command returns the 'init' command for initializing a Talos project
+// It sets up the project structure, configuration, and key material needed for
+// managing a Talos cluster with arbiter
 func Command() *cobra.Command {
 	base := &cobra.Command{
 		Use:   "init",
 		Short: "initialize talos project",
+		Long:  "Initialize a new Talos project with required configuration and key material for cluster management",
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cmd.SilenceUsage = true
 			return initCmd()

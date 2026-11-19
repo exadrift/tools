@@ -35,15 +35,19 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 )
 
+// HelmRepoUrl is the URL for the ArgoCD Helm repository
 const (
 	HelmRepoUrl = "https://argoproj.github.io/argo-helm"
 )
 
+// Command returns the 'bootstrap' command for bootstrapping a Talos cluster
+// It handles the complete process of installing Talos, configuring the cluster,
+// and setting up ArgoCD for GitOps management
 func Command() *cobra.Command {
 	base := &cobra.Command{
 		Use:   "bootstrap [project-name]",
 		Short: "bootstrap talos on target system",
-		Long:  "boostrap talos either from the current project directory, or by passing the project name as the first command argument",
+		Long:  "bootstrap talos either from the current project directory, or by passing the project name as the first command argument",
 		Args:  cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cwd, cerr := os.Getwd()

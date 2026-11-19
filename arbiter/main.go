@@ -19,8 +19,12 @@ import (
 	"github.com/spf13/cobra"
 )
 
+// Version holds the version of the arbiter tool
+// This is set during build time using ldflags
 var Version string
 
+// main is the entry point for the arbiter command-line tool
+// It sets up the command structure and executes the appropriate command based on user input
 func main() {
 	if slices.Contains(os.Args, "--version") {
 		fmt.Println(Version)
@@ -28,7 +32,9 @@ func main() {
 	}
 
 	rootCmd := &cobra.Command{
-		Use: "arbiter",
+		Use:   "arbiter",
+		Short: "A guided, GitOps-oriented tool for Talos cluster management",
+		Long:  "Arbiter is a tool designed to manage single-node Talos clusters with GitOps workflows, focusing on reproducibility, ease of management, and secure secret handling.",
 	}
 
 	rootCmd.AddCommand(initc.Command())

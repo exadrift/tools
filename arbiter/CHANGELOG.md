@@ -1,3 +1,5 @@
+# v0.0.7
+- updated documentation
 # v0.0.6
 - added export so that we can use talosctl if need be
 # v0.0.5

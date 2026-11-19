@@ -18,16 +18,20 @@ var (
 	projectArg string
 )
 
+// Command returns the 'secrets' command for managing secrets
+// This command provides functionality for setting, removing, listing, and applying
+// secrets within the arbiter system and Kubernetes deployments
 func Command() *cobra.Command {
 	base := &cobra.Command{
 		Use:   "secrets",
 		Short: "manage secrets",
-		Long:  "manage secrets",
+		Long:  "manage secrets for Talos cluster configuration and Kubernetes deployments",
 	}
 
 	var setCmd = &cobra.Command{
 		Use:   "set <key>",
 		Short: "Set/replace a secret",
+		Long:  "Set or replace a secret in the arbiter secret store with the given key",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cwd, cerr := os.Getwd()
@@ -54,11 +58,12 @@ func Command() *cobra.Command {
 			return setSecret(cfg, args[0], pathArg)
 		}}
 
-	setCmd.PersistentFlags().StringVar(&pathArg, "path", "", "optional path to secret")
+	setCmd.PersistentFlags().StringVar(&pathArg, "path", "", "optional path to secret file")
 
 	var removeCmd = &cobra.Command{
 		Use:   "remove <key>",
 		Short: "Remove a secret",
+		Long:  "Remove a secret from the arbiter secret store with the given key",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cwd, cerr := os.Getwd()
@@ -88,6 +93,7 @@ func Command() *cobra.Command {
 	var listCmd = &cobra.Command{
 		Use:   "list",
 		Short: "lists secrets",
+		Long:  "List all secrets in the arbiter secret store with their creation timestamps",
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cwd, cerr := os.Getwd()
 			if cerr != nil {
@@ -116,6 +122,7 @@ func Command() *cobra.Command {
 	var applyCmd = &cobra.Command{
 		Use:   "apply <name>",
 		Short: "Apply a secret within the kubernetes deploy manifest",
+		Long:  "Create a Kubernetes secret that references arbiter secrets for deployment in Kubernetes",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			cwd, cerr := os.Getwd()
@@ -161,6 +168,8 @@ func Command() *cobra.Command {
 	return base
 }
 
+// setSecret sets or replaces a secret in the configuration
+// It reads secret data from a file path or stdin and stores it in the arbiter secret store
 func setSecret(cfg *config.Config, key string, path string) error {
 	var (
 		secretBytes []byte
@@ -196,6 +205,8 @@ func setSecret(cfg *config.Config, key string, path string) error {
 	return nil
 }
 
+// removeSecret removes a secret from the configuration
+// It deletes the secret from the arbiter secret store if it exists
 func removeSecret(cfg *config.Config, key string) error {
 	if !cfg.Secrets().Exists(key) {
 		return nil
@@ -211,6 +222,8 @@ func removeSecret(cfg *config.Config, key string) error {
 	return nil
 }
 
+// listSecrets lists all secrets in the configuration with their creation times
+// It outputs a tabular format showing the key names and ages of secrets
 func listSecrets(cfg *config.Config) error {
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
 	if _, err := fmt.Fprintln(w, "KEY\tAGE"); err != nil {
@@ -229,6 +242,8 @@ func listSecrets(cfg *config.Config) error {
 	return w.Flush()
 }
 
+// applySecret creates a Kubernetes secret that references arbiter secrets
+// It guides the user through mapping arbiter secret keys to Kubernetes secret keys
 func applySecret(cfg *config.Config, name string, namespace string) error {
 	sl := statusline.NewStatusLine()
 	defer sl.Stop()
