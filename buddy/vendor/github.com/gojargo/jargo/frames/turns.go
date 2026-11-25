@@ -1,0 +1,385 @@
+package frames
+
+import (
+	"fmt"
+	"time"
+
+	"github.com/gojargo/jargo/audio/turn"
+	"github.com/gojargo/jargo/audio/vad"
+)
+
+// VADUserStartedSpeakingFrame reports that a voice-activity detector heard the
+// user start speaking. It is the raw VAD signal the turn subsystem consumes to
+// decide a user turn; it is distinct from UserStartedSpeakingFrame, which is the
+// turn decision. It is a system frame.
+type VADUserStartedSpeakingFrame struct {
+	BaseSystemFrame
+	// StartSecs is the VAD's confirmation delay (how long speech persisted
+	// before onset was confirmed), in seconds.
+	StartSecs float64
+	// Timestamp is the wall-clock time at which the VAD made its determination.
+	// Subtracting StartSecs from it gives the moment the speech itself began,
+	// which is what a measurement of the whole utterance is anchored to.
+	Timestamp time.Time
+}
+
+// NewVADUserStartedSpeakingFrame builds a VADUserStartedSpeakingFrame.
+func NewVADUserStartedSpeakingFrame(
+	startSecs float64, timestamp time.Time,
+) *VADUserStartedSpeakingFrame {
+	return &VADUserStartedSpeakingFrame{
+		BaseSystemFrame: NewBaseSystemFrame("VADUserStartedSpeakingFrame"),
+		StartSecs:       startSecs,
+		Timestamp:       timestamp,
+	}
+}
+
+// SpeechStart is the moment the speech this frame reports actually began, which
+// is earlier than the determination by the confirmation delay.
+func (f *VADUserStartedSpeakingFrame) SpeechStart() time.Time {
+	return f.Timestamp.Add(-time.Duration(f.StartSecs * float64(time.Second)))
+}
+
+// String implements fmt.Stringer.
+func (f *VADUserStartedSpeakingFrame) String() string {
+	return fmt.Sprintf("%s(start_secs: %.3f)", f.Name(), f.StartSecs)
+}
+
+// VADUserStoppedSpeakingFrame reports that the VAD heard the user stop speaking.
+// It is a system frame.
+type VADUserStoppedSpeakingFrame struct {
+	BaseSystemFrame
+	// StopSecs is the silence duration the VAD required before confirming the
+	// stop, in seconds.
+	StopSecs float64
+	// Timestamp is the wall-clock time at which the VAD made its determination.
+	// Subtracting StopSecs from it gives the moment the speech itself ended,
+	// which is what a deadline measured from the end of speech is anchored to.
+	// The zero value means unset.
+	Timestamp time.Time
+}
+
+// NewVADUserStoppedSpeakingFrame builds a VADUserStoppedSpeakingFrame.
+func NewVADUserStoppedSpeakingFrame(stopSecs float64, timestamp time.Time) *VADUserStoppedSpeakingFrame {
+	return &VADUserStoppedSpeakingFrame{
+		BaseSystemFrame: NewBaseSystemFrame("VADUserStoppedSpeakingFrame"),
+		StopSecs:        stopSecs,
+		Timestamp:       timestamp,
+	}
+}
+
+// String implements fmt.Stringer.
+func (f *VADUserStoppedSpeakingFrame) String() string {
+	return fmt.Sprintf("%s(stop_secs: %.3f)", f.Name(), f.StopSecs)
+}
+
+// UserSpeakingFrame is emitted periodically while the user is speaking, a
+// keepalive that lets strategies and idle logic know audio is still arriving. It
+// is a system frame.
+type UserSpeakingFrame struct {
+	BaseSystemFrame
+}
+
+// NewUserSpeakingFrame builds a UserSpeakingFrame.
+func NewUserSpeakingFrame() *UserSpeakingFrame {
+	return &UserSpeakingFrame{BaseSystemFrame: NewBaseSystemFrame("UserSpeakingFrame")}
+}
+
+// BotSpeakingFrame is emitted periodically while the bot is speaking. It is a
+// system frame.
+type BotSpeakingFrame struct {
+	BaseSystemFrame
+}
+
+// NewBotSpeakingFrame builds a BotSpeakingFrame.
+func NewBotSpeakingFrame() *BotSpeakingFrame {
+	return &BotSpeakingFrame{BaseSystemFrame: NewBaseSystemFrame("BotSpeakingFrame")}
+}
+
+// UserMuteStartedFrame reports that user input is now being suppressed (a mute
+// strategy engaged). It is a system frame.
+type UserMuteStartedFrame struct {
+	BaseSystemFrame
+}
+
+// NewUserMuteStartedFrame builds a UserMuteStartedFrame.
+func NewUserMuteStartedFrame() *UserMuteStartedFrame {
+	return &UserMuteStartedFrame{BaseSystemFrame: NewBaseSystemFrame("UserMuteStartedFrame")}
+}
+
+// UserMuteStoppedFrame reports that user input is no longer suppressed. It is a
+// system frame.
+type UserMuteStoppedFrame struct {
+	BaseSystemFrame
+}
+
+// NewUserMuteStoppedFrame builds a UserMuteStoppedFrame.
+func NewUserMuteStoppedFrame() *UserMuteStoppedFrame {
+	return &UserMuteStoppedFrame{BaseSystemFrame: NewBaseSystemFrame("UserMuteStoppedFrame")}
+}
+
+// UserIdleTimeoutUpdateFrame updates the user-idle timeout at runtime. A value
+// <= 0 disables idle detection. It is a system frame.
+type UserIdleTimeoutUpdateFrame struct {
+	BaseSystemFrame
+	// Timeout is the new idle timeout.
+	Timeout time.Duration
+}
+
+// NewUserIdleTimeoutUpdateFrame builds a UserIdleTimeoutUpdateFrame.
+func NewUserIdleTimeoutUpdateFrame(timeout time.Duration) *UserIdleTimeoutUpdateFrame {
+	return &UserIdleTimeoutUpdateFrame{
+		BaseSystemFrame: NewBaseSystemFrame("UserIdleTimeoutUpdateFrame"),
+		Timeout:         timeout,
+	}
+}
+
+// String implements fmt.Stringer.
+func (f *UserIdleTimeoutUpdateFrame) String() string {
+	return fmt.Sprintf("%s(timeout: %s)", f.Name(), f.Timeout)
+}
+
+// UserTurnInferenceCompletedFrame signals that an external judge (an LLM
+// completion gate, an EOT classifier) decided the user's turn is semantically
+// complete. A turn-stop strategy waits for it to finalize the turn. It is a
+// system frame.
+type UserTurnInferenceCompletedFrame struct {
+	BaseSystemFrame
+}
+
+// NewUserTurnInferenceCompletedFrame builds a UserTurnInferenceCompletedFrame.
+func NewUserTurnInferenceCompletedFrame() *UserTurnInferenceCompletedFrame {
+	return &UserTurnInferenceCompletedFrame{
+		BaseSystemFrame: NewBaseSystemFrame("UserTurnInferenceCompletedFrame"),
+	}
+}
+
+// UserTurnCompletionFrame is the LLM's judgment of whether the user's turn is
+// complete.
+//
+// An LLM service that uses turn-completion markers pushes it upstream, once per
+// inference and as soon as the judgment is known: when the response's marker is
+// read, when the response calls a tool before writing a marker (Kind
+// "complete"), or when the response ends without one (Kind ""). The marker
+// itself reaches the conversation as an LLMMarkerFrame. It is a system frame.
+type UserTurnCompletionFrame struct {
+	BaseSystemFrame
+	// Kind is "complete", "short" (the user will continue shortly) or "long"
+	// (the user needs more time), or "" when the response carried no marker.
+	Kind string
+	// Marker is the marker read, or "" for a tool call or no marker.
+	Marker string
+	// ContextFrameID is the ID of the LLMContextFrame that started the
+	// inference, or 0 when it is not known.
+	ContextFrameID uint64
+}
+
+// NewUserTurnCompletionFrame builds a UserTurnCompletionFrame.
+func NewUserTurnCompletionFrame(kind, marker string, contextFrameID uint64) *UserTurnCompletionFrame {
+	return &UserTurnCompletionFrame{
+		BaseSystemFrame: NewBaseSystemFrame("UserTurnCompletionFrame"),
+		Kind:            kind,
+		Marker:          marker,
+		ContextFrameID:  contextFrameID,
+	}
+}
+
+// String implements fmt.Stringer.
+func (f *UserTurnCompletionFrame) String() string {
+	return fmt.Sprintf("%s(kind: %q, marker: %q, context_frame_id: %d)",
+		f.Name(), f.Kind, f.Marker, f.ContextFrameID)
+}
+
+// SpeechControlParamsFrame reports the parameters governing speech detection and
+// end-of-turn analysis, so a processor downstream can size its own behavior to
+// them (speech recognition matching its endpointing to the detector's, say) and
+// clients and observers can mirror them. Either set is nil when only the other
+// is being reported. It is a system frame.
+type SpeechControlParamsFrame struct {
+	BaseSystemFrame
+	// VADParams are the voice-activity parameters in force, or nil.
+	VADParams *vad.Params
+	// TurnParams are the end-of-turn parameters in force, or nil.
+	TurnParams *turn.Params
+}
+
+// NewSpeechControlParamsFrame builds a SpeechControlParamsFrame. Either set may
+// be nil.
+func NewSpeechControlParamsFrame(vadParams *vad.Params, turnParams *turn.Params) *SpeechControlParamsFrame {
+	return &SpeechControlParamsFrame{
+		BaseSystemFrame: NewBaseSystemFrame("SpeechControlParamsFrame"),
+		VADParams:       vadParams,
+		TurnParams:      turnParams,
+	}
+}
+
+// VADParamsUpdateFrame asks the voice-activity detector to adopt new parameters.
+// It is pushed upstream (by the RTVI processor acting on a client request, say)
+// and takes effect from the next chunk analyzed. It is a control frame.
+type VADParamsUpdateFrame struct {
+	BaseControlFrame
+	// Params are the detection parameters to adopt.
+	Params vad.Params
+}
+
+// NewVADParamsUpdateFrame builds a VADParamsUpdateFrame.
+func NewVADParamsUpdateFrame(params vad.Params) *VADParamsUpdateFrame {
+	return &VADParamsUpdateFrame{
+		BaseControlFrame: NewBaseControlFrame("VADParamsUpdateFrame"),
+		Params:           params,
+	}
+}
+
+// UserTurnResponseCancelFrame cancels the speculative response for the current
+// user turn.
+//
+// It is emitted when an eager end of turn is withdrawn: the user resumed
+// speaking, or the committed transcript does not match the predicted one. The
+// LLM service stops generating, and the speculative reply it was holding is
+// discarded: everything that reply produced was held, so nothing further down
+// the pipeline has anything to undo. A reply already released is left alone;
+// stopping that one is what an InterruptionFrame does.
+//
+// It is a system frame, so it overtakes the speculative output it cancels.
+type UserTurnResponseCancelFrame struct {
+	BaseSystemFrame
+}
+
+// NewUserTurnResponseCancelFrame builds a UserTurnResponseCancelFrame.
+func NewUserTurnResponseCancelFrame() *UserTurnResponseCancelFrame {
+	return &UserTurnResponseCancelFrame{
+		BaseSystemFrame: NewBaseSystemFrame("UserTurnResponseCancelFrame"),
+	}
+}
+
+// EagerEndOfTurnCancelFrame is the former name of UserTurnResponseCancelFrame.
+//
+// Deprecated: use UserTurnResponseCancelFrame. It is the same type, so a frame
+// built under the old name still cancels.
+type EagerEndOfTurnCancelFrame = UserTurnResponseCancelFrame
+
+// NewEagerEndOfTurnCancelFrame is the former name of
+// NewUserTurnResponseCancelFrame.
+//
+// Deprecated: use NewUserTurnResponseCancelFrame.
+func NewEagerEndOfTurnCancelFrame() *UserTurnResponseCancelFrame {
+	return NewUserTurnResponseCancelFrame()
+}
+
+// LLMMarkerFrame carries a turn-completion marker the LLM emitted (for example
+// "●"). It is informational, since the TTS downstream ignores it, and lets
+// observers see the model's completeness verdict. It is a data frame.
+type LLMMarkerFrame struct {
+	BaseDataFrame
+	// Marker is the marker text.
+	Marker string
+	// AppendToContextImmediately asks for the marker to be written to the
+	// conversation as an assistant message of its own, as soon as it arrives.
+	// Clear it to have the marker held and flushed together with the text that
+	// follows, as one message, which is what makes a gated reply read as the
+	// marker followed by the response rather than as two entries.
+	AppendToContextImmediately bool
+}
+
+// NewLLMMarkerFrame builds an LLMMarkerFrame that is written to the
+// conversation on its own.
+func NewLLMMarkerFrame(marker string) *LLMMarkerFrame {
+	return &LLMMarkerFrame{
+		BaseDataFrame:              NewBaseDataFrame("LLMMarkerFrame"),
+		Marker:                     marker,
+		AppendToContextImmediately: true,
+	}
+}
+
+// LLMMarkerResponseFrame is what a marker-reading LLM service made of one whole
+// response: the marker it found, what that meant, and the text the model
+// produced before anything was held back.
+//
+// It is pushed when the response ends, behind the LLMMarkerFrame and the spoken
+// text. It is a diagnostic, for a consumer checking how well the model follows
+// the marker protocol, and plays no part in the conversation. It is a data frame.
+type LLMMarkerResponseFrame struct {
+	BaseDataFrame
+	// Raw is the response as the model produced it, markers included.
+	Raw string
+	// Marker is the marker found, or empty when the response carried none.
+	Marker string
+	// Kind is what the marker meant, in the emitter's own vocabulary, for a
+	// consumer that should not depend on the marker text, which is configurable.
+	// The turn-completion protocol uses "complete", "short" and "long".
+	Kind string
+	// Markers are every marker the emitter recognizes, so a consumer can find
+	// them in Raw without knowing how the emitter was configured.
+	Markers []string
+}
+
+// NewLLMMarkerResponseFrame builds an LLMMarkerResponseFrame.
+func NewLLMMarkerResponseFrame(raw, marker, kind string, markers []string) *LLMMarkerResponseFrame {
+	return &LLMMarkerResponseFrame{
+		BaseDataFrame: NewBaseDataFrame("LLMMarkerResponseFrame"),
+		Raw:           raw,
+		Marker:        marker,
+		Kind:          kind,
+		Markers:       markers,
+	}
+}
+
+// LLMConfigureOutputFrame configures how an LLM service produces output. It
+// tells the service to stamp the tokens it emits so a TTS service downstream
+// passes them through instead of speaking them: the reply is added to the
+// conversation but never said out loud. It is a data frame.
+type LLMConfigureOutputFrame struct {
+	BaseDataFrame
+	// SkipTTS reports whether the tokens the LLM emits should skip the TTS
+	// service, if the pipeline has one.
+	SkipTTS bool
+}
+
+// NewLLMConfigureOutputFrame builds an LLMConfigureOutputFrame.
+func NewLLMConfigureOutputFrame(skipTTS bool) *LLMConfigureOutputFrame {
+	return &LLMConfigureOutputFrame{
+		BaseDataFrame: NewBaseDataFrame("LLMConfigureOutputFrame"),
+		SkipTTS:       skipTTS,
+	}
+}
+
+// LLMMessagesAppendFrame asks the context aggregator to append messages to the
+// LLM context, in contrast to LLMMessagesUpdateFrame which replaces them. The
+// turn-completion re-prompt and a conversation flow entering a node both use it.
+// It is a data frame, so the messages are ordered against the surrounding
+// conversation.
+type LLMMessagesAppendFrame struct {
+	BaseDataFrame
+	// Messages are the messages to append.
+	Messages []Message
+	// RunLLM reports whether the LLM should run on the updated context.
+	RunLLM bool
+}
+
+// NewLLMMessagesAppendFrame builds an LLMMessagesAppendFrame.
+func NewLLMMessagesAppendFrame(messages []Message) *LLMMessagesAppendFrame {
+	return &LLMMessagesAppendFrame{
+		BaseDataFrame: NewBaseDataFrame("LLMMessagesAppendFrame"),
+		Messages:      messages,
+	}
+}
+
+// Compile-time interface checks.
+var (
+	_ SystemFrame  = (*VADUserStartedSpeakingFrame)(nil)
+	_ SystemFrame  = (*VADUserStoppedSpeakingFrame)(nil)
+	_ SystemFrame  = (*UserSpeakingFrame)(nil)
+	_ SystemFrame  = (*BotSpeakingFrame)(nil)
+	_ SystemFrame  = (*UserMuteStartedFrame)(nil)
+	_ SystemFrame  = (*UserMuteStoppedFrame)(nil)
+	_ SystemFrame  = (*UserIdleTimeoutUpdateFrame)(nil)
+	_ SystemFrame  = (*SpeechControlParamsFrame)(nil)
+	_ SystemFrame  = (*UserTurnResponseCancelFrame)(nil)
+	_ SystemFrame  = (*UserTurnCompletionFrame)(nil)
+	_ ControlFrame = (*VADParamsUpdateFrame)(nil)
+	_ SystemFrame  = (*UserTurnInferenceCompletedFrame)(nil)
+	_ DataFrame    = (*LLMMarkerFrame)(nil)
+	_ DataFrame    = (*LLMMarkerResponseFrame)(nil)
+	_ DataFrame    = (*LLMConfigureOutputFrame)(nil)
+	_ DataFrame    = (*LLMMessagesAppendFrame)(nil)
+)

@@ -1,0 +1,2017 @@
+// Package llm is the shared base for streaming LLM services. A concrete service
+// embeds *Base and implements Generator; the base handles the LLMContextFrame
+// lifecycle and brackets the streamed response as an LLMFullResponseStartFrame,
+// a stream of LLMTextFrames, and an LLMFullResponseEndFrame.
+//
+// This keeps every provider down to the part that differs — turning a
+// conversation into a stream of text deltas — while the frame contract lives in
+// one place.
+//
+// A service that also supports tool calling implements ToolGenerator. When the
+// context carries tools, the base streams text, dispatches each requested call to
+// a registered handler, and emits the function-call frames; the assistant
+// aggregator commits the results and re-triggers generation for the model's reply.
+package llm
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"os"
+	"runtime/debug"
+	"slices"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/gojargo/jargo/frames"
+	"github.com/gojargo/jargo/processor"
+	"github.com/gojargo/jargo/service"
+	"github.com/gojargo/jargo/service/settings"
+	"github.com/gojargo/jargo/telemetry/metrics"
+	"github.com/gojargo/jargo/telemetry/tracing"
+	errs "github.com/gojargo/jargo/utils/errors"
+	"github.com/google/uuid"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
+)
+
+// missingFunctionMessage is the tool result returned when the model calls a
+// function no handler is registered for. It is a terminal result rather than an
+// error, so the call completes normally and the model is told the function is
+// unavailable instead of being left waiting.
+const missingFunctionMessage = "The function `%s` is not currently available."
+
+// Emit pushes a chunk of generated text downstream as an LLMTextFrame. A
+// Generator calls it once per delta received from the provider; empty deltas are
+// ignored.
+type Emit func(text string) error
+
+// Generator produces a streaming completion for a conversation. The
+// implementation streams text deltas to emit until the response completes or ctx
+// is canceled (an interruption). A returned error is reported upstream.
+type Generator interface {
+	Generate(ctx context.Context, convo *frames.LLMContext, emit Emit) error
+}
+
+// Sink receives the streamed output of a tool-capable generation: text deltas
+// via Text and each requested tool call via Tool.
+type Sink interface {
+	Text(text string) error
+	Tool(call frames.ToolCall) error
+}
+
+// InferenceOptions tunes a one-shot inference. The zero value runs it the way
+// the service was built.
+type InferenceOptions struct {
+	// MaxTokens caps this completion, overriding the service's own bound. Zero
+	// leaves the service's in place.
+	MaxTokens int
+	// SystemInstruction is prepended as a system message for this completion
+	// only, ahead of whatever the conversation carries. Empty leaves the
+	// conversation's own instruction to stand alone.
+	SystemInstruction string
+	// ResponseSchema is a JSON schema the reply must follow. A service that can
+	// have its provider enforce it returns JSON text matching the schema. When
+	// the service or its current model cannot enforce one (see
+	// ResponseSchemaSupporter), the schema is left off with a warning. The
+	// schema must satisfy the strictest provider in use: every object lists all
+	// its properties as required and sets additionalProperties to false. Empty
+	// asks for no schema.
+	ResponseSchema json.RawMessage
+}
+
+// ResponseSchemaSupporter is implemented by a service whose provider can hold
+// an inference's reply to a JSON schema. A service that does not implement it
+// cannot, and a schema it is given is left off with a warning.
+type ResponseSchemaSupporter interface {
+	// SupportsResponseSchema reports whether the provider can enforce a schema
+	// at all. An endpoint speaking another provider's API may not.
+	SupportsResponseSchema() bool
+	// ModelSupportsResponseSchema reports whether model can enforce one, on a
+	// provider that can.
+	ModelSupportsResponseSchema(model string) bool
+}
+
+// Inferencer is implemented by a service that can answer a conversation once,
+// off to the side of the pipeline: no frames, no context of its own, just the
+// text. It is what a summarizer, a judge or a classifier runs on, none of which
+// wants the answer spoken.
+type Inferencer interface {
+	RunInference(ctx context.Context, convo *frames.LLMContext, opts InferenceOptions) (string, error)
+}
+
+// ErrCompletionTimeout marks a generation that gave up waiting for the
+// provider. A service wraps its own timeout in it, which is what tells the base
+// to report the failure as a timeout and notify anything watching for one.
+var ErrCompletionTimeout = errors.New("llm completion timeout")
+
+// AsCompletionTimeout marks err as a completion timeout when that is what it
+// is, and returns it untouched otherwise. A service passes what its provider
+// reported through this, so a provider that stopped answering is told apart
+// from one that failed for a reason of its own.
+//
+// ctx is the context the generation ran under. Its still being live is what
+// says the provider ran out of time rather than the turn being cut short, which
+// is not a timeout: an interruption is the pipeline's own doing.
+func AsCompletionTimeout(ctx context.Context, err error) error {
+	if err == nil || errors.Is(err, ErrCompletionTimeout) {
+		return err
+	}
+	if ctx.Err() == nil && os.IsTimeout(err) {
+		return fmt.Errorf("%w: %w", ErrCompletionTimeout, err)
+	}
+	return err
+}
+
+// ToolGenerator is implemented by services that support tool calling. It streams
+// text to sink.Text and reports each tool call the model requests to sink.Tool.
+// It returns when the model's turn completes — either a final text answer or a
+// request to call tools — or when ctx is canceled.
+type ToolGenerator interface {
+	GenerateWithTools(ctx context.Context, convo *frames.LLMContext, sink Sink) error
+}
+
+// FunctionCallResultCallback delivers a tool call's result to the conversation.
+// props tunes how the result is applied and may be nil for the defaults: a final
+// result, on which the aggregator decides whether to re-generate.
+//
+// It is how a handler reports, rather than returning a value, because a call can
+// have more than one thing to say. A handler registered to survive interruptions
+// calls it repeatedly with props.IsFinal false to stream progress, and once more
+// without to finish. An intermediate update does not settle the call, so it
+// leaves any bound on how long the call may take running: the handler still has
+// to finish inside the budget it was given.
+type FunctionCallResultCallback func(
+	ctx context.Context, result string, props *frames.FunctionCallResultProperties,
+) error
+
+// FunctionCallParams is everything a tool handler is given for one call.
+type FunctionCallParams struct {
+	// FunctionName is the name of the tool being called.
+	FunctionName string
+	// ToolCallID identifies this invocation.
+	ToolCallID string
+	// Arguments is the raw JSON the model produced for the call.
+	Arguments json.RawMessage
+	// LLM is the service running the call.
+	LLM *Base
+	// Context is the conversation the call was made in.
+	Context *frames.LLMContext
+	// PipelineWorker is the worker running the pipeline the call was made in,
+	// or nil when the service is not running in one.
+	PipelineWorker processor.Running
+	// AppResources is what the application shares across the session, as the
+	// worker's configuration gave it: the same value, passed by reference.
+	AppResources any
+	// Result delivers what the call produced. A handler that returns without
+	// calling it reports nothing, and the call is left showing as in progress
+	// until it is canceled.
+	Result FunctionCallResultCallback
+}
+
+// FunctionCallHandler runs one tool call, reporting what it produced through
+// params.Result. A returned error is reported as a non-fatal pipeline error and
+// no result reaches the conversation, so a handler that wants the model to see a
+// failure should report the failure as its result instead of returning it.
+//
+// A handler that does blocking work must honor ctx: it is canceled when the call
+// is, which for an ordinary tool means the moment the user interrupts.
+type FunctionCallHandler func(ctx context.Context, params FunctionCallParams) error
+
+// catchAllFunction is the registry key of the handler that takes every call no
+// named handler claims. Registering under it is how one handler serves a whole
+// toolset, a proxy to another system for instance.
+const catchAllFunction = ""
+
+// registryItem is a registered handler and the call options it was registered
+// with.
+type registryItem struct {
+	name                 string
+	handler              FunctionCallHandler
+	cancelOnInterruption bool
+	// timeout bounds one call to this function, overriding the service's own.
+	// Zero means the service's.
+	timeout time.Duration
+	// cancellableByLLM says whether the model may cancel this tool's calls while
+	// they run, which is what advertises a cancel tool named for it.
+	cancellableByLLM bool
+	// fromToolset marks a handler registered because an advertised tool carried
+	// it, so it is dropped again when the toolset stops advertising the tool. A
+	// handler registered by hand is never dropped.
+	fromToolset bool
+	// cleanup is the resource this tool works through, released at teardown. See
+	// ToolCleanup.
+	cleanup ToolCleanup
+	// missing marks the entry built for a call nothing claims, which answers it
+	// with the missing-function handler.
+	missing bool
+}
+
+// WithToolCleanup names the resource this tool works through, so the service
+// releases it when the pipeline tears down. Tools sharing one resource name the
+// same value and it is released once. See ToolCleanup.
+func WithToolCleanup(c ToolCleanup) RegisterOption {
+	return func(i *registryItem) { i.cleanup = c }
+}
+
+// RegisterOption configures how a registered function's calls are run.
+type RegisterOption func(*registryItem)
+
+// WithCancelOnInterruption sets whether a call to this function is canceled when
+// the user interrupts. It is true by default.
+//
+// Registering with false makes the tool asynchronous: the model carries on with
+// the conversation rather than waiting, the call outlives the turn that made it,
+// and everything the handler reports arrives as async-tool messages the model
+// reads on a later turn.
+func WithCancelOnInterruption(cancel bool) RegisterOption {
+	return func(i *registryItem) { i.cancelOnInterruption = cancel }
+}
+
+// WithTimeout bounds how long one call to this function may take before it is
+// given up on, overriding whatever the service was built with. Zero restores the
+// service's own bound.
+//
+// It covers the handler's run as a whole, so reporting an intermediate result
+// neither clears the bound nor restarts it.
+func WithTimeout(d time.Duration) RegisterOption {
+	return func(i *registryItem) { i.timeout = d }
+}
+
+// Option configures an LLM Base at construction.
+type Option func(*Base)
+
+// WithFunctionCallTimeout bounds how long any tool call may take before it is
+// given up on. A call that overruns reports no result of its own, which records
+// it as completed and leaves generation to whatever comes next rather than
+// answering on the tool's behalf.
+//
+// Zero, the default, means no bound: a call runs until it reports, is canceled,
+// or the session ends. WithTimeout overrides it for one function.
+//
+// It covers the handler's run as a whole, so reporting an intermediate result
+// neither clears the bound nor restarts it.
+func WithFunctionCallTimeout(d time.Duration) Option {
+	return func(b *Base) { b.callTimeout = d }
+}
+
+// WithSequentialFunctionCalls runs the calls of one response one after another
+// rather than at the same time. Use it when the tools share something that does
+// not take concurrent use, or when a later call is only meaningful once an
+// earlier one has taken effect.
+func WithSequentialFunctionCalls() Option {
+	return func(b *Base) { b.runInParallel = false }
+}
+
+// WithUngroupedFunctionCalls makes each tool result re-run generation on its own
+// instead of the batch answering once its last call reports. The model then
+// answers as many times as it made calls, which is rarely what a spoken
+// conversation wants, so grouping is the default.
+func WithUngroupedFunctionCalls() Option {
+	return func(b *Base) { b.groupCalls = false }
+}
+
+// WithContinuousGeneration says the service generates continuously and drives
+// its own responses, rather than answering one conversation at a time when a
+// context frame arrives. A speech-to-speech service sets it: the model is
+// already generating from the audio it is being sent, so a conversation
+// reaching the service is not a prompt to run but news that the conversation
+// changed, which such a service acts on itself.
+//
+// The base still does for it everything it does for any model service: the tool
+// registry, the calls in flight, and the interruption that cancels them. Only
+// the generating is left to the service.
+func WithContinuousGeneration() Option {
+	return func(b *Base) { b.continuousGeneration = true }
+}
+
+// FunctionCallsHandler is notified about the tool calls of one response.
+type FunctionCallsHandler func(ctx context.Context, calls []frames.ToolCall)
+
+// CompletionTimeoutHandler is notified when a generation timed out waiting for
+// the provider.
+type CompletionTimeoutHandler func(ctx context.Context)
+
+// FunctionCallFilter narrows the calls one response requested to the ones that
+// should actually run. It is given the conversation the calls were made in and
+// returns the calls to keep, in the order they should run.
+//
+// It exists for a provider that reports the calls it finds across the whole
+// message history rather than only the ones it just streamed. Such a provider
+// asks for a call it already made again on the completion that answers the
+// first one's result, and running it twice would repeat whatever the tool did.
+// A dropped call raises no event, no frame and no handler: for everything
+// downstream, the response did not request it.
+type FunctionCallFilter func(convo *frames.LLMContext, calls []frames.ToolCall) []frames.ToolCall
+
+// WithFunctionCallFilter decides, per response, which of the calls the model
+// requested are run. The default runs all of them.
+func WithFunctionCallFilter(f FunctionCallFilter) Option {
+	return func(b *Base) { b.callFilter = f }
+}
+
+// functionCall is one call in flight, tracked so it can be canceled.
+type functionCall struct {
+	// item is the registration the call was dispatched under. Which calls an
+	// interruption or a cancel tool stops is decided from it; the handler that
+	// runs is looked up again when the call starts. See runFunctionCall.
+	item       registryItem
+	name       string
+	toolCallID string
+	args       json.RawMessage
+	convo      *frames.LLMContext
+	groupID    string
+
+	// ctx is the lifetime the handler runs under, and cancel ends it. Both are
+	// set when the call starts being tracked, which can be before its goroutine
+	// runs: a call canceled by then never runs at all.
+	ctx    context.Context
+	cancel context.CancelFunc
+	// settled reports that the call is over: it has reported a final result,
+	// timed out, or been canceled. It stops the result callback from reporting
+	// again. A goroutine cannot be killed the way a task can, so a handler that
+	// outlives its call and reports anyway is silenced here rather than
+	// broadcasting a result the conversation has already answered for.
+	settled bool
+	// stopTimeout disarms the bound on how long the call may take. Reporting
+	// anything at all disarms it: a tool that has spoken is not stuck.
+	stopTimeout func()
+}
+
+// SettingsHolder is an optional interface a Generator implements when part of
+// what it was built with can change while the pipeline runs: the model, the
+// system prompt, the sampling knobs. The value returned is the provider's own
+// store, a pointer to a settings value, which an update is merged into.
+type SettingsHolder interface {
+	Settings() any
+}
+
+// SettingsUpdater is an optional interface a Generator implements to act on a
+// settings change, with what changed and what each field held before. A
+// Generator that holds settings without implementing this still has them
+// updated; it picks them up on the next generation, which is enough for a
+// service that reads its settings each time it generates.
+type SettingsUpdater interface {
+	SettingsHolder
+	UpdateSettings(ctx context.Context, changed settings.Changed) error
+}
+
+// Base is the shared LLM processor. It runs the embedded Generator on each
+// LLMContextFrame and surrounds the streamed text with response start/end
+// frames. When the context carries tools and the generator supports them, it
+// runs the tool loop instead.
+type Base struct {
+	*service.Base
+	gen Generator
+
+	// modelMu guards model, which labels the metrics and can change mid-call.
+	modelMu sync.Mutex
+	model   string // reported as a span attribute; set by the provider via SetModel
+	// fullModel is the model the provider reported answering, when it says.
+	fullModel string
+
+	handlersMu sync.RWMutex
+	handlers   map[string]registryItem
+	// unregisteredByHand names the handlers a caller removed while their tool
+	// was still advertised, so registering from the toolset does not bring one
+	// back on the next inference and undo the removal. A name is forgotten again
+	// when it is registered by hand or stops being advertised, so re-advertising
+	// a tool later registers its handler afresh. Guarded by handlersMu.
+	unregisteredByHand map[string]bool
+
+	// How the tool calls of one response are run, fixed at construction.
+	callTimeout   time.Duration
+	runInParallel bool
+	groupCalls    bool
+	// warnNoAdapter reports once that cancellation was asked for on a service
+	// with no adapter to put the tool on.
+	warnNoAdapter sync.Once
+	// asyncToolCancellation widens cancellation to every asynchronous tool
+	// rather than the ones that opted in. Deprecated; see
+	// WithAsyncToolCancellation.
+	asyncToolCancellation bool
+	// callFilter narrows the calls of a response to the ones that run. Nil, the
+	// default, runs every call the model requested.
+	callFilter FunctionCallFilter
+	// continuousGeneration says the service generates on its own rather than
+	// being run by a conversation arriving. See WithContinuousGeneration.
+	continuousGeneration bool
+	// warnedNoTurnFrames keeps the report that a realtime service emits no turn
+	// frames to one.
+	warnedNoTurnFrames atomic.Bool
+	// cancelTools names the cancel tools currently registered, so each is added
+	// and withdrawn exactly once and a call of one is recognized as internal.
+	// Guarded by handlersMu.
+	cancelTools map[string]bool
+	// warnedCancelCollisions names the cancel tools already reported as
+	// colliding with a tool of the application's own, so the collision is
+	// reported once rather than on every inference. Guarded by handlersMu.
+	warnedCancelCollisions map[string]bool
+	// warnedRedundantRegistrations names the tools already reported as
+	// registered by hand though their advertised tool carries a handler, so the
+	// warning is given once rather than on every inference. Guarded by
+	// handlersMu.
+	warnedRedundantRegistrations map[string]bool
+
+	// Tool calls in flight, keyed by tool call id. They run off the frame path,
+	// on a lifetime of their own, so that a handler taking its time does not hold
+	// up the frames queued behind it, including the speech that covers the wait.
+	callsMu     sync.Mutex
+	calls       map[string]*functionCall
+	callsCtx    context.Context
+	callsCancel context.CancelFunc
+	callsWG     sync.WaitGroup
+	// sequential carries the calls of a response to the runner that takes them
+	// one at a time. Nil unless the service was built to run them that way.
+	sequential chan *functionCall
+
+	// Turn-completion markers: the protocol the model answers under, and the
+	// state of the response being read.
+	turnCompletion turnCompletionState
+
+	// Summary generations in flight. They run on the session's lifetime rather
+	// than the turn's, like the tool calls above: compressing the conversation
+	// must not be abandoned because the turn that crossed the threshold ended.
+	summaryCtx    context.Context
+	summaryCancel context.CancelFunc
+	summaryWG     sync.WaitGroup
+
+	// Notifications about the calls of a response, set by the application.
+	eventsMu   sync.RWMutex
+	onStarted  FunctionCallsHandler
+	onCanceled FunctionCallsHandler
+	onTimeout  CompletionTimeoutHandler
+
+	ttfbMu    sync.Mutex
+	ttfbStart time.Time
+	// processingStart is when a continuously generating service started
+	// processing what it reports the time of. Guarded by ttfbMu.
+	processingStart time.Time
+	ttfb            time.Duration
+	hasTTFB         bool
+	// TTFAT runs from the same request start as the TTFB and ends at the first
+	// token of the answer the caller sees, so whatever the model streamed first
+	// falls between the two. It is armed when the TTFB is reported, which is when
+	// ttfatStart takes the request start, and ttfatActive says it is still to
+	// be reported.
+	ttfatActive bool
+	ttfatStart  time.Time
+	// reportsTTFATOnce caches whether this service answers in text at all, since
+	// working it out builds a metadata frame.
+	reportsTTFATOnce sync.Once
+	reportsTTFATVal  bool
+
+	// gate holds a speculative reply until its turn is confirmed. Frames are
+	// routed through it on their way out, and it decides synchronously, so its
+	// verdict cannot be torn by another goroutine pushing at the same time.
+	gateMu sync.Mutex
+	gate   *speculationGate
+	// outputGate can drop what this service pushes or the function calls it
+	// runs. See OutputGate.
+	outputGate OutputGate
+
+	// The system instruction this service sends, and the parts it is composed
+	// from. baseSystemInstruction is the prompt the application set, which every
+	// rebuild starts from; appendedSystemInstructions are the additions a
+	// framework component made; systemInstruction is the composition of the two,
+	// which is what a generation reads. See system.go.
+	systemMu                   sync.Mutex
+	baseSystemInstruction      string
+	appendedSystemInstructions []string
+	systemInstruction          string
+	// expression is what the service knows of the expressive conversation it
+	// takes part in, which feeds the instruction. Guarded by systemMu. See
+	// expression.go.
+	expression expressionState
+
+	// loggedThinkingDefaultModel is the model the thinking default was last
+	// reported for, so it is reported once per model rather than on every
+	// request. See thinking.go.
+	thinkingDefaultMu          sync.Mutex
+	loggedThinkingDefaultModel string
+
+	// settings are the general LLM settings, used when the provider keeps none of
+	// its own. A provider with settings of its own carries these fields inside
+	// them, so an update reaches whichever store the service actually has.
+	settings settings.LLM
+	// settingsMu guards the settings store, the base's or the provider's: an
+	// update is applied on the frame path while a generation reads them.
+	settingsMu sync.RWMutex
+
+	// skipTTSMu guards skipTTS, which an LLMConfigureOutputFrame sets from the
+	// frame path while a response is being pushed from the process goroutine.
+	skipTTSMu sync.Mutex
+	// skipTTS is what the tokens of a response are stamped with, nil until
+	// something configures the output.
+	skipTTS *bool
+
+	// cleanups are the resources registered tools work through, released when
+	// the service is cleaned up. See toolcleanup.go.
+	cleanups toolCleanups
+}
+
+// New builds an LLM Base named name driven by gen. The concrete service passes
+// itself as gen and embeds the returned Base.
+func New(name string, gen Generator, opts ...Option) *Base {
+	b := &Base{
+		gen:           gen,
+		calls:         make(map[string]*functionCall),
+		runInParallel: true,
+		groupCalls:    true,
+	}
+	for _, opt := range opts {
+		opt(b)
+	}
+	// The base dispatches through the concrete service, not through itself. A
+	// service embeds the base, so the base embedded in it is not the processor
+	// the pipeline runs: handing the base its own address would leave anything
+	// the service defines for the base to reach, such as answering a
+	// conversation off the pipeline, unreachable behind the embedded value.
+	// Every service passes itself as its Generator, which is that value.
+	var self processor.Processor = b
+	if p, ok := gen.(processor.Processor); ok {
+		self = p
+	}
+	b.Base = service.New(name, self)
+	b.gate = newSpeculationGate(b.Name())
+	return b
+}
+
+// LLMService marks this processor as a language-model service.
+//
+// It says what a type assertion cannot: that the processor is a model rather
+// than something that merely handles the same frames. An observer outside this
+// package asserts for it to tell a frame the model produced from the same kind
+// of frame reaching it from an aggregator or a conversation flow.
+func (b *Base) LLMService() {}
+
+// OnFunctionCallsStarted registers a callback run when the model requests tool
+// calls, with the calls of that response. It runs off the frame path, so what it
+// does cannot hold up the pipeline.
+func (b *Base) OnFunctionCallsStarted(h FunctionCallsHandler) {
+	b.eventsMu.Lock()
+	b.onStarted = h
+	b.eventsMu.Unlock()
+}
+
+// OnFunctionCallsCanceled registers a callback run when tool calls are
+// canceled, with the calls that were. It runs off the frame path.
+func (b *Base) OnFunctionCallsCanceled(h FunctionCallsHandler) {
+	b.eventsMu.Lock()
+	b.onCanceled = h
+	b.eventsMu.Unlock()
+}
+
+// OnCompletionTimeout registers a callback run when a generation gives up
+// waiting for the provider. It is the signal a switcher fails over on, so it is
+// reported apart from the error frame that also goes out. It runs off the frame
+// path.
+func (b *Base) OnCompletionTimeout(h CompletionTimeoutHandler) {
+	b.eventsMu.Lock()
+	b.onTimeout = h
+	b.eventsMu.Unlock()
+}
+
+// reportGenerationFailure pushes the error a generation failed with, carrying
+// its own message, which is the provider's account of what went wrong: it is
+// what an RTVI client and the logs get to read. A timeout is reported as one,
+// and anything watching for a timeout is told first.
+func (b *Base) reportGenerationFailure(ctx context.Context, err error) {
+	if !errors.Is(err, ErrCompletionTimeout) {
+		b.PushError(ctx, err.Error(), err, false)
+		return
+	}
+	b.eventsMu.RLock()
+	h := b.onTimeout
+	b.eventsMu.RUnlock()
+	if h != nil {
+		go h(context.WithoutCancel(ctx))
+	}
+	b.PushError(ctx, "LLM completion timeout", err, false)
+}
+
+// notify runs one of the two callbacks on a goroutine of its own, tracked so
+// Cleanup waits for it.
+func (b *Base) notify(ctx context.Context, h FunctionCallsHandler, calls []frames.ToolCall) {
+	if h == nil || len(calls) == 0 {
+		return
+	}
+	b.callsWG.Go(func() { h(ctx, calls) })
+}
+
+// Setup opens the lifetime the tool calls run under. It is the session's, not
+// the turn's: a call must be able to outlive the frame that started it, so that
+// canceling it is a decision this service makes rather than a side effect of the
+// turn ending.
+func (b *Base) Setup(ctx context.Context, s processor.Setup) error {
+	if err := b.Base.Setup(ctx, s); err != nil {
+		return err
+	}
+	b.callsCtx, b.callsCancel = context.WithCancel(ctx)
+	b.summaryCtx, b.summaryCancel = context.WithCancel(ctx)
+	b.setupExpression(s)
+	if !b.runInParallel {
+		b.sequential = make(chan *functionCall, sequentialQueueDepth)
+		b.callsWG.Go(b.runSequentially)
+	}
+	return nil
+}
+
+// sequentialQueueDepth bounds the calls waiting for the sequential runner. It is
+// generous: a response requesting more calls than this at once would be
+// remarkable, and a full queue only makes the service wait its turn to enqueue.
+const sequentialQueueDepth = 64
+
+// runSequentially takes queued calls one at a time, so a service built with
+// WithSequentialFunctionCalls never has two handlers running at once.
+func (b *Base) runSequentially() {
+	for {
+		select {
+		case <-b.callsCtx.Done():
+			return
+		case call := <-b.sequential:
+			// Tracked only once the runner takes it, so a call still queued is
+			// not one an interruption finds in flight.
+			b.trackFunctionCall(call)
+			b.runFunctionCall(call)
+		}
+	}
+}
+
+// Cleanup cancels every tool call still running and waits for the handlers to
+// return.
+func (b *Base) Cleanup(ctx context.Context) error {
+	if b.callsCancel != nil {
+		b.callsCancel()
+	}
+	b.callsWG.Wait()
+	if b.summaryCancel != nil {
+		b.summaryCancel()
+	}
+	b.summaryWG.Wait()
+	// Released after the calls that were using them have been stopped and waited
+	// for, so nothing is mid-call against a connection being closed.
+	b.runToolCleanups(ctx)
+	return b.Base.Cleanup(ctx)
+}
+
+// SetModel records the model id the service generates with, reported as the
+// llm.model span attribute. A provider calls it during construction.
+func (b *Base) SetModel(model string) {
+	b.modelMu.Lock()
+	defer b.modelMu.Unlock()
+	b.model = model
+}
+
+// Model is the model the service generates with, as it stands now: the one it
+// was built with, or the one a settings update changed it to.
+func (b *Base) Model() string { return b.modelName() }
+
+// CurrentSettings is the service's current settings, for code outside the
+// service to read, such as the model. They are still changed through an
+// LLMUpdateSettingsFrame. It is not named Settings, which is the method a
+// provider keeping settings of its own implements.
+func (b *Base) CurrentSettings() any { return b.settingsStore() }
+
+// modelName is the identifier the generation is measured and priced against.
+func (b *Base) modelName() string {
+	b.modelMu.Lock()
+	defer b.modelMu.Unlock()
+	return b.model
+}
+
+// SetFullModelName records the model the provider says answered, which is more
+// specific than the one asked for: an alias resolves to a dated build. A service
+// calls it with what the response reported.
+//
+// It labels the trace, where knowing which build answered is the point. Metrics
+// stay on the model the service was configured with, so a series is not split in
+// two the day the alias moves.
+func (b *Base) SetFullModelName(model string) {
+	b.modelMu.Lock()
+	defer b.modelMu.Unlock()
+	b.fullModel = model
+}
+
+// tracedModelName is the model a span is labeled with: what answered, when the
+// provider said, and what was asked for otherwise.
+func (b *Base) tracedModelName() string {
+	b.modelMu.Lock()
+	defer b.modelMu.Unlock()
+	if b.fullModel != "" {
+		return b.fullModel
+	}
+	return b.model
+}
+
+// PushTokenUsage emits a MetricsFrame carrying token usage downstream. A service
+// calls it after a generation, gated on UsageMetricsEnabled, so the conversion
+// from the provider's usage shape happens only when metrics are collected.
+func (b *Base) PushTokenUsage(ctx context.Context, u frames.LLMTokenUsage) error {
+	tracing.SetTokenUsage(ctx, u)
+	metrics.RecordTokens(ctx, b.TypeName(), b.modelName(), u.PromptTokens, u.CompletionTokens)
+	f := frames.NewMetricsFrame(frames.LLMUsageMetricsData{
+		Processor: b.Name(), Model: b.modelName(),
+		Value: u,
+	})
+	return b.PushFrame(ctx, f, processor.Downstream)
+}
+
+// StartTTFBMetrics starts this generation's time-to-first-byte clock. A service
+// calls it immediately before issuing the request. It measures nothing once the
+// pipeline has had the only measurement it asked for, which leaves the clock
+// unstarted and so reports no time to first byte for this generation.
+func (b *Base) StartTTFBMetrics() {
+	armed := b.BeginTTFB()
+	b.ttfbMu.Lock()
+	defer b.ttfbMu.Unlock()
+	b.ttfbStart = time.Time{}
+	b.ttfb = 0
+	b.hasTTFB = false
+	// A response interrupted before its first answer token leaves TTFAT armed;
+	// it is dropped so this request measures its own, whether or not its TTFB
+	// is reported.
+	b.ttfatActive = false
+	b.ttfatStart = time.Time{}
+	if armed {
+		b.ttfbStart = time.Now()
+	}
+}
+
+// StopTTFBMetrics records time to first byte. A service calls it on the first
+// output the model produces, rather than on an earlier event that merely
+// acknowledges the request: a response's opening event, or a leading chunk
+// carrying only usage metadata, is not the model answering. Stopping every
+// service on the same thing is what makes the number comparable between them.
+//
+// The first output need not be text. A turn that only requests tools streams
+// none, so the event announcing the call counts, and the turn reports a TTFB
+// rather than none at all.
+//
+// The measurement is reported at once, rather than with the processing time at
+// the end of the generation, so whatever watches the pipeline sees the first
+// output land when it does: a latency breakdown places the model's first token
+// by it, while the reply it starts is still being spoken.
+//
+// Only the first call in a generation counts, so a service may call it on every
+// chunk it reads.
+func (b *Base) StopTTFBMetrics(ctx context.Context) {
+	b.ReportTTFBMetrics(ctx)
+}
+
+// StopTTFATMetrics reports the time to the first answer token. A service calls
+// it where it produces that token rather than where the pipeline releases it, so
+// buffering downstream stays out of the number. The measurement is pushed at
+// once, in a frame of its own, with the TTFB and the thinking time between them.
+//
+// It measures from the request start the TTFB was measured from, and only once
+// the TTFB was reported: a response that produced no output has no answer token
+// to time. Only the first call in a generation counts, so a service may call it
+// from every branch that produces an answer: streamed text, and the start of a
+// tool call on a turn that answers with one instead of text.
+func (b *Base) StopTTFATMetrics(ctx context.Context) {
+	if !b.reportsTTFAT() {
+		return
+	}
+	b.ttfbMu.Lock()
+	if !b.ttfatActive || b.ttfatStart.IsZero() {
+		b.ttfbMu.Unlock()
+		return
+	}
+	ttfat := time.Since(b.ttfatStart)
+	ttfb := b.ttfb
+	b.ttfatActive = false
+	b.ttfatStart = time.Time{}
+	b.ttfbMu.Unlock()
+
+	slog.DebugContext(ctx, "TTFAT", "service", b.Name(), "ttfat", ttfat, "thinking", ttfat-ttfb)
+	if !b.MetricsEnabled() {
+		return
+	}
+	base := frames.BaseMetricsData{Processor: b.Name(), Model: b.modelName()}
+	_ = b.PushFrame(ctx, frames.NewMetricsFrame(frames.TTFATMetricsData{
+		BaseMetricsData: base,
+		TTFAT:           ttfat,
+		TTFB:            ttfb,
+		ThinkingTime:    ttfat - ttfb,
+	}), processor.Downstream)
+}
+
+// reportsTTFAT reports whether this service answers in text, and so has an
+// answer token to measure to. A speech-to-speech service answers in audio and
+// reports none.
+func (b *Base) reportsTTFAT() bool {
+	b.reportsTTFATOnce.Do(func() {
+		b.reportsTTFATVal = true
+		d, ok := b.Self().(service.MetadataDescriber)
+		if !ok {
+			return
+		}
+		if m, ok := d.ServiceMetadataFrame().(*frames.LLMServiceMetadataFrame); ok && m.Realtime {
+			b.reportsTTFATVal = false
+		}
+	})
+	return b.reportsTTFATVal
+}
+
+// emitTiming records the generation's processing time to OpenTelemetry (always)
+// and, when in-band metrics are enabled, downstream as a MetricsFrame for the
+// RTVI client. The time to first byte and to the first answer token are not
+// among them: each was reported as it was measured.
+func (b *Base) emitTiming(ctx context.Context, _ trace.Span, processing time.Duration) {
+	model := b.modelName()
+	metrics.RecordProcessing(ctx, "llm", b.TypeName(), model, processing.Seconds())
+	if !b.MetricsEnabled() {
+		return
+	}
+	base := frames.BaseMetricsData{Processor: b.Name(), Model: model}
+	_ = b.PushFrame(ctx, frames.NewMetricsFrame(frames.ProcessingMetricsData{BaseMetricsData: base, Value: processing}),
+		processor.Downstream)
+}
+
+// TraceRenderer is a generator that can render the conversation and the toolset
+// the way its provider will see them. A generator that converts through an
+// adapter implements it by delegating to that adapter, so the generation span
+// shows what the model was actually sent rather than the universal form it was
+// converted from. A generator that does not implement it has its conversation
+// rendered in the universal form instead.
+type TraceRenderer interface {
+	// MessagesForLogging renders the conversation as the provider will see it.
+	MessagesForLogging(convo *frames.LLMContext) []map[string]any
+	// ToolsForLogging renders the toolset as the provider will see it.
+	ToolsForLogging(schema frames.ToolsSchema) []any
+}
+
+// notGiven marks a setting the application cleared. A cleared setting is
+// reported rather than dropped, so a span shows the service was told to send
+// nothing for it rather than leaving it ambiguous with a setting never touched.
+const notGiven = "NOT_GIVEN"
+
+// startSpan opens the generation span. The returned context carries the span so
+// PushTokenUsage and any nested work attach to it. On an untraced pipeline the
+// span is a no-op and the attributes below cost nothing.
+func (b *Base) startSpan(ctx context.Context) (context.Context, trace.Span) {
+	return b.StartSpan(ctx, "llm")
+}
+
+// traceRequest records the generation's request on its span: the provider and
+// model, the generation parameters, the conversation sent and the toolset
+// offered, so a trace backend renders the prompt the model answered.
+func (b *Base) traceRequest(span trace.Span, convo *frames.LLMContext) {
+	attrs := tracing.LLMAttributes{
+		Service:            b.TypeName(),
+		Model:              b.tracedModelName(),
+		Stream:             true,
+		Messages:           b.traceMessages(convo),
+		SystemInstructions: b.traceSystemInstruction(convo),
+		Parameters:         b.traceParameters(),
+	}
+	if tools, n := b.traceTools(convo); tools != "" {
+		attrs.Tools, attrs.ToolCount = tools, &n
+	}
+	tracing.SetLLMAttributes(span, attrs)
+}
+
+// traceOutput records the model's reply text as the span's output attribute.
+func traceOutput(span trace.Span, text string) {
+	if text != "" {
+		span.SetAttributes(attribute.String("output", text))
+	}
+}
+
+// traceSystemInstruction is the system instruction the generation ran under: the
+// service's composed instruction, and the conversation's own system prompt when
+// the service has none of its own. The service's takes priority because that is
+// what it sends.
+//
+// A conversation's own prompt is its system field or, failing that, a system
+// message at the head of its messages, where a conversation set message by
+// message carries it.
+func (b *Base) traceSystemInstruction(convo *frames.LLMContext) string {
+	if s := b.SystemInstruction(); s != "" {
+		return s
+	}
+	if s := convo.System(); s != "" {
+		return s
+	}
+	if msgs := convo.Messages(); len(msgs) > 0 && msgs[0].Role == frames.RoleSystem && !msgs[0].IsLLMSpecific() {
+		return msgs[0].Text
+	}
+	return ""
+}
+
+// traceParameters renders the service's settings as the generation parameters.
+// The system instruction is left out: it has an attribute of its own.
+func (b *Base) traceParameters() map[string]any {
+	b.settingsMu.RLock()
+	given, err := settings.Given(b.settingsStore())
+	b.settingsMu.RUnlock()
+	if err != nil {
+		return nil
+	}
+	delete(given, "system_instruction")
+	for k, v := range given {
+		if v == nil {
+			given[k] = notGiven
+		}
+	}
+	return given
+}
+
+// traceMessages renders the conversation for the span's input attribute, in the
+// provider's own format where the generator can produce it.
+func (b *Base) traceMessages(convo *frames.LLMContext) string {
+	if r, ok := b.gen.(TraceRenderer); ok {
+		return marshalTrace(r.MessagesForLogging(convo))
+	}
+	return universalMessages(convo)
+}
+
+// traceTools renders the toolset for the span, with the number of tools offered.
+// An empty toolset renders as nothing, which leaves both attributes off.
+func (b *Base) traceTools(convo *frames.LLMContext) (string, int) {
+	schema := convo.ToolsSchema()
+	var tools []any
+	if r, ok := b.gen.(TraceRenderer); ok {
+		tools = r.ToolsForLogging(schema)
+	} else {
+		for _, t := range schema.Standard {
+			tools = append(tools, t)
+		}
+	}
+	if len(tools) == 0 {
+		return "", 0
+	}
+	return marshalTrace(tools), len(tools)
+}
+
+// marshalTrace serializes a value for a span attribute, rendering as nothing
+// what will not serialize. A span attribute is a report on the call, not part of
+// it, so a value that cannot be rendered leaves the attribute off rather than
+// failing the generation it describes.
+func marshalTrace(v any) string {
+	data, err := json.Marshal(v)
+	if err != nil {
+		return ""
+	}
+	return string(data)
+}
+
+// universalMessages renders the context (system prompt plus conversation) as a
+// JSON array of role/content messages, for a generator that cannot render the
+// conversation in its provider's own format.
+func universalMessages(convo *frames.LLMContext) string {
+	type msg struct {
+		Role        string              `json:"role"`
+		Content     string              `json:"content,omitempty"`
+		ToolCalls   []frames.ToolCall   `json:"tool_calls,omitempty"`
+		ToolResults []frames.ToolResult `json:"tool_results,omitempty"`
+	}
+	var out []msg
+	if sys := convo.System(); sys != "" {
+		out = append(out, msg{Role: "system", Content: sys})
+	}
+	for _, m := range convo.Messages() {
+		out = append(out, msg{
+			Role:        string(m.Role),
+			Content:     m.Text,
+			ToolCalls:   m.ToolCalls,
+			ToolResults: m.ToolResults,
+		})
+	}
+	return marshalTrace(out)
+}
+
+// RegisterFunction registers a handler for the named tool. During a tool-capable
+// generation, a call to that tool is dispatched to the handler. By default the
+// call is canceled when the user interrupts; see WithCancelOnInterruption.
+//
+// Registering under the empty name registers a catch-all: it takes every call no
+// named handler claims, which is how one handler serves a whole toolset.
+func (b *Base) RegisterFunction(name string, h FunctionCallHandler, opts ...RegisterOption) {
+	if b.isCancelTool(name) {
+		slog.Error("refusing to register a reserved built-in tool name",
+			"service", b.Name(), "function", name)
+		return
+	}
+	item := registryItem{name: name, handler: h, cancelOnInterruption: true}
+	for _, opt := range opts {
+		opt(&item)
+	}
+	b.resolveCancellableByLLM(&item)
+	// Recorded on the service rather than on the item, so that unregistering the
+	// tool later does not release a resource something else may still be using.
+	b.recordToolCleanup(item.cleanup)
+	b.handlersMu.Lock()
+	if b.handlers == nil {
+		b.handlers = make(map[string]registryItem)
+	}
+	b.handlers[name] = item
+	// Registering by hand is the caller changing their mind about a handler they
+	// removed, so the removal stops being held against the toolset.
+	delete(b.unregisteredByHand, name)
+	b.handlersMu.Unlock()
+	// Its cancel tool, if it is cancellable, comes in with the next sync of the
+	// tool handlers, which settles them once every advertised handler is in:
+	// settled here, it would take a name a tool advertised later in the same
+	// toolset may hold.
+}
+
+// UnregisterFunction removes the handler registered for name, reporting whether
+// there was one.
+//
+// It stops the tool being handled, not being offered. To withdraw a tool
+// properly, push an [frames.LLMSetToolsFrame] with the tool left out: that stops
+// advertising it as well, rather than leaving the model free to call something
+// that answers only that it is unavailable.
+//
+// The removal holds even while the tool is still advertised carrying a handler:
+// without that, registering from the toolset would bring the handler back on the
+// very next inference and calls would keep being answered by the handler the
+// caller took away. It stops holding once the tool leaves the toolset, so
+// advertising it again registers its handler afresh.
+func (b *Base) UnregisterFunction(name string) bool {
+	b.handlersMu.Lock()
+	_, ok := b.handlers[name]
+	delete(b.handlers, name)
+	if b.unregisteredByHand == nil {
+		b.unregisteredByHand = make(map[string]bool)
+	}
+	b.unregisteredByHand[name] = true
+	b.handlersMu.Unlock()
+	// Its cancel tool, if it had one, goes with the next sync of the tool
+	// handlers.
+	return ok
+}
+
+// HasFunction reports whether a handler is registered for name. A catch-all
+// counts: it would take the call.
+func (b *Base) HasFunction(name string) bool {
+	b.handlersMu.RLock()
+	defer b.handlersMu.RUnlock()
+	if _, ok := b.handlers[name]; ok {
+		return true
+	}
+	_, ok := b.handlers[catchAllFunction]
+	return ok
+}
+
+// FunctionIsAsync reports whether the named tool was registered to outlive the
+// reply that asked for it, with WithCancelOnInterruption(false). A registration
+// under the name answers for itself, a catch-all answers for anything else, and
+// a name nothing claims is not asynchronous.
+//
+// It is what a service tells a provider that distinguishes a call it should wait
+// for from one it should not.
+func (b *Base) FunctionIsAsync(name string) bool {
+	item, ok := b.lookupFunction(name)
+	return ok && !item.cancelOnInterruption
+}
+
+// lookupFunction returns the entry that runs a call to name: its own handler, or
+// else the catch-all. It reports false when nothing claims the call, which the
+// caller answers with the missing-function handler.
+func (b *Base) lookupFunction(name string) (registryItem, bool) {
+	b.handlersMu.RLock()
+	item, ok := b.handlers[name]
+	if !ok {
+		item, ok = b.handlers[catchAllFunction]
+	}
+	b.handlersMu.RUnlock()
+	if !ok {
+		return registryItem{}, false
+	}
+	// The catch-all keeps the empty name it is registered under, so an
+	// interruption matches its calls to it. A call runs under the name the model
+	// actually used, which the call carries itself.
+	return item, true
+}
+
+// missingFunctionItem builds the entry that answers a call nothing claims.
+func missingFunctionItem(name string) registryItem {
+	return registryItem{name: name, handler: missingFunctionHandler, cancelOnInterruption: true, missing: true}
+}
+
+// logMissingFunction says why a call had no handler, telling apart the two cases
+// that lead here. A tool the conversation advertises with nothing behind it is
+// almost always a wiring mistake, and reads as an error. A tool nothing
+// advertises is the model inventing one, which an application can do little
+// about beyond answering that it is unavailable.
+func (b *Base) logMissingFunction(ctx context.Context, name string, convo *frames.LLMContext) {
+	for _, t := range convo.Tools() {
+		if t.Name == name {
+			slog.ErrorContext(ctx, "tool is advertised to the model but has no handler",
+				"service", b.Name(), "function", name)
+			return
+		}
+	}
+	slog.WarnContext(ctx, "model called a tool that is not in the advertised toolset",
+		"service", b.Name(), "function", name)
+}
+
+// missingFunctionHandler answers a call to an unregistered tool with a terminal
+// result naming it.
+func missingFunctionHandler(ctx context.Context, params FunctionCallParams) error {
+	return params.Result(ctx, fmt.Sprintf(missingFunctionMessage, params.FunctionName), nil)
+}
+
+// updateSettings merges an update into the provider's own settings and lets it
+// act on what changed. There is no reconnection here: a generation is a request
+// of its own, so a provider reads its settings the next time it generates.
+func (b *Base) updateSettings(ctx context.Context, f *frames.LLMUpdateSettingsFrame) {
+	changed, err := b.applySettingsUpdate(f)
+	if err != nil {
+		b.PushError(ctx, "llm: settings update", err, false)
+		return
+	}
+	if len(changed) == 0 {
+		return
+	}
+	slog.Info("updated settings", "service", b.Name(), "fields", changed.String())
+	b.SettingsUpdated(ctx)
+
+	if changed.Has("model") {
+		// The model labels the tokens this service reports and is what they are
+		// priced against, so a model that changed mid-call has to relabel what
+		// follows.
+		name := b.setting("model")
+		model, _ := name.(string)
+		b.SetModel(model)
+	}
+
+	if changed.Has("filter_incomplete_user_turns") {
+		on := b.setting("filter_incomplete_user_turns")
+		enabled, _ := on.(bool)
+		b.SetFilterIncompleteUserTurns(enabled)
+	}
+
+	// A turn-completion configuration takes effect only while incomplete turns
+	// are filtered, the flag being applied first so an update turning both on
+	// takes both. One sent while filtering is off is kept in the settings but
+	// not put in force.
+	if changed.Has("user_turn_completion_config") && b.FilterIncompleteUserTurns() {
+		v := b.setting("user_turn_completion_config")
+		if cfg, ok := v.(UserTurnCompletionConfig); ok {
+			b.SetUserTurnCompletionConfig(cfg)
+		} else if v != nil {
+			slog.Error("the turn-completion configuration is not the expected type; ignoring it",
+				"service", b.Name(), "type", fmt.Sprintf("%T", v))
+		}
+	}
+
+	if changed.Has("system_instruction") {
+		// The application replaced the base prompt, so it is re-read and the
+		// composed instruction rebuilt from it. Rebuilding rather than assigning is
+		// what keeps whatever was composed onto the prompt in place.
+		instruction := b.setting("system_instruction")
+		text, _ := instruction.(string)
+		b.SetSystemInstruction(text)
+	}
+
+	if updater, ok := b.gen.(SettingsUpdater); ok {
+		if err := updater.UpdateSettings(ctx, changed); err != nil {
+			b.PushError(ctx, "llm: settings update", err, false)
+		}
+	}
+}
+
+// applySettingsUpdate resolves an update against the settings and merges it in,
+// under the settings lock, reporting what changed. An update that names nothing
+// changes nothing.
+func (b *Base) applySettingsUpdate(f *frames.LLMUpdateSettingsFrame) (settings.Changed, error) {
+	b.settingsMu.Lock()
+	defer b.settingsMu.Unlock()
+	store := b.settingsStore()
+	delta, ok, err := settings.Resolve(&f.ServiceUpdateSettingsFrame, store)
+	if err != nil || !ok {
+		return nil, err
+	}
+	return settings.Apply(store, delta)
+}
+
+// setting reads one field of the settings under the settings lock.
+func (b *Base) setting(name string) any {
+	b.settingsMu.RLock()
+	defer b.settingsMu.RUnlock()
+	v, _ := settings.Get(b.settingsStore(), name)
+	return v
+}
+
+// ReadSettings runs fn while no settings update can be applied, so a provider
+// building a request reads its settings whole: an update arriving meanwhile
+// lands before or after the read, never in the middle of it.
+func (b *Base) ReadSettings(fn func()) {
+	b.settingsMu.RLock()
+	defer b.settingsMu.RUnlock()
+	fn()
+}
+
+// settingsStore returns the settings an update is applied to: the provider's
+// own where it keeps any, and otherwise the general LLM settings the base holds
+// for it. Every LLM service therefore answers a settings update, whether or not
+// its provider has settings of its own to add.
+func (b *Base) settingsStore() any {
+	if holder, ok := b.gen.(SettingsHolder); ok {
+		return holder.Settings()
+	}
+	return &b.settings
+}
+
+// ProcessFrame runs the generator on each LLMContextFrame and forwards other
+// frames untouched.
+func (b *Base) ProcessFrame(ctx context.Context, f frames.Frame, dir processor.Direction) error {
+	if err := b.processBaseAndGate(ctx, f, dir); err != nil {
+		return err
+	}
+	// The inference a turn-completion report names is tracked whether or not
+	// the markers are on, so turning them on mid-response names the right one.
+	b.handleTurnCompletionProcessFrame(ctx, f)
+	b.handleExpressionMetadata(f)
+	switch fr := f.(type) {
+	case *frames.LLMContextFrame:
+		// Before the generation starts, so the gate knows what this inference
+		// answers before any of its frames arrive.
+		b.beginSpeculation(fr.Speculation)
+		if b.continuousGeneration {
+			// The service is already generating, so a conversation arriving is
+			// not a prompt to run. It still settles what the model may call, and
+			// what the service does with it beyond that is the service's own.
+			b.SyncToolHandlers(ctx, fr.Context.ToolsSchema())
+			return nil
+		}
+		return b.run(ctx, fr.Context)
+	case *frames.InterruptionFrame:
+		b.handleInterruptions(ctx)
+		return b.PushFrame(ctx, f, dir)
+	case *frames.UserTurnResponseCancelFrame:
+		b.handleUserTurnResponseCancel(ctx)
+		return b.PushFrame(ctx, f, dir)
+	case *frames.StartFrame:
+		// A realtime service can run a tool it was configured with before the
+		// first conversation reaches it, so the handlers of its own tools are
+		// registered up front. Conversations re-sync them from then on.
+		b.SyncToolHandlers(ctx, frames.ToolsSchema{})
+		if err := b.PushFrame(ctx, f, dir); err != nil {
+			return err
+		}
+		return nil
+	case *frames.LLMContextSummaryRequestFrame:
+		b.handleSummaryRequest(fr)
+		return nil
+	case *frames.LLMConfigureOutputFrame:
+		b.setSkipTTS(fr.SkipTTS)
+		return b.PushFrame(ctx, f, dir)
+	case *frames.LLMUpdateSettingsFrame:
+		if !fr.TargetsService(b) {
+			// Meant for another service; leave it untouched for that one.
+			return b.PushFrame(ctx, f, dir)
+		}
+		b.updateSettings(ctx, fr)
+		return nil
+	default:
+		return b.PushFrame(ctx, f, dir)
+	}
+}
+
+// PushFrame stamps the frames of a response with the output configuration in
+// effect before pushing them on, so a TTS service downstream knows whether to
+// speak them. Only the frames that describe the model's own output are stamped:
+// the ones a TTS service reads to decide what it synthesizes.
+//
+// Nothing is stamped until something configures the output, which leaves the
+// decision to whatever else in the pipeline may set it on a frame. An output
+// gate, when one is set, may drop the frame before any of this.
+func (b *Base) PushFrame(ctx context.Context, f frames.Frame, dir processor.Direction) error {
+	if b.outputGate != nil && !b.outputGate.AllowPush(f) {
+		return nil
+	}
+	// The gating sees the response-lifecycle frames the service generates before
+	// anything downstream does. They never arrive as input, so this is the only
+	// place they can be intercepted.
+	if b.FilterIncompleteUserTurns() {
+		b.handleTurnCompletionPushFrame(ctx, f)
+	}
+	if skip, ok := b.currentSkipTTS(); ok {
+		// A copy per frame: the frames travel on their own from here, and one
+		// must not be able to change what another says.
+		switch fr := f.(type) {
+		case *frames.LLMTextFrame:
+			fr.SkipTTS = &skip
+		case *frames.LLMFullResponseStartFrame:
+			fr.SkipTTS = &skip
+		case *frames.LLMFullResponseEndFrame:
+			fr.SkipTTS = &skip
+		}
+	}
+
+	// Everything the gate hands back is pushed past it: routing it back through
+	// here would gate it a second time.
+	for _, out := range b.gateProcess(f, dir) {
+		if err := b.Base.PushFrame(ctx, out.frame, out.dir); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// gateProcess runs one frame past the speculation gate, returning what it
+// releases.
+func (b *Base) gateProcess(f frames.Frame, dir processor.Direction) []gatedFrame {
+	b.gateMu.Lock()
+	defer b.gateMu.Unlock()
+	return b.gate.process(f, dir)
+}
+
+// beginSpeculation tells the gate what the inference about to run answers,
+// before any of its frames arrive.
+func (b *Base) beginSpeculation(speculation bool) {
+	b.gateMu.Lock()
+	defer b.gateMu.Unlock()
+	b.gate.beginSpeculation(speculation)
+}
+
+// isSpeculating reports whether the inference in flight answers a turn that has
+// not been confirmed.
+func (b *Base) isSpeculating() bool {
+	b.gateMu.Lock()
+	defer b.gateMu.Unlock()
+	return b.gate.isSpeculating()
+}
+
+// handleUserTurnResponseCancel stops generating a reply whose user turn turned out
+// to be unfinished.
+//
+// The tokens are wasted either way; stopping keeps the service from paying for
+// the rest of them. Unlike an interruption this leaves the turn open: the bot
+// never spoke, and the user is still mid-turn.
+//
+// Nothing measured for the abandoned generation is reported, because the
+// measurements go out where a generation finishes and this one never does.
+func (b *Base) handleUserTurnResponseCancel(ctx context.Context) {
+	// Runs before the frame reaches the gate, which is what clears the
+	// speculation, so this still sees the one being withdrawn.
+	if !b.isSpeculating() {
+		return
+	}
+	slog.DebugContext(ctx, "eager end of turn withdrawn, stopping the speculative inference",
+		"service", b.Name())
+	b.StartInterruption()
+}
+
+// setSkipTTS records what the tokens of a response are stamped with from here
+// on.
+func (b *Base) setSkipTTS(v bool) {
+	b.skipTTSMu.Lock()
+	b.skipTTS = &v
+	b.skipTTSMu.Unlock()
+}
+
+// currentSkipTTS returns the configuration to stamp with, reporting false while
+// nothing has configured the output.
+func (b *Base) currentSkipTTS() (bool, bool) {
+	b.skipTTSMu.Lock()
+	defer b.skipTTSMu.Unlock()
+	if b.skipTTS == nil {
+		return false, false
+	}
+	return *b.skipTTS, true
+}
+
+// ServiceMetadataFrame implements service.MetadataDescriber, describing this
+// language model service to the rest of the pipeline.
+func (b *Base) ServiceMetadataFrame() frames.ServiceMetadata {
+	return frames.NewLLMServiceMetadataFrame(b.Name())
+}
+
+// run streams a response for the conversation, choosing the tool loop when the
+// context or the service carries tools and the generator supports them. It runs under the
+// process goroutine's context, so an interruption cancels the in-flight work.
+func (b *Base) run(ctx context.Context, convo *frames.LLMContext) error {
+	// The conversation carries its current toolset on every inference, so this is
+	// the one place tool changes take effect: pick up the handler any advertised
+	// tool carries, drop the ones for tools no longer advertised, and only then
+	// settle what this service adds on its own account.
+	b.SyncToolHandlers(ctx, convo.ToolsSchema())
+	// The tools this service implements itself go out on every request, so they
+	// are the toolset when the conversation advertises none of its own.
+	if len(convo.Tools()) > 0 || b.hasBuiltinTools() {
+		if tg, ok := b.gen.(ToolGenerator); ok {
+			return b.runWithTools(ctx, convo, tg)
+		}
+		slog.Warn("LLM service does not support tools; tools ignored", "processor", b.Name())
+	}
+	return b.runText(ctx, convo)
+}
+
+// runText is the text-only path: brackets the streamed deltas with response
+// start/end frames.
+func (b *Base) runText(ctx context.Context, convo *frames.LLMContext) error {
+	ctx, span := b.startSpan(ctx)
+	defer span.End()
+	b.traceRequest(span, convo)
+	if err := b.PushFrame(ctx, frames.NewLLMFullResponseStartFrame(), processor.Downstream); err != nil {
+		return err
+	}
+	start := time.Now()
+	var out strings.Builder
+	emit := func(text string) error {
+		if text == "" {
+			return nil
+		}
+		out.WriteString(text)
+		return b.pushLLMText(ctx, text)
+	}
+	if err := b.gen.Generate(ctx, convo, emit); err != nil && ctx.Err() == nil {
+		span.RecordError(err)
+		b.reportGenerationFailure(ctx, err)
+	}
+	traceOutput(span, out.String())
+	b.emitTiming(ctx, span, time.Since(start))
+	b.pushMarkerResponse(ctx)
+	return b.PushFrame(ctx, frames.NewLLMFullResponseEndFrame(), processor.Downstream)
+}
+
+// sink adapts per-pass closures to the Sink interface.
+type sink struct {
+	text func(string) error
+	tool func(frames.ToolCall) error
+}
+
+func (s sink) Text(t string) error          { return s.text(t) }
+func (s sink) Tool(c frames.ToolCall) error { return s.tool(c) }
+
+// runWithTools runs one tool-capable inference: it streams text and, when the
+// model requests tools, dispatches each call to its handler and emits the
+// function-call frames. It does not loop — the assistant aggregator commits the
+// results to the context and re-triggers generation, so the next inference reads a
+// context whose tool calls are balanced. The base writes nothing to the context.
+func (b *Base) runWithTools(ctx context.Context, convo *frames.LLMContext, tg ToolGenerator) error {
+	ctx, span := b.startSpan(ctx)
+	defer span.End()
+	b.traceRequest(span, convo)
+	if err := b.PushFrame(ctx, frames.NewLLMFullResponseStartFrame(), processor.Downstream); err != nil {
+		return err
+	}
+	start := time.Now()
+	var preamble strings.Builder
+	var calls []frames.ToolCall
+	s := sink{
+		text: func(t string) error {
+			if t == "" {
+				return nil
+			}
+			preamble.WriteString(t)
+			return b.pushLLMText(ctx, t)
+		},
+		tool: func(c frames.ToolCall) error {
+			calls = append(calls, c)
+			return nil
+		},
+	}
+	// The calls are announced before the response ends but run once it has: a
+	// call is under way as soon as it starts, and a fast one would otherwise
+	// report its result ahead of the end of the response that asked for it,
+	// leaving the turn's own text out of the conversation the result runs on.
+	launch := func() {}
+	genErr := tg.GenerateWithTools(ctx, convo, s)
+	if genErr != nil && ctx.Err() == nil {
+		b.reportGenerationFailure(ctx, genErr)
+	}
+	// A response that failed may have finished some calls before it did. The
+	// model made them, so they still run; a provider reports only the calls it
+	// knows to be complete.
+	if ctx.Err() == nil && (genErr == nil || len(calls) > 0) {
+		launchCalls, err := b.announceFunctionCalls(ctx, convo, calls)
+		if err != nil {
+			return err
+		}
+		launch = launchCalls
+	}
+	traceOutput(span, preamble.String())
+	b.emitTiming(ctx, span, time.Since(start))
+	b.pushMarkerResponse(ctx)
+	err := b.PushFrame(ctx, frames.NewLLMFullResponseEndFrame(), processor.Downstream)
+	launch()
+	return err
+}
+
+// RunFunctionCalls runs the tool calls a response requested: it narrows them to
+// the ones that run, announces them, and sets them going without waiting.
+//
+// The base calls it for the models it runs itself. A service generating
+// continuously calls it directly, since its calls arrive on its own protocol
+// rather than out of a generation the base drove.
+//
+// convo is the conversation the calls belong to, which is what the results are
+// written back into.
+func (b *Base) RunFunctionCalls(
+	ctx context.Context, convo *frames.LLMContext, calls []frames.ToolCall,
+) error {
+	launch, err := b.announceFunctionCalls(ctx, convo, calls)
+	if err != nil {
+		return err
+	}
+	launch()
+	return nil
+}
+
+// announceFunctionCalls narrows the calls to the ones that run, announces them,
+// and tracks them, so an interruption from here on cancels them. It returns
+// what sets them going, which the base calls once the response that asked for
+// them has ended.
+func (b *Base) announceFunctionCalls(
+	ctx context.Context, convo *frames.LLMContext, calls []frames.ToolCall,
+) (func(), error) {
+	noop := func() {}
+	if b.callFilter != nil {
+		calls = b.callFilter(convo, calls)
+	}
+	if len(calls) == 0 {
+		return noop, nil
+	}
+	if b.outputGate != nil && !b.outputGate.AllowFunctionCalls() {
+		return noop, nil
+	}
+	// The built-in cancellation tool is how the model abandons an asynchronous
+	// call, an internal mechanism rather than a tool the application put up, so
+	// it is announced to neither the application nor the pipeline.
+	if b.isSpeculating() {
+		// Tools run inside the service, so no gate downstream can undo their
+		// side effects if the speculation is discarded. Withdraw it instead: the
+		// inference that follows the committed transcript runs the call. A turn
+		// confirmed before the call was reached leaves nothing pending, and the
+		// call runs as an ordinary one.
+		slog.DebugContext(ctx, "a speculative inference wants a tool call, withdrawing it",
+			"service", b.Name())
+		return noop, b.Broadcast(ctx, func() frames.Frame { return frames.NewUserTurnResponseCancelFrame() })
+	}
+
+	if visible := b.userVisibleCalls(calls); len(visible) > 0 {
+		b.eventsMu.RLock()
+		started := b.onStarted
+		b.eventsMu.RUnlock()
+		b.notify(ctx, started, visible)
+		if err := b.Broadcast(ctx, func() frames.Frame {
+			return frames.NewFunctionCallsStartedFrame(visible)
+		}); err != nil {
+			return noop, err
+		}
+	}
+	return b.runFunctionCalls(ctx, convo, calls), nil
+}
+
+// isCancelTool reports whether name belongs to a built-in cancel tool.
+func (b *Base) isCancelTool(name string) bool {
+	b.handlersMu.RLock()
+	defer b.handlersMu.RUnlock()
+	return b.cancelTools[name]
+}
+
+// userVisibleCalls drops the built-in cancel tools from the calls, leaving the
+// ones the application put up. It returns the calls untouched when there is
+// nothing to drop, which is every response but the rare one that abandons an
+// asynchronous call.
+func (b *Base) userVisibleCalls(calls []frames.ToolCall) []frames.ToolCall {
+	internal := func(c frames.ToolCall) bool { return b.isCancelTool(c.Name) }
+	if !slices.ContainsFunc(calls, internal) {
+		return calls
+	}
+	return slices.DeleteFunc(slices.Clone(calls), internal)
+}
+
+// runFunctionCalls tracks every call the model requested this turn and returns
+// what starts them, without waiting for them. A handler runs for as long as the
+// work it does takes. Running it on the goroutine that processes this service's
+// frames would hold up every frame queued behind it, including the speech a bot
+// plays to cover the wait.
+//
+// The calls are tracked here, before they start, so an interruption handled
+// before the launch finds them and cancels them; a call canceled that way never
+// runs its handler.
+//
+// The calls share a group id, which is how the aggregator recognizes them as one
+// batch and answers the batch with a single inference once the last of them has
+// reported, rather than once per call.
+func (b *Base) runFunctionCalls(ctx context.Context, convo *frames.LLMContext, calls []frames.ToolCall) func() {
+	groupID := ""
+	if b.groupCalls {
+		groupID = uuid.NewString()
+	}
+	tracked := make([]*functionCall, 0, len(calls))
+	for _, c := range calls {
+		item, claimed := b.lookupFunction(c.Name)
+		if !claimed {
+			// Nothing claims it, so say which of the two ways that happened before
+			// the missing-function handler answers the model.
+			b.logMissingFunction(ctx, c.Name, convo)
+			item = missingFunctionItem(c.Name)
+		}
+		call := &functionCall{
+			item:       item,
+			name:       c.Name,
+			toolCallID: c.ID,
+			args:       c.Args,
+			convo:      convo,
+			groupID:    groupID,
+		}
+		if b.runInParallel {
+			b.trackFunctionCall(call)
+		}
+		tracked = append(tracked, call)
+	}
+	return func() {
+		for _, call := range tracked {
+			if b.runInParallel {
+				b.callsWG.Go(func() { b.runFunctionCall(call) })
+				continue
+			}
+			// Sequential: one runner takes them in turn, so no two handlers overlap.
+			select {
+			case b.sequential <- call:
+			case <-b.callsCtx.Done():
+				return
+			}
+		}
+	}
+}
+
+// trackFunctionCall records a call as in flight and opens the lifetime its
+// handler runs under, derived from the session's rather than the turn's, so that
+// whether it survives an interruption is decided by how it was registered and
+// not by the turn ending.
+func (b *Base) trackFunctionCall(call *functionCall) {
+	call.ctx, call.cancel = context.WithCancel(b.callsCtx)
+	b.callsMu.Lock()
+	b.calls[call.toolCallID] = call
+	b.callsMu.Unlock()
+}
+
+// runFunctionCall executes one tracked tool call: it announces the call as in
+// progress, which is what writes it and the message answering it to the
+// conversation, then dispatches it to its handler.
+func (b *Base) runFunctionCall(call *functionCall) {
+	ctx := call.ctx
+	defer call.cancel()
+	defer func() {
+		b.callsMu.Lock()
+		// Only if it is still this call: a cancellation may already have dropped
+		// it, and the model may have called the same tool again since.
+		if b.calls[call.toolCallID] == call {
+			delete(b.calls, call.toolCallID)
+		}
+		b.callsMu.Unlock()
+	}()
+	if ctx.Err() != nil {
+		// Canceled before it started: whatever canceled it has settled it, and
+		// its handler never runs.
+		return
+	}
+
+	item := b.resolveFunctionCall(ctx, call)
+
+	slog.DebugContext(ctx, "calling function", "service", b.Name(),
+		"function", call.name, "tool_call_id", call.toolCallID)
+
+	if err := b.Broadcast(ctx, func() frames.Frame {
+		return frames.NewFunctionCallInProgressFrame(
+			call.toolCallID, call.name, call.args, item.cancelOnInterruption, call.groupID,
+		)
+	}); err != nil {
+		return
+	}
+
+	report := b.resultCallback(call, item)
+	stopTimeout := b.startCallTimeout(ctx, call, item)
+	defer stopTimeout()
+	b.callsMu.Lock()
+	call.stopTimeout = stopTimeout
+	b.callsMu.Unlock()
+
+	params := FunctionCallParams{
+		FunctionName: call.name,
+		ToolCallID:   call.toolCallID,
+		Arguments:    call.args,
+		LLM:          b,
+		Context:      call.convo,
+		Result:       report,
+	}
+	if running := b.Running(); running != nil {
+		params.PipelineWorker = running
+		params.AppResources = running.AppResources()
+	}
+	if err := callHandler(ctx, item.handler, params); err != nil {
+		if ctx.Err() != nil && (errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)) {
+			// The call was canceled, by its timeout, an interruption or the
+			// pipeline ending, and whatever canceled it has settled it. A handler
+			// returning the cancellation is how it stops, not a failure.
+			return
+		}
+		// The failure came from the application's own handler, so it says nothing
+		// about whether this service can go on doing its job.
+		b.PushError(ctx, fmt.Sprintf("error executing function call [%s]: %v", call.name, err), err, false,
+			processor.WithErrorCategory(errs.Application))
+		// A handler that failed will never report, so the call is settled on its
+		// behalf: the conversation is left waiting on a result that can never
+		// arrive otherwise. What it is told names the function and nothing else.
+		// The error itself reaches the user through the model, and it carries
+		// whatever the handler put in it.
+		_ = b.settleCall(ctx, call, item, fmt.Sprintf(functionCallErrorTemplate, call.name), err.Error(), nil)
+	}
+}
+
+// callHandler runs a tool handler, turning a panic into the error it returns. A
+// handler is application code, and a bug in it (a nil map, an index out of
+// range) is a failed call, settled like any other, not the end of the process
+// and every session in it.
+func callHandler(ctx context.Context, handler FunctionCallHandler, params FunctionCallParams) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.ErrorContext(ctx, "function call handler panicked",
+				"function", params.FunctionName, "panic", r, "stack", string(debug.Stack()))
+			err = fmt.Errorf("%w: %v", errHandlerPanicked, r)
+		}
+	}()
+	return handler(ctx, params)
+}
+
+// errHandlerPanicked wraps the value a tool handler panicked with.
+//
+//nolint:gochecknoglobals // sentinel error
+var errHandlerPanicked = errors.New("handler panicked")
+
+// resolveFunctionCall looks the handler of a call up again as it starts. The
+// function may have been unregistered since the call was dispatched, a tool set
+// swapped by an earlier call of the same response for instance. The call then
+// falls back to the missing-function handler, so it still ends with an ordinary
+// tool result.
+func (b *Base) resolveFunctionCall(ctx context.Context, call *functionCall) registryItem {
+	if item, ok := b.lookupFunction(call.name); ok {
+		return item
+	}
+	if call.item.missing {
+		return call.item
+	}
+	slog.WarnContext(ctx, "function was unregistered between being queued and running",
+		"service", b.Name(), "function", call.name, "tool_call_id", call.toolCallID)
+	return missingFunctionItem(call.name)
+}
+
+// functionCallErrorTemplate is returned to the model as the tool result when a
+// handler fails. It names the function as the thing that failed, and the failure
+// itself is deliberately left out.
+const functionCallErrorTemplate = "The function `%s` failed and returned no result."
+
+// startCallTimeout arms the bound on how long a call may take, returning the
+// function that disarms it. A call that overruns is canceled: the call is
+// settled first, so a result racing in while the handler unwinds is rejected
+// rather than broadcast, and the handler's context is then canceled so a
+// cancel-aware handler can run its cleanup.
+//
+// It returns a no-op when no bound applies, so a call with none costs nothing.
+func (b *Base) startCallTimeout(ctx context.Context, call *functionCall, item registryItem) func() {
+	timeout := item.timeout
+	if timeout == 0 {
+		timeout = b.callTimeout
+	}
+	if timeout <= 0 {
+		return func() {}
+	}
+	timer := time.AfterFunc(timeout, func() {
+		slog.WarnContext(ctx, "function call timed out", "service", b.Name(),
+			"function", call.name, "tool_call_id", call.toolCallID, "timeout", timeout)
+		b.timeoutFunctionCall(ctx, call)
+	})
+	return func() { timer.Stop() }
+}
+
+// timeoutFunctionCall cancels a call that ran past its deadline.
+//
+// A deadline is the one cancellation nothing else follows up on, so it asks for
+// inference: without it the model never learns the call is over and the user is
+// left waiting on an answer that never comes. An interruption does not ask,
+// because the user is talking; a cancellation the model requested does not
+// either, because the result of the tool that requested it runs inference
+// already.
+func (b *Base) timeoutFunctionCall(ctx context.Context, call *functionCall) {
+	b.callsMu.Lock()
+	if call.settled {
+		// It reported while the deadline was being processed, so there is
+		// nothing left to settle.
+		b.callsMu.Unlock()
+		return
+	}
+	// Settled before canceling, so a handler that notices its context is done
+	// and reports while unwinding cannot reopen a call the pipeline has stopped
+	// tracking.
+	call.settled = true
+	if b.calls[call.toolCallID] == call {
+		delete(b.calls, call.toolCallID)
+	}
+	b.callsMu.Unlock()
+
+	call.cancel()
+	b.broadcastFunctionCallCanceled(ctx, call, true)
+
+	b.eventsMu.RLock()
+	h := b.onCanceled
+	b.eventsMu.RUnlock()
+	b.notify(ctx, h, []frames.ToolCall{{ID: call.toolCallID, Name: call.name, Args: call.args}})
+}
+
+// broadcastFunctionCallCanceled settles a canceled call downstream, asking for
+// inference when runLLM says the cancellation is the last thing that will happen
+// to the call.
+func (b *Base) broadcastFunctionCallCanceled(
+	ctx context.Context, call *functionCall, runLLM bool,
+) {
+	_ = b.Broadcast(ctx, func() frames.Frame {
+		f := frames.NewFunctionCallCancelFrame(call.toolCallID, call.name)
+		f.RunLLM = runLLM
+		return f
+	})
+}
+
+// resultCallback builds the callback the handler reports through. It is bound to
+// the call rather than to a turn, so a result reports against the call that
+// produced it however much has happened since.
+func (b *Base) resultCallback(call *functionCall, item registryItem) FunctionCallResultCallback {
+	return func(ctx context.Context, result string, props *frames.FunctionCallResultProperties) error {
+		return b.settleCall(ctx, call, item, result, "", props)
+	}
+}
+
+// settleCall reports a result against a call. failure is what went wrong on a
+// call whose handler failed, and "" on one that returned: it travels on the
+// frame beside the result so a failed call is legible as one, where the result
+// itself only ever names the function. item is the registration the call runs
+// under.
+func (b *Base) settleCall(
+	ctx context.Context, call *functionCall, item registryItem, result, failure string,
+	props *frames.FunctionCallResultProperties,
+) error {
+	if !props.Final() && item.cancelOnInterruption {
+		slog.WarnContext(ctx, "intermediate result from a tool that is not asynchronous",
+			"service", b.Name(), "function", call.name, "tool_call_id", call.toolCallID)
+		return nil
+	}
+	// A handler can outlive its call and still hold this callback, so a late
+	// result is rejected here rather than broadcast for the aggregator to
+	// drop.
+	b.callsMu.Lock()
+	if call.settled {
+		b.callsMu.Unlock()
+		slog.WarnContext(ctx, "ignoring the result of a call that has already finished",
+			"service", b.Name(), "function", call.name, "tool_call_id", call.toolCallID)
+		return nil
+	}
+	var stop func()
+	if props.Final() {
+		call.settled = true
+		// Only a final result settles the call, so only a final result disarms
+		// the bound on how long it may take. An intermediate update leaves it
+		// armed: an update is not a result, and a handler that reports progress
+		// and then hangs would otherwise have bought itself unbounded time.
+		stop = call.stopTimeout
+	}
+	b.callsMu.Unlock()
+	if stop != nil {
+		stop()
+	}
+	return b.Broadcast(ctx, func() frames.Frame {
+		f := frames.NewFunctionCallResultFrame(call.toolCallID, call.name, call.args, result)
+		f.Properties = props
+		f.Error = failure
+		return f
+	})
+}
+
+// handleInterruptions cancels the calls in flight of every function registered
+// to be canceled on interruption. A call registered to survive an interruption
+// is left to finish. The user is talking, so a canceled call must not answer
+// over them, and no inference is asked for.
+func (b *Base) handleInterruptions(ctx context.Context) {
+	b.handlersMu.RLock()
+	var names []string
+	for name, item := range b.handlers {
+		if item.cancelOnInterruption {
+			names = append(names, name)
+		}
+	}
+	b.handlersMu.RUnlock()
+	slices.Sort(names)
+	for _, name := range names {
+		b.cancelFunctionCallTasks(ctx, func(call *functionCall) bool {
+			return call.item.name == name
+		}, "interruption", false)
+	}
+}
+
+// CancelFunctionCalls cancels every function call in flight, whether or not it
+// survives interruptions, and returns the calls it canceled.
+//
+// Each handler's context is canceled, the call is settled downstream as
+// canceled, and OnFunctionCallsCanceled is told. No inference runs for the
+// cancellations. reason is what triggered them, for the logs.
+//
+// An interruption cancels only the calls registered to be canceled by one; this
+// is how a caller lets go of the asynchronous ones too, when whoever asked for
+// the work has gone.
+func (b *Base) CancelFunctionCalls(ctx context.Context, reason string) []frames.ToolCall {
+	return b.cancelFunctionCallTasks(ctx, func(*functionCall) bool { return true }, reason, false)
+}
+
+// LLMWithBackendRole is a role a service can fill in a pairing of a
+// conversational frontend with a backend that does the work it hands off.
+type LLMWithBackendRole string
+
+// The roles of a pairing.
+const (
+	// RoleFrontend is the conversational LLM, which holds the conversation.
+	RoleFrontend LLMWithBackendRole = "frontend"
+	// RoleBackend is the LLM inside the backend worker.
+	RoleBackend LLMWithBackendRole = "backend"
+)
+
+// LLMWithBackendRoleObjector is implemented by a service that can say why it
+// cannot take a role in a pairing. *Base implements it, saying nothing.
+type LLMWithBackendRoleObjector interface {
+	// LLMWithBackendRoleObjection says why the service cannot take role, or ""
+	// when it can.
+	LLMWithBackendRoleObjection(role LLMWithBackendRole) string
+}
+
+// LLMWithBackendRoleObjection says why this service cannot take the given role
+// in a pairing of a frontend with a backend, or "" when it can.
+//
+// The pairing refuses the service with what this returns, so the objection says
+// what to do instead. Services that work in both roles, which is nearly all of
+// them, say nothing; a service that cannot fill one overrides this.
+func (b *Base) LLMWithBackendRoleObjection(LLMWithBackendRole) string { return "" }
+
+// IntermediateResultAcceptor is implemented by every service, through Base,
+// to say whether it delivers a tool's intermediate results to its model.
+type IntermediateResultAcceptor interface {
+	// AcceptsIntermediateFunctionCallResults reports whether intermediate
+	// results reach the model.
+	AcceptsIntermediateFunctionCallResults() bool
+}
+
+// AcceptsIntermediateFunctionCallResults reports whether this service delivers
+// a tool's intermediate results to the model. An intermediate result is one
+// reported with FunctionCallResultProperties.IsFinal false while the call keeps
+// running. A text service passes them on as context messages. A
+// speech-to-speech service has to map them onto whatever second channel its
+// provider offers, and not all of them have one; one that has none overrides
+// this and drops them with a warning.
+func (b *Base) AcceptsIntermediateFunctionCallResults() bool { return true }
+
+// cancelFunctionCallTasks cancels the calls in flight that match, and returns
+// them. Each handler's context is canceled so a cancel-aware handler runs its
+// cleanup, a FunctionCallCancelFrame is broadcast so the rest of the pipeline
+// settles the call, and OnFunctionCallsCanceled is told. runLLM says whether
+// inference should run once the canceled calls are settled in the conversation.
+func (b *Base) cancelFunctionCallTasks(
+	ctx context.Context, match func(*functionCall) bool, reason string, runLLM bool,
+) []frames.ToolCall {
+	b.callsMu.Lock()
+	var canceled []*functionCall
+	for id, call := range b.calls {
+		if !match(call) {
+			continue
+		}
+		// Settled before canceling, so a handler that catches its cancellation
+		// and reports a result while unwinding cannot reopen a call the pipeline
+		// has stopped tracking.
+		call.settled = true
+		delete(b.calls, id)
+		canceled = append(canceled, call)
+	}
+	b.callsMu.Unlock()
+	slices.SortFunc(canceled, func(x, y *functionCall) int {
+		return strings.Compare(x.toolCallID, y.toolCallID)
+	})
+
+	items := make([]frames.ToolCall, 0, len(canceled))
+	for _, call := range canceled {
+		slog.DebugContext(ctx, "canceling function call", "service", b.Name(),
+			"function", call.name, "tool_call_id", call.toolCallID, "reason", reason)
+		call.cancel()
+		b.broadcastFunctionCallCanceled(ctx, call, runLLM)
+		items = append(items, frames.ToolCall{ID: call.toolCallID, Name: call.name, Args: call.args})
+	}
+
+	b.eventsMu.RLock()
+	h := b.onCanceled
+	b.eventsMu.RUnlock()
+	b.notify(ctx, h, items)
+	return items
+}
+
+// CanGenerateMetrics reports that this service times inference and reports
+// the result, so the pipeline counts it when it collects the processors that
+// report metrics.
+func (b *Base) CanGenerateMetrics() bool { return true }

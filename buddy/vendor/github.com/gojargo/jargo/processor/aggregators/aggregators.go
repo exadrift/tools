@@ -1,0 +1,2926 @@
+// Package aggregators assembles the conversation around an LLM. The user
+// aggregator collects transcriptions into a user message and triggers the LLM;
+// the assistant aggregator collects the streamed response into an assistant
+// message. Both share one LLMContext, so the conversation accrues across turns.
+//
+// Place the user aggregator before the LLM and the assistant aggregator at the
+// end of the pipeline:
+//
+//	pipeline.New(input, stt, agg.User(), llm, tts, output, agg.Assistant())
+//
+// By default the user turn ends when the STT service finalizes a transcription.
+// With WithTurnTaking, the turn instead ends when a turntaking.Detector reports
+// end-of-turn (a UserStoppedSpeakingFrame), gated on having a finalized
+// transcript — so a Smart Turn model, not STT endpointing, decides when the bot
+// responds. Add the turntaking.Detector right after the input transport:
+//
+//	pipeline.New(input, detector, stt, agg.User(), llm, tts, output, agg.Assistant())
+package aggregators
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"maps"
+	"slices"
+	"sort"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gojargo/jargo/audio/vad"
+	"github.com/gojargo/jargo/audio/vad/controller"
+	"github.com/gojargo/jargo/expressive"
+	"github.com/gojargo/jargo/expressive/formatter"
+	"github.com/gojargo/jargo/frames"
+	"github.com/gojargo/jargo/processor"
+	"github.com/gojargo/jargo/processor/turns"
+	"github.com/gojargo/jargo/service/stt"
+	"github.com/gojargo/jargo/utils/text"
+)
+
+// The placeholder contents a tool-result message holds while its call has not
+// reported a result of its own. The one written while a call is still running is
+// frames.ToolResultInProgress, which lives beside the async-tool protocol
+// because summarization has to recognize it too.
+const (
+	// toolResultCanceled replaces the placeholder when the call is canceled.
+	// The spelling is the protocol's, not prose.
+	toolResultCanceled = frames.ToolResultCanceled
+	// toolResultCompleted stands in for a call that finished having produced no
+	// result of its own.
+	toolResultCompleted = frames.ToolResultCompleted
+)
+
+// The events the user half of a pair raises around each turn it collects.
+const (
+	// EventUserTurnStarted fires when the user's turn begins, carrying the
+	// turns.StartStrategy that decided it began.
+	//
+	//	events.On(agg.User().Events(), aggregators.EventUserTurnStarted,
+	//	    func(ctx context.Context, s turns.StartStrategy) { … })
+	EventUserTurnStarted = "on_user_turn_started"
+	// EventUserTurnStopped fires when the user's turn ends, carrying a
+	// UserTurnStopped describing what they said and which strategy decided the
+	// turn was over.
+	EventUserTurnStopped = "on_user_turn_stopped"
+	// EventUserTurnInferenceTriggered fires when a stop strategy decides there
+	// is enough to answer, which is usually but not always the moment the turn
+	// ends. It carries the turns.StopStrategy that decided.
+	EventUserTurnInferenceTriggered = "on_user_turn_inference_triggered"
+	// EventUserTurnStopTimeout fires when a turn was closed because no stop
+	// strategy decided it had ended. It carries no argument.
+	EventUserTurnStopTimeout = "on_user_turn_stop_timeout"
+	// EventUserTurnIdle fires when the user has said nothing for the configured
+	// idle timeout. It carries no argument.
+	EventUserTurnIdle = "on_user_turn_idle"
+	// EventUserTurnMessageAdded fires when the user's words are written to the
+	// conversation, carrying a UserTurnMessageAdded. A turn can write more than
+	// once, when an early inference answers part of it, so this fires per write
+	// where EventUserTurnStopped fires once per turn.
+	EventUserTurnMessageAdded = "on_user_turn_message_added"
+	// EventUserMuteStarted fires when the user becomes muted and their input
+	// stops reaching the bot. It carries no argument.
+	EventUserMuteStarted = "on_user_mute_started"
+	// EventUserMuteStopped fires when the user is unmuted. It carries no
+	// argument.
+	EventUserMuteStopped = "on_user_mute_stopped"
+	// EventUserBackchannel fires when the user acknowledges the bot without
+	// interrupting it, from a UserBackchannelFrame, carrying a UserBackchannel.
+	// The acknowledgment stays out of the conversation and its turn events.
+	EventUserBackchannel = "on_user_backchannel"
+)
+
+// UserBackchannel describes a short acknowledgment the user said while the bot
+// talks, such as "mhm", which stays out of the conversation.
+type UserBackchannel struct {
+	// Content is what the user said.
+	Content string
+	// Timestamp is when the user said it.
+	Timestamp string
+	// UserID identifies the user, and is empty when it is not known.
+	UserID string
+}
+
+// UserTurnStopped describes a user turn that has just ended.
+type UserTurnStopped struct {
+	// Strategy is the stop strategy that decided the turn was over. It is nil
+	// when nothing decided: a turn closed because no strategy did, or one closed
+	// by the session ending.
+	Strategy turns.StopStrategy
+	// Content is everything the user said during the turn, including whatever an
+	// earlier inference already answered. It is empty for a turn that said
+	// nothing.
+	Content string
+	// Timestamp is when the turn began, as ISO 8601.
+	Timestamp string
+	// UserID identifies the speaker, and is empty when the transcription service
+	// does not say who spoke.
+	UserID string
+	// Perception is the turn's final reading of how the user spoke, with
+	// expressive conversation on and a perception producer in the pipeline, or
+	// nil. Part of expressive conversation (alpha).
+	Perception []expressive.PerceptionSignal
+}
+
+// UserTurnMessageAdded describes a user message written to the conversation.
+type UserTurnMessageAdded struct {
+	// Content is the message that was written. It is the segment written now,
+	// not the whole turn: a turn answered early writes what it had, then writes
+	// the rest when it ends.
+	Content string
+	// Timestamp is when the turn began, as ISO 8601.
+	Timestamp string
+	// UserID identifies the speaker, and is empty when the transcription service
+	// does not say who spoke.
+	UserID string
+}
+
+// The events the assistant half of a pair raises around each turn it writes.
+const (
+	// EventAssistantTurnStarted fires when the bot's turn begins, which is the
+	// model starting to answer or, for an utterance spoken with no answer around
+	// it, that speech starting. It carries no argument.
+	//
+	//	events.On(agg.Assistant().Events(), aggregators.EventAssistantTurnStarted,
+	//	    func(ctx context.Context, _ any) { … })
+	EventAssistantTurnStarted = "on_assistant_turn_started"
+	// EventAssistantTurnStopped fires when the bot's turn ends, carrying an
+	// AssistantTurnStopped describing what it said.
+	//
+	//	events.On(agg.Assistant().Events(), aggregators.EventAssistantTurnStopped,
+	//	    func(ctx context.Context, t aggregators.AssistantTurnStopped) { … })
+	EventAssistantTurnStopped = "on_assistant_turn_stopped"
+	// EventAssistantThought fires when a reasoning model finishes a thought,
+	// carrying an AssistantThought with what it reasoned.
+	EventAssistantThought = "on_assistant_thought"
+	// EventAssistantBackchannel fires when the assistant starts saying text of
+	// type backchannel, such as a BotBackchannelFrame's, carrying an
+	// AssistantBackchannel. It stays out of the conversation and its turn
+	// events.
+	EventAssistantBackchannel = "on_assistant_backchannel"
+)
+
+// AssistantBackchannel describes a short acknowledgment the assistant said
+// while the user talks, such as "Mm-hmm.".
+type AssistantBackchannel struct {
+	// Content is what the assistant said.
+	Content string
+	// Timestamp is when the assistant started saying it, as ISO 8601.
+	Timestamp string
+}
+
+// AssistantThought is one completed piece of a reasoning model's thinking.
+type AssistantThought struct {
+	// Content is the thought, whole.
+	Content string
+	// Timestamp is when the thought began, as ISO 8601.
+	Timestamp string
+}
+
+// AssistantTurnStopped describes a bot turn that has just ended.
+type AssistantTurnStopped struct {
+	// Content is everything the bot said during the turn, as one message, which
+	// the context also records. It is empty for a turn that said nothing. With
+	// expressive conversation on, it is the words alone, while the context keeps
+	// the expression tags the LLM wrote.
+	Content string
+	// Interrupted reports whether the turn was cut off rather than finishing.
+	Interrupted bool
+	// Timestamp is when the turn began, as ISO 8601.
+	Timestamp string
+}
+
+// Pair is a user and assistant aggregator sharing one conversation context.
+type Pair struct {
+	context   *frames.LLMContext
+	user      *UserAggregator
+	assistant *AssistantAggregator
+}
+
+// Option configures an aggregator Pair.
+type Option func(*options)
+
+type options struct {
+	turns *turns.Config
+	// summarize configures the automatic summarization thresholds, and is nil
+	// when only on-demand summarization is wanted.
+	summarize *frames.AutoSummarizationConfig
+	// mute suppresses user input while the bot is engaged. It is separate from
+	// the turn configuration because muting the user and deciding when their
+	// turn ended are different things, and a pipeline can want either alone.
+	mute []turns.MuteStrategy
+	// vad configures voice-activity detection run inside the user aggregator,
+	// and is nil when the pipeline detects speech somewhere else.
+	vad *VADConfig
+	// toolChangeMessages announces a change of toolset to the model as a
+	// developer message.
+	toolChangeMessages bool
+	// realtime forces the speech-to-speech mode on or off; nil decides it from
+	// what the services say about themselves.
+	realtime *bool
+}
+
+// VADConfig configures the voice-activity detection a user aggregator runs.
+type VADConfig struct {
+	// Analyzer detects voice activity in the incoming audio. Required.
+	Analyzer vad.Analyzer
+	// AudioIdleTimeout is how long to wait, with the user speaking and no audio
+	// arriving at all, before taking the speech to have stopped. It covers the
+	// audio going away mid-utterance, a muted microphone being the usual case.
+	//
+	// Leave it nil for one second. A zero duration turns the watch off.
+	AudioIdleTimeout *time.Duration
+}
+
+// WithSummarization compresses the conversation automatically once it passes
+// either of the configured thresholds. Older turns are replaced by a summary
+// written into the conversation ahead of the messages kept back, so the model
+// keeps the history without carrying every message of it.
+//
+// Summarization runs beside the conversation rather than in the path of it, so
+// it never adds latency to a turn. Without this option the conversation is still
+// compressed on demand, whenever an frames.LLMSummarizeContextFrame is pushed
+// into the pipeline.
+//
+// The summary is generated by the pipeline's own LLM unless the configuration
+// names one of its own, which is how summarization is routed to a cheaper model
+// than the one carrying the conversation.
+func WithSummarization(cfg frames.AutoSummarizationConfig) Option {
+	return func(o *options) { o.summarize = &cfg }
+}
+
+// WithMuteStrategies suppresses the user's input while the bot is engaged: while
+// it is speaking, or while a tool call it is waiting on runs. Input that arrives
+// muted is dropped rather than queued, so the bot is not answered by something
+// the user said while it was not listening.
+//
+// The strategies are consulted for every frame, so each keeps up with the
+// conversation, and any one of them asking for silence is enough. A change of
+// state is announced to the pipeline as a UserMuteStarted or UserMuteStopped
+// frame, and raised as an event.
+//
+// It is independent of WithTurns: muting the user and deciding when their turn
+// ended are different questions.
+func WithMuteStrategies(strategies ...turns.MuteStrategy) Option {
+	return func(o *options) { o.mute = strategies }
+}
+
+// WithVAD detects voice activity inside the user aggregator rather than in a
+// processor of its own.
+//
+// The frames it produces are queued back into the aggregator rather than pushed
+// at a neighbor, so the turn strategies running here see the speech their own
+// detector heard.
+//
+// Use it when the aggregator is the only thing that needs the detection. Where a
+// transport, an interruption decision or a recorder needs it too, put a
+// vadproc.Processor after the input transport instead and leave this unset: the
+// detection is then done once, where everything downstream of it can see it.
+// Running both means analyzing the same audio twice.
+//
+// Muted input never reaches the detector, so a muted microphone does not read as
+// speech.
+func WithVAD(cfg VADConfig) Option {
+	return func(o *options) { o.vad = &cfg }
+}
+
+// WithToolChangeMessages announces a change of toolset to the model.
+//
+// On each LLMSetToolsFrame the aggregators diff the new toolset against the one
+// the conversation currently advertises and append a developer message naming
+// what was added and what was removed. It helps the model stay coherent across a
+// mid-conversation toolset change, and heads off several flavors of tool-call
+// hallucination: calling tools that have been removed, avoiding tools that have
+// been added back, and inventing output (made-up answers, or tool-call-shaped
+// text that is not a tool call) when no tool is available.
+//
+// Only the standard tools are diffed; tools written in one provider's own format
+// are left out of it.
+//
+// Both halves of the pair take part, which is what makes it work whichever of
+// them handles a given frame first. They share the conversation, so whichever
+// one gets there first writes the announcement and the other one's diff is
+// empty by the time it looks, and the message is written exactly once.
+func WithToolChangeMessages() Option {
+	return func(o *options) { o.toolChangeMessages = true }
+}
+
+// WithRealtimeServiceMode forces on or off the mode a pipeline driven by a
+// speech-to-speech service runs in.
+//
+// It is normally decided from the pipeline itself: a realtime LLM service says
+// so when it describes itself at start, and the mode turns on then. Pass this to
+// overrule that, on for a service that does not announce itself and off to keep
+// the cascaded behavior with one that does.
+//
+// The mode changes two things. The turn strategies lose their transcript
+// dependence, since the service is answering the audio and a transcript only
+// delays the turn. And the user's message is written to the conversation when
+// the assistant starts responding rather than when the turn ends, because a
+// realtime service delivers the user's transcript late, sometimes only after it
+// has begun answering.
+func WithRealtimeServiceMode(on bool) Option {
+	return func(o *options) { o.realtime = &on }
+}
+
+// WithTurns configures the turn taking the user aggregator drives.
+//
+// The aggregator always decides when the user's turn began and ended; this is
+// how the strategies it decides with, and the idle and mute settings around
+// them, are chosen. Without it the defaults stand.
+//
+// The strategies run inside the user aggregator, on the same frames and in the
+// same order as the aggregation. That is what makes the turn's own transcript
+// part of it: a turn ends because a transcript finalized, and were the decision
+// made in a processor of its own, the end-of-turn frame would be a system frame
+// racing ahead of the transcript that caused it and the user's last words would
+// be dropped from the message the model is given. Where the decision has to be
+// shared instead, put a turns.UserTurnProcessor in the pipeline and give this
+// aggregator turns.ExternalStrategies so it adopts what that decides.
+func WithTurns(cfg turns.Config) Option {
+	return func(o *options) { o.turns = &cfg }
+}
+
+// New builds a user/assistant aggregator pair around ctx.
+func New(ctx *frames.LLMContext, opts ...Option) *Pair {
+	var o options
+	for _, opt := range opts {
+		opt(&o)
+	}
+	mute := o.mute
+	if o.turns != nil && len(o.turns.MuteStrategies) > 0 {
+		mute = append(append([]turns.MuteStrategy(nil), mute...), o.turns.MuteStrategies...)
+	}
+	user := newUser(ctx, o.turns, mute, o.vad, o.toolChangeMessages, o.realtime)
+	assistant := newAssistant(ctx, o.summarize, o.toolChangeMessages, o.realtime)
+	// The assistant half needs to know which user half it belongs to, so a
+	// proposal that reaches it can be stopped when that half resolves it.
+	assistant.pairedUser = user
+	return &Pair{context: ctx, user: user, assistant: assistant}
+}
+
+// User returns the user-side aggregator.
+func (p *Pair) User() *UserAggregator { return p.user }
+
+// Assistant returns the assistant-side aggregator.
+func (p *Pair) Assistant() *AssistantAggregator { return p.assistant }
+
+// Context returns the shared conversation context.
+func (p *Pair) Context() *frames.LLMContext { return p.context }
+
+// UserAggregator collects transcriptions into a user message and, when the
+// user's turn ends, appends it to the context and triggers the LLM with an
+// LLMContextFrame.
+//
+// When turn strategies are configured it also drives them, and the idle
+// watchdog, from this same processor: every frame is folded into the
+// aggregation first and only then handed to the controllers, so a turn that
+// ends on a finalized transcript ends with that transcript already in the
+// message.
+type UserAggregator struct {
+	*processor.Base
+	context *frames.LLMContext
+	// toolChangeMessages announces a change of toolset to the model.
+	toolChangeMessages bool
+	// provided are the turn strategies the application configured itself, nil
+	// when it configured none. They replace what a service recommends, unless
+	// strategiesParams extends a list, which they are then added to.
+	provided         *turns.UserTurnStrategies
+	strategiesParams turns.UserTurnStrategiesParams
+
+	turn *turns.UserTurnController
+	idle *turns.UserIdleController
+	// vad detects voice activity for the strategies running here, and is nil
+	// when the pipeline detects speech somewhere else.
+	vad *controller.Controller
+
+	muteStrategies []turns.MuteStrategy
+	muteMu         sync.Mutex
+	muted          bool
+
+	mu sync.Mutex
+	// aggregation is what the user has said so far this turn, in the order they
+	// said it. Each piece records whether it carries its own spacing, because a
+	// transcription service may deliver either kind and joining them all the
+	// same way either doubles the spaces or runs the words together.
+	aggregation []text.Part
+	// turnStartedAt is when the open turn began, as ISO 8601, and is what every
+	// report of the turn is stamped with.
+	turnStartedAt string
+	// wholeTurn is everything the turn has said across every write it has made.
+	// A turn answered early writes what it had and empties the aggregation, so
+	// without this the report of the turn ending would carry only the tail.
+	wholeTurn string
+	// userID is who the transcription service said was speaking, carried on what
+	// the turn reports.
+	userID string
+	// realtime is whether the pipeline is driven by a speech-to-speech service,
+	// nil until something says so. See WithRealtimeServiceMode.
+	realtime *bool
+	// realtimeHandled records that a realtime service has already announced
+	// itself, so the mode turns on and is logged exactly once.
+	realtimeHandled bool
+	// ttfsP99 is the transcript latency the last transcription service published,
+	// which is how long a late transcript is waited for before the user's message
+	// is written in realtime mode. Nil until one is published, when the default
+	// applies; zero means no wait.
+	ttfsP99 *time.Duration
+	// handoffCancel stops the deferred write armed when the assistant began
+	// answering, and is nil when none is armed.
+	handoffCancel func()
+	// sessionCtx is the session the processor was set up with, so the deferred
+	// write has a context to push its frames on.
+	sessionCtx context.Context //nolint:containedctx // the session, held for a timer
+	// emptyUserTurn is how a user turn ending with no transcript is answered,
+	// nil when it is not.
+	emptyUserTurn *turns.EmptyUserTurnConfig
+	// turnInterruptedBot is whether the current user turn interrupted the bot.
+	turnInterruptedBot bool
+	// emptyTurnRecoveries is how many empty turns in a row have been answered.
+	emptyTurnRecoveries int
+	// turnAnswerVoided is whether the user speaking again voided the answer to
+	// words already in the conversation. Without new words, the turn's next
+	// inference recovers it like an empty user turn that interrupted the bot.
+	turnAnswerVoided bool
+	// expressive is whether the pipeline has expressive conversation on
+	// (alpha), which is what writes how the user spoke into the conversation.
+	expressive bool
+	// perception is the latest final reading of how the user spoke, for the
+	// user message, written at its head. turnPerception is the same reading
+	// for the turn, reported when it stops: a turn can write several messages.
+	perception     []expressive.PerceptionSignal
+	turnPerception []expressive.PerceptionSignal
+}
+
+func newUser(
+	ctx *frames.LLMContext, cfg *turns.Config, mute []turns.MuteStrategy, vadCfg *VADConfig,
+	toolChangeMessages bool, realtime *bool,
+) *UserAggregator {
+	// The turn controllers always exist. Deciding when the user's turn began and
+	// ended is what this processor is for, and a pipeline that configures no
+	// strategies gets the default chains rather than no turn taking at all.
+	if cfg == nil {
+		cfg = &turns.Config{}
+	}
+	u := &UserAggregator{
+		context:            ctx,
+		toolChangeMessages: toolChangeMessages,
+		muteStrategies:     mute,
+		strategiesParams:   cfg.StrategiesParams,
+		realtime:           realtime,
+	}
+	strategies := cfg.Strategies
+	if len(cfg.Strategies.Start) > 0 || len(cfg.Strategies.Stop) > 0 {
+		provided := cfg.Strategies
+		u.provided = &provided
+		// No service has recommended strategies yet, so an extending list joins
+		// the defaults.
+		strategies = provided.MergeWith(nil, cfg.StrategiesParams)
+	}
+	u.Base = processor.New("UserContextAggregator", u)
+	u.emptyUserTurn = &turns.EmptyUserTurnConfig{}
+	if cfg.EmptyUserTurn != nil {
+		c := *cfg.EmptyUserTurn
+		u.emptyUserTurn = &c
+	}
+	// Only when the mode was asked for outright. Left to be decided from the
+	// services, the mutation waits for the one that announces itself, which is
+	// also where it is applied on top of any strategies a service recommends.
+	if realtime != nil && *realtime {
+		// The mode applies to the default chains as much as to configured ones,
+		// so the defaults are filled in first: left empty, they would be filled
+		// in later with the transcription start the mode drops.
+		strategies.FillDefaults()
+		u.mutateForRealtime(&strategies)
+		u.disableEmptyUserTurnRecovery()
+	}
+	if vadCfg != nil {
+		u.vad = newVADController(u, *vadCfg)
+	}
+	// All asynchronous: a handler may do anything, and the turn must not wait on
+	// whatever is listening to it.
+	for _, name := range []string{
+		EventUserTurnStarted, EventUserTurnStopped, EventUserTurnInferenceTriggered,
+		EventUserTurnStopTimeout, EventUserTurnIdle, EventUserTurnMessageAdded,
+		EventUserMuteStarted, EventUserMuteStopped, EventUserBackchannel,
+	} {
+		u.Events().Register(name, false)
+	}
+	u.turn = turns.NewUserTurnControllerWithParams(strategies, cfg.StrategiesParams, cfg.StopTimeout)
+	// The event fires alongside the configured callback, so something watching
+	// the aggregator hears about an idle conversation without having to be the
+	// one thing the pipeline was built with.
+	onIdle := func(ctx context.Context, c *turns.UserIdleController) error {
+		u.Events().Call(ctx, EventUserTurnIdle, u)
+		if cfg.OnIdle == nil {
+			return nil
+		}
+		return cfg.OnIdle(ctx, c)
+	}
+	u.idle = turns.NewUserIdleController(turns.IdleConfig{Timeout: cfg.IdleTimeout, Callback: onIdle})
+	u.turn.SetHooks(turns.ControllerHooks{
+		Started:             u.onTurnStarted,
+		Stopped:             u.onTurnStopped,
+		InferenceTriggered:  u.onInferenceTriggered,
+		SpeculationCanceled: u.onSpeculationCanceled,
+		Resumed:             u.onTurnResumed,
+		StopTimeout:         u.onStopTimeout,
+		ResetAggregation:    u.onResetAggregation,
+		Push: func(ctx context.Context, f frames.Frame, dir processor.Direction) {
+			// Queued, not pushed: a frame a strategy emits has to travel through
+			// this processor like any other, so the aggregation and the rest of
+			// the strategies see it. Pushing it at a neighbor would send it past
+			// the very things it was emitted to reach.
+			_ = u.QueueFrame(ctx, f, dir)
+		},
+		Broadcast: u.queuedBroadcast,
+	})
+	return u
+}
+
+// newVADController builds the detector the aggregator runs, wired so everything
+// it produces is queued back into the aggregator rather than pushed at a
+// neighbor.
+//
+// Queueing is what makes the detection reach the strategies at all. A frame
+// pushed at a neighbor leaves this processor without ever being handled by it,
+// so the turn controller running here would never see the speech its own
+// detector heard. Queued, it arrives like any other frame and is handled in
+// turn. The copy going the other way is pushed, since there is nothing on this
+// side of the pipeline waiting for it.
+func newVADController(u *UserAggregator, cfg VADConfig) *controller.Controller {
+	return controller.New(cfg.Analyzer, controller.Handlers{
+		OnSpeechStarted: func(ctx context.Context) {
+			startSecs := u.vad.Params().StartSecs
+			// Taken once, outside the builder, so the frame sent each way reports
+			// the same moment.
+			ts := time.Now()
+			u.queuedBroadcast(ctx, func() frames.Frame {
+				return frames.NewVADUserStartedSpeakingFrame(startSecs, ts)
+			})
+		},
+		OnSpeechStopped: func(ctx context.Context) {
+			stopSecs := u.vad.Params().StopSecs
+			ts := time.Now()
+			u.queuedBroadcast(ctx, func() frames.Frame {
+				return frames.NewVADUserStoppedSpeakingFrame(stopSecs, ts)
+			})
+		},
+		OnSpeechActivity: func(ctx context.Context) {
+			u.queuedBroadcast(ctx, func() frames.Frame { return frames.NewUserSpeakingFrame() })
+		},
+		OnPushFrame: func(ctx context.Context, f frames.Frame, dir processor.Direction) {
+			_ = u.QueueFrame(ctx, f, dir)
+		},
+		OnBroadcastFrame: u.queuedBroadcast,
+	}, controller.Config{AudioIdleTimeout: cfg.AudioIdleTimeout})
+}
+
+// Setup wires the controllers.
+func (u *UserAggregator) Setup(ctx context.Context, s processor.Setup) error {
+	if err := u.Base.Setup(ctx, s); err != nil {
+		return err
+	}
+	u.mu.Lock()
+	u.sessionCtx = ctx
+	u.expressive = s.EnableExpressiveConversation
+	u.mu.Unlock()
+	if u.vad != nil {
+		if err := u.vad.Setup(s); err != nil {
+			return err
+		}
+	}
+	if err := u.turn.Setup(ctx, s); err != nil {
+		return err
+	}
+	u.idle.Setup(ctx, u)
+	return nil
+}
+
+// handleLifecycle brings the controllers up and takes them down around the
+// session, and reports whether the frame was one of the three that do so.
+//
+// The controllers' timers belong to the session: there is no audio to go missing
+// and no turn to stall until it starts, and once it is over they can only report
+// what ending looks like rather than anything real.
+func (u *UserAggregator) handleLifecycle(
+	ctx context.Context, f frames.Frame, dir processor.Direction,
+) (bool, error) {
+	switch f.(type) {
+	case *frames.StartFrame:
+		// Forwarded before the controllers come up, so the frame reaches
+		// everything downstream before any parameters they announce.
+		if err := u.PushFrame(ctx, f, dir); err != nil {
+			return true, err
+		}
+		u.startControllers(ctx)
+		return true, nil
+
+	case *frames.EndFrame:
+		// The session is over, so whatever the user said last is committed
+		// rather than lost with the processor. It happens after the frame has
+		// been forwarded, so the end of the pipeline is not held up behind it.
+		if err := u.PushFrame(ctx, f, dir); err != nil {
+			return true, err
+		}
+		u.commitOnSessionEnd(ctx)
+		u.stopControllers()
+		return true, nil
+
+	case *frames.CancelFrame:
+		// Same, the other way round: a cancel tears the pipeline down at once, so
+		// what is held is committed before the frame that stops everything.
+		u.commitOnSessionEnd(ctx)
+		u.stopControllers()
+		return true, u.PushFrame(ctx, f, dir)
+	}
+	return false, nil
+}
+
+// commitOnSessionEnd writes whatever the user said last rather than losing it
+// with the processor.
+//
+// In speech-to-speech mode the turn was already reported when it ended, and only
+// the writing was left pending, so the pending write is taken now and the turn
+// is not reported a second time.
+func (u *UserAggregator) commitOnSessionEnd(ctx context.Context) {
+	if u.realtimeMode() {
+		u.realtimeHandoffNow(ctx)
+		return
+	}
+	u.reportTurnStopped(ctx, nil, true, false, u.turn.Process)
+}
+
+// startControllers brings the controllers up for the session, which is where the
+// timers that watch it belong: there is no audio to go missing and no turn to
+// stall until the session has started.
+func (u *UserAggregator) startControllers(ctx context.Context) {
+	if u.vad != nil {
+		u.vad.Start(ctx)
+	}
+}
+
+// stopControllers stops the controllers' timers at the end of the session. Left
+// running they report what ending looks like rather than anything real: no audio
+// arrives, no turn finishes, the user is idle. What they hold, the detector and
+// the strategies, may be shared and is released in Cleanup instead.
+func (u *UserAggregator) stopControllers() {
+	if u.vad != nil {
+		u.vad.Stop()
+	}
+	u.turn.Stop()
+	u.idle.Stop()
+	u.mu.Lock()
+	u.cancelHandoff()
+	u.mu.Unlock()
+}
+
+// Cleanup releases what the controllers hold. It is the one call that happens
+// exactly once, which is why releasing a shared detector or strategy belongs
+// here rather than at the end of the session.
+func (u *UserAggregator) Cleanup(ctx context.Context) error {
+	if u.vad != nil {
+		u.vad.Cleanup()
+	}
+	u.turn.Cleanup()
+	u.idle.Cleanup()
+	return u.Base.Cleanup(ctx)
+}
+
+// ProcessFrame collects transcriptions and triggers the LLM.
+//
+// The frame is handled first and only then given to the turn and idle
+// controllers, so anything the frame contributes to the aggregation is already
+// there when a strategy decides the turn ended on it.
+func (u *UserAggregator) ProcessFrame(ctx context.Context, f frames.Frame, dir processor.Direction) error {
+	if err := u.Base.ProcessFrame(ctx, f, dir); err != nil {
+		return err
+	}
+	// A muted frame is dropped outright: the controllers must not see input the
+	// user is not allowed to give.
+	if u.suppressed(ctx, f) {
+		return nil
+	}
+	err := u.handleFrame(ctx, f, dir)
+	// Detection runs after the frame has been handled and forwarded, so the
+	// speaking frames it raises are queued behind this one and reach the
+	// strategies in order with it.
+	if u.vad != nil {
+		if verr := u.vad.ProcessFrame(ctx, f); verr != nil {
+			return verr
+		}
+	}
+	u.turn.Process(f)
+	u.idle.Process(f)
+	return err
+}
+
+// handleFrame folds one frame into the aggregation and forwards it.
+func (u *UserAggregator) handleFrame(ctx context.Context, f frames.Frame, dir processor.Direction) error {
+	if handled, err := u.handleLifecycle(ctx, f, dir); handled {
+		return err
+	}
+
+	switch fr := f.(type) {
+	case *frames.InterimTranscriptionFrame, *frames.TranslationFrame, *frames.EagerTranscriptionFrame:
+		// Consumed here, like the final transcript below: partial speech is not
+		// aggregated either, and the turn strategies that read it run inside this
+		// processor. What is downstream is the model, which is given the
+		// conversation rather than the transcripts it was built from.
+		//
+		// A translation is consumed for the same reason and never aggregated:
+		// only the transcription is the user's own words, so a provider that
+		// reports both must not have the turn counted twice.
+		//
+		// So is the transcript of a predicted end of turn: the strategies that
+		// speculate on it are fed every frame after this, and anything further
+		// down acting on it would act on a turn that may yet be withdrawn.
+		return nil
+
+	case *frames.TranscriptionFrame:
+		return u.handleTranscription(fr)
+
+	case *frames.UserBackchannelFrame:
+		u.Events().Call(ctx, EventUserBackchannel, u,
+			UserBackchannel{Content: fr.Text, Timestamp: fr.Timestamp, UserID: fr.UserID})
+		return u.PushFrame(ctx, f, dir)
+
+	case *frames.LLMRunFrame:
+		// Explicit trigger: run the LLM on the current context now (e.g. to make
+		// the bot speak first), bypassing the turn-completion gating. The frame
+		// is consumed and turned into the LLMContextFrame the LLM service runs.
+		return u.PushFrame(ctx, frames.NewLLMContextFrame(u.context), processor.Downstream)
+
+	case *frames.LLMMessagesAppendFrame, *frames.LLMMessagesUpdateFrame,
+		*frames.LLMMessagesTransformFrame, *frames.LLMSetToolsFrame,
+		*frames.LLMSetToolChoiceFrame:
+		return u.handleContextUpdate(ctx, f, dir)
+
+	case *frames.ProposedUserStartedSpeakingFrame:
+		// A proposal is resolved once. Forwarding one our own strategies resolve
+		// would let a resolver further down the pipeline decide the same turn a
+		// second time.
+		if u.resolvesProposedStarts() {
+			return nil
+		}
+		return u.PushFrame(ctx, f, dir)
+
+	case *frames.ProposedUserStoppedSpeakingFrame:
+		if u.resolvesProposedStops() {
+			return nil
+		}
+		return u.PushFrame(ctx, f, dir)
+
+	default:
+		if md, ok := f.(frames.ServiceMetadata); ok {
+			u.handleServiceMetadata(md)
+		}
+		return u.PushFrame(ctx, f, dir)
+	}
+}
+
+// resolvesProposedStarts reports whether the turn strategies running here take
+// proposed turn starts as theirs to decide.
+func (u *UserAggregator) resolvesProposedStarts() bool {
+	return u.turn.ResolvesProposedTurnStartFrames()
+}
+
+// resolvesProposedStops is the end-of-turn counterpart.
+func (u *UserAggregator) resolvesProposedStops() bool {
+	return u.turn.ResolvesProposedTurnStopFrames()
+}
+
+// handleServiceMetadata acts on a service describing itself as the pipeline
+// starts. Any service may recommend turn strategies, whatever kind of service it
+// is, so that is applied first, and the frame travels on either way.
+func (u *UserAggregator) handleServiceMetadata(md frames.ServiceMetadata) {
+	u.handleServiceUserTurnStrategies(md.Service(), md.RecommendedUserTurnStrategies())
+
+	switch fr := md.(type) {
+	case *frames.LLMServiceMetadataFrame:
+		u.handleLLMServiceMetadata(fr)
+	case *frames.STTMetadataFrame:
+		// How long a late transcript is waited for before the user's message is
+		// written in realtime mode. A realtime service publishes it for the
+		// transcription it runs inside itself.
+		u.mu.Lock()
+		u.ttfsP99 = &fr.TTFSP99Latency
+		u.mu.Unlock()
+	}
+}
+
+// handleLLMServiceMetadata turns the speech-to-speech mode on for a service that
+// says it is one, and strips the transcript dependence from the strategies in
+// force.
+//
+// The mode is decided once, but the strategies are mutated on every broadcast: a
+// switcher making another service the active one re-applies the recommendation,
+// and the mutation has to be re-applied on top of it. Updating the strategies is
+// idempotent, so re-applying costs nothing.
+func (u *UserAggregator) handleLLMServiceMetadata(fr *frames.LLMServiceMetadataFrame) {
+	if !fr.Realtime {
+		return
+	}
+
+	u.mu.Lock()
+	if !u.realtimeHandled {
+		u.realtimeHandled = true
+		if u.realtime == nil {
+			on := true
+			u.realtime = &on
+			slog.Debug("a realtime service announced itself, so the pipeline runs in "+
+				"speech-to-speech mode", "processor", u.Name(), "service", fr.Service())
+		}
+	}
+	on := u.realtime != nil && *u.realtime
+	u.mu.Unlock()
+
+	// Turned off deliberately, which is the application's call to make.
+	if !on {
+		return
+	}
+
+	u.disableEmptyUserTurnRecovery()
+
+	strategies := u.turn.Strategies()
+	if !u.mutateForRealtime(&strategies) {
+		return
+	}
+	if err := u.turn.UpdateStrategies(strategies); err != nil {
+		slog.Error("could not apply the speech-to-speech turn strategies",
+			"processor", u.Name(), "err", err)
+	}
+}
+
+// mutateForRealtime strips the transcript dependence from the chains and reports
+// whether anything changed. Strategies the application configured itself are
+// worth saying out loud, since the change is not what it asked for.
+func (u *UserAggregator) mutateForRealtime(s *turns.UserTurnStrategies) bool {
+	dropped, flipped := s.ApplyRealtimeServiceMode()
+	if len(dropped) == 0 && len(flipped) == 0 {
+		return false
+	}
+	msg := "speech-to-speech mode: the turn strategies no longer wait on transcripts"
+	args := []any{
+		"processor", u.Name(),
+		"dropped", strings.Join(dropped, ", "),
+		"no_longer_waiting", strings.Join(flipped, ", "),
+	}
+	if u.provided != nil {
+		slog.Warn(msg, args...)
+	} else {
+		slog.Debug(msg, args...)
+	}
+	return true
+}
+
+// disableEmptyUserTurnRecovery turns off empty user turn recovery for realtime
+// mode. A realtime LLM service hears the user's audio directly, so an empty
+// transcript does not mean the model missed the speech.
+func (u *UserAggregator) disableEmptyUserTurnRecovery() {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.emptyUserTurn == nil {
+		return
+	}
+	u.emptyUserTurn = nil
+	slog.Debug("realtime mode: empty user turn recovery disabled; the realtime LLM service "+
+		"hears the user's audio directly", "processor", u.Name())
+}
+
+// realtimeMode reports whether the pipeline is driven by a speech-to-speech
+// service.
+func (u *UserAggregator) realtimeMode() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.realtime != nil && *u.realtime
+}
+
+// handleServiceUserTurnStrategies applies the turn strategies a service
+// recommends through its metadata.
+//
+// The application's own strategies replace them, except for a list its
+// UserTurnStrategiesParams extends, which the application's strategies are
+// added to. Updating is idempotent, so a later broadcast (a switcher making
+// another service the active one, say) can safely re-run it.
+func (u *UserAggregator) handleServiceUserTurnStrategies(service string, recommended any) {
+	if recommended == nil {
+		return
+	}
+	strategies, ok := recommended.(turns.UserTurnStrategies)
+	if !ok {
+		slog.Warn("the recommended user turn strategies are not turn strategies",
+			"processor", u.Name(), "service", service, "recommended", fmt.Sprintf("%T", recommended))
+		return
+	}
+	if u.provided != nil && u.strategiesParams.ReplacesServiceStrategies() {
+		slog.Debug("ignoring the user turn strategies a service recommends; "+
+			"the ones the application configured are used instead",
+			"processor", u.Name(), "service", service)
+		u.warnOnDiscardedInterruptionSetting(service, strategies)
+		return
+	}
+	slog.Debug("applying the user turn strategies a service recommends",
+		"processor", u.Name(), "service", service)
+	if u.provided != nil {
+		strategies = u.provided.MergeWith(&strategies, u.strategiesParams)
+	}
+	if err := u.turn.UpdateStrategies(strategies); err != nil {
+		slog.Error("could not apply the user turn strategies a service recommends",
+			"processor", u.Name(), "service", service, "err", err)
+	}
+}
+
+// warnOnDiscardedInterruptionSetting reports overruling a service in the one way
+// that silently turns interruptions back on.
+//
+// A service recommends turn strategies by putting them on its metadata frame,
+// and one built with interruptions off carries that setting there. Strategies
+// the application configured that replace both lists discard the
+// recommendation whole, so the pipeline would start interrupting with nothing
+// to say why.
+//
+// Only the external container is checked. Strategies assembled by hand around a
+// bare external start strategy contradict the service the same way and go
+// unwarned, which is not expected to come up often enough to justify inspecting
+// the individual strategies.
+func (u *UserAggregator) warnOnDiscardedInterruptionSetting(
+	service string, recommended turns.UserTurnStrategies,
+) {
+	wanted, isExternal := recommended.ExternalInterruptions()
+	if !isExternal || wanted {
+		return
+	}
+	provided, ok := u.provided.ExternalInterruptions()
+	if !ok || !provided {
+		return
+	}
+	slog.Warn("the service asked for interruptions to stay off, but the external turn "+
+		"strategies the application configured leave them on, so the bot will be "+
+		"interrupted when the user starts speaking; drop the configured strategies to "+
+		"use the service's recommendation, or configure them with interruptions off",
+		"processor", u.Name(), "service", service)
+}
+
+// handleContextUpdate applies a frame that mutates the shared LLM context.
+//
+// Only the toolset change is forwarded. A text LLM picks up a context change on
+// its next run, but a speech-to-speech service is generating continuously and
+// would never learn that the tools it may call had changed, so that one frame
+// travels on. The message changes are consumed: the aggregators share the
+// context, so a frame that reached one of them has already been applied, and
+// forwarding it would let the other apply it a second time.
+func (u *UserAggregator) handleContextUpdate(
+	ctx context.Context, f frames.Frame, dir processor.Direction,
+) error {
+	runLLM := false
+
+	switch fr := f.(type) {
+	case *frames.LLMMessagesAppendFrame:
+		// The turn-completion re-prompt appends a message to the context before a
+		// follow-up LLMRunFrame; a conversation flow appends the node's objective
+		// on entry.
+		u.appendMessages(fr.Messages)
+		runLLM = fr.RunLLM
+
+	case *frames.LLMMessagesUpdateFrame:
+		// Wholesale replacement of the conversation (restoring a saved session,
+		// resetting the conversation).
+		u.context.SetMessages(fr.Messages)
+		runLLM = fr.RunLLM
+
+	case *frames.LLMMessagesTransformFrame:
+		// Rewriting the conversation from what it currently is, which is what a
+		// wholesale replacement cannot express.
+		u.context.TransformMessages(fr.Transform)
+		runLLM = fr.RunLLM
+
+	case *frames.LLMSetToolsFrame:
+		maybeAddToolChangeMessages(u.toolChangeMessages, u.context, fr.Tools)
+		u.context.SetTools(fr.Tools)
+		// The one frame that travels on, for a speech-to-speech service that
+		// cannot pick the change up on a next run because it never stops running.
+		if err := u.PushFrame(ctx, f, dir); err != nil {
+			return err
+		}
+
+	case *frames.LLMSetToolChoiceFrame:
+		u.context.SetToolChoice(fr.ToolChoice)
+	}
+
+	if runLLM {
+		return u.PushFrame(ctx, frames.NewLLMContextFrame(u.context), processor.Downstream)
+	}
+	return nil
+}
+
+// appendMessages adds messages to the context as they were written. The role
+// each message carries is kept: a developer message is an out-of-band
+// instruction to the model and reads differently from something the user said,
+// and every adapter renders the distinction.
+func (u *UserAggregator) appendMessages(msgs []frames.Message) {
+	for _, m := range msgs {
+		u.context.AddMessage(m)
+	}
+}
+
+// handleTranscription folds one transcript into the aggregation. The frame is
+// consumed rather than forwarded: what the user said reaches the model as the
+// conversation, and a client is told about the transcript by the RTVI observer,
+// which watches it where the transcription service pushes it rather than
+// waiting for it to travel any further.
+func (u *UserAggregator) handleTranscription(fr *frames.TranscriptionFrame) error {
+	u.handlePerception(fr.Perception)
+	// Whitespace is not something the user said. A service that reports a final
+	// transcript of nothing but spaces would otherwise open a turn, commit it as
+	// a message and have the model answer it.
+	if strings.TrimSpace(fr.Text) == "" {
+		return nil
+	}
+	// A turn opened by a strategy is stamped when it opens. A transcript that
+	// arrives with no turn open stamps it here instead, so every report of the
+	// turn has a moment to carry.
+	u.mu.Lock()
+	if u.turnStartedAt == "" {
+		u.turnStartedAt = frames.NowTimestamp()
+	}
+	u.userID = fr.UserID
+	u.mu.Unlock()
+
+	u.aggregate(text.Part{Text: fr.Text, IncludesInterPartSpaces: fr.IncludesInterFrameSpaces})
+
+	// A transcript only adds to the aggregation. What is aggregated is committed
+	// when the turn controller says the turn is over, or when a stop strategy
+	// says there is enough to answer: a transcript on its own is not an end of
+	// turn, and one arriving after a turn closed is the beginning of the next one
+	// rather than a second answer to the one that just ended.
+	return nil
+}
+
+// handlePerception folds a final transcription's reading of how the user spoke
+// into the readings kept, with expressive conversation on: for the user message
+// and for the turn. A later reading in the same turn is merged in, keeping the
+// higher of each (see expressive.MergePerception), so a reading taken early in a
+// long turn is not lost. It is folded in under the turn controller's lock, as
+// the transcript is.
+func (u *UserAggregator) handlePerception(signals []expressive.PerceptionSignal) {
+	u.mu.Lock()
+	on := u.expressive
+	u.mu.Unlock()
+	if !on || len(signals) == 0 {
+		return
+	}
+	u.turn.Locked(func() {
+		u.mu.Lock()
+		defer u.mu.Unlock()
+		u.perception = expressive.MergePerception(u.perception, signals)
+		u.turnPerception = expressive.MergePerception(u.turnPerception, signals)
+	})
+}
+
+// withPerception is the user message for what was said: the reading of how the
+// user spoke at its head, when there is one.
+func withPerception(said string, perception []expressive.PerceptionSignal) string {
+	if len(perception) == 0 {
+		return said
+	}
+	return expressive.FormatPerception(perception) + " " + said
+}
+
+// aggregate folds a transcript into what the turn has said so far.
+//
+// It runs under the turn controller's lock. Ending a turn
+// commits the aggregation twice: once when a stop strategy says there is enough
+// to answer, and again when it finalizes, so that anything the user added
+// between the two still reaches the model. Both run from the strategy's timer,
+// under that lock, and a transcript folded in between them would be committed on
+// its own: a second user message holding the tail of a sentence, and a second
+// inference answering it. A streaming service is entitled to deliver one
+// utterance as several final transcripts, so this is speech arriving as
+// expected, not a fault. Taking the lock puts the transcript either side of the
+// pair rather than inside it.
+func (u *UserAggregator) aggregate(part text.Part) {
+	fold := func() {
+		u.mu.Lock()
+		defer u.mu.Unlock()
+		u.aggregation = append(u.aggregation, part)
+	}
+	u.turn.Locked(fold)
+}
+
+// maybeRun commits the aggregated user message and triggers the LLM on it.
+// Nothing is committed when the user has said nothing since the last time.
+//
+// With turn taking it is called only from the turn controller's hooks, which
+// are the sole authority on when the aggregation becomes a message. Without turn
+// taking a finalized transcript alone suffices.
+func (u *UserAggregator) maybeRun(ctx context.Context, feed func(frames.Frame)) (string, error) {
+	return u.commitTurn(ctx, true, feed)
+}
+
+// commitTurn writes what the user said to the conversation and, when runLLM is
+// set, asks the model to answer it.
+//
+// A turn confirming a speculation writes the message and does not ask: the reply
+// was generated already, from the eager transcript, and is waiting on the turn
+// frame this turn end emits.
+//
+// feed hands the turn controller the LLMContextFrame that asks, so a stop
+// strategy that waits for the turn's inference, such as LLMTurnCompletionStop,
+// waits for that one. A caller inside one of the controller's hooks passes its
+// ProcessFromHook, and any other its Process.
+//
+// With nothing new to write after the user speaking again voided the answer to
+// the words already written, it recovers that answer like an empty user turn
+// that interrupted the bot.
+func (u *UserAggregator) commitTurn(ctx context.Context, runLLM bool, feed func(frames.Frame)) (string, error) {
+	u.mu.Lock()
+	parts := u.aggregation
+	u.aggregation = nil
+	startedAt, userID := u.turnStartedAt, u.userID
+	perception := u.perception
+	if len(parts) > 0 {
+		u.perception = nil
+	}
+	u.mu.Unlock()
+
+	said := text.Concatenate(parts)
+	if said == "" {
+		u.mu.Lock()
+		voided := runLLM && u.turnAnswerVoided
+		if voided {
+			u.turnAnswerVoided = false
+		}
+		u.mu.Unlock()
+		if voided {
+			u.maybeRecoverEmptyUserTurn(ctx, true, feed)
+		}
+		return "", nil
+	}
+	u.context.AddUserMessage(withPerception(said, perception))
+	if err := u.Broadcast(ctx, func() frames.Frame {
+		turn := frames.NewLLMContextUserTurnFrame(said, startedAt)
+		turn.Perception = perception
+		return turn
+	}); err != nil {
+		return said, err
+	}
+	var err error
+	if runLLM {
+		err = u.runLLM(ctx, feed)
+	}
+	u.Events().Call(ctx, EventUserTurnMessageAdded, u,
+		UserTurnMessageAdded{Content: said, Timestamp: startedAt, UserID: userID})
+	return said, err
+}
+
+// runLLM pushes the conversation for the turn's inference, and hands the frame
+// that runs it to the turn controller through feed.
+func (u *UserAggregator) runLLM(ctx context.Context, feed func(frames.Frame)) error {
+	u.mu.Lock()
+	u.turnAnswerVoided = false
+	u.mu.Unlock()
+	f := frames.NewLLMContextFrame(u.context)
+	err := u.PushFrame(ctx, f, processor.Downstream)
+	// A stop strategy that waits for the inference, such as
+	// LLMTurnCompletionStop, waits for this one.
+	if feed != nil {
+		feed(f)
+	}
+	return err
+}
+
+// AssistantAggregator collects the LLM's streamed text into a single assistant
+// message and appends it to the context when the response completes. If the
+// response is interrupted (barge-in), the partial text gathered so far is
+// committed so the context reflects what the bot actually said. The response
+// fields are touched from both the process goroutine (text frames) and the
+// input goroutine (the InterruptionFrame system frame), so they are
+// mutex-guarded.
+type AssistantAggregator struct {
+	*processor.Base
+	context *frames.LLMContext
+	// expressive is whether the pipeline has expressive conversation on (alpha):
+	// the context keeps the expression tags the LLM wrote, and what the turn is
+	// reported to have said is the words alone.
+	expressive bool
+	// taggedAfterLLM is whether a tagger after the LLM writes the replies'
+	// expression tags, announced by an ExpressionMetadataFrame. The LLM, never
+	// taught them, then reads its replies back as plain words. Guarded by mu.
+	taggedAfterLLM bool
+	// toolChangeMessages announces a change of toolset to the model.
+	toolChangeMessages bool
+	// pairedUser is the user half this one was built with, so a proposal this
+	// half sees can be stopped when the user half is the one resolving it, and
+	// so the user's message can be written as this half starts answering.
+	pairedUser *UserAggregator
+	// realtime is whether the pipeline is driven by a speech-to-speech service,
+	// nil until something says so. The user half owns the strategies; this half
+	// needs the flag only to know when to hand the user's message over.
+	realtime *bool
+	// summarizer compresses the conversation once it has grown long. It is
+	// always present, so an on-demand LLMSummarizeContextFrame is always
+	// honored; the automatic thresholds are what WithSummarization enables.
+	summarizer *Summarizer
+
+	mu sync.Mutex
+	// seenMarkers are the turn-completion markers that have arrived on marker
+	// frames, so a service using a set other than the defaults still has them
+	// stripped from the transcript.
+	seenMarkers map[string]struct{}
+	// aggregation is what the turn has said so far, in the order it was said:
+	// the model's own text where that is what reaches the conversation, and the
+	// playback-aligned words a word-timestamp TTS reports where it is not. The
+	// two kinds space themselves differently, so each piece carries the answer
+	// and the join respects it.
+	aggregation []text.Part
+	// turnStartedAt is when the open assistant turn began, and empty when no turn
+	// is open. A turn opens on the model's response starting, or, for an
+	// utterance the service speaks with no response around it, on the start of
+	// that speech. It doubles as the flag because a turn is reported with the
+	// moment it began, so the two can never disagree.
+	turnStartedAt string
+	// inProgress holds every tool call of the current turn that has not reported
+	// a final result yet, keyed by tool call id. The value is nil between the
+	// FunctionCallsStartedFrame that announced the call and the
+	// FunctionCallInProgressFrame that starts it.
+	inProgress map[string]*frames.FunctionCallInProgressFrame
+	// userSpeaking and botSpeaking track who holds the floor. A tool result that
+	// arrives while the user is speaking never re-runs generation, and one that
+	// arrives while the bot is speaking defers it until the bot finishes.
+	userSpeaking bool
+	botSpeaking  bool
+	// pushOnBotStopped records a deferred re-run, so several results arriving
+	// while the bot speaks are answered by a single inference once it stops.
+	pushOnBotStopped bool
+	// contextPushOwed records that a tool result or an appended message asked to
+	// run inference and the push has not happened yet: it was held for results or
+	// appends still queued, or for a user who is speaking. Whichever result or
+	// append is handled once the way is clear makes the push, whatever its own
+	// request says. A run that starts meanwhile, such as the one the user's turn
+	// brings, settles it, since that run sees the conversation as it stands. A
+	// user turn with nothing in it brings no run, so the push stays owed until the
+	// next arrival.
+	contextPushOwed bool
+
+	// thought is the reasoning being streamed now, and the moment it began. A
+	// thought is kept apart from the turn's own text: it is the model reasoning
+	// with itself, so it is never spoken and never joins what the bot said.
+	thought        []text.Part
+	thoughtStarted string
+	// thoughtToContext and thoughtLLM record whether the thought being streamed
+	// is written to the conversation, and as whose provider's native message.
+	thoughtToContext bool
+	thoughtLLM       string
+
+	// Lifetime of the context-updated callbacks, which run off the frame path.
+	// Cleanup cancels them and waits for them to return.
+	taskCtx    context.Context
+	taskCancel context.CancelFunc
+	taskWG     sync.WaitGroup
+}
+
+func newAssistant(
+	ctx *frames.LLMContext, sc *frames.AutoSummarizationConfig, toolChangeMessages bool,
+	realtime *bool,
+) *AssistantAggregator {
+	a := &AssistantAggregator{
+		context:            ctx,
+		toolChangeMessages: toolChangeMessages,
+		inProgress:         make(map[string]*frames.FunctionCallInProgressFrame),
+		realtime:           realtime,
+	}
+	// The summarizer exists whether or not the thresholds are enabled, so a
+	// pushed LLMSummarizeContextFrame is always acted on; sc is what decides
+	// whether it also triggers on its own.
+	cfg := frames.NewAutoSummarizationConfig()
+	if sc != nil {
+		cfg = *sc
+	}
+	a.summarizer = NewSummarizer(ctx, cfg, sc != nil)
+	a.summarizer.Add(EventRequestSummarization, a.onRequestSummarization)
+	a.Base = processor.New("AssistantContextAggregator", a)
+	// Both run on their own goroutine: a handler may do anything, and a turn
+	// beginning or ending must not be held up by whatever is listening for it.
+	a.Events().Register(EventAssistantTurnStarted, false)
+	a.Events().Register(EventAssistantTurnStopped, false)
+	a.Events().Register(EventAssistantThought, false)
+	a.Events().Register(EventAssistantBackchannel, false)
+	return a
+}
+
+// Summarizer is the conversation summarizer this aggregator owns, for attaching
+// handlers to the events it raises.
+func (a *AssistantAggregator) Summarizer() *Summarizer { return a.summarizer }
+
+// onRequestSummarization puts a summary request to the LLM service. It travels
+// upstream, which is where the service sits relative to the assistant half of
+// the pair.
+func (a *AssistantAggregator) onRequestSummarization(ctx context.Context, _ any, args ...any) {
+	request, ok := args[0].(*frames.LLMContextSummaryRequestFrame)
+	if !ok {
+		return
+	}
+	if err := a.PushFrame(ctx, request, processor.Upstream); err != nil {
+		slog.Error("putting the summary request to the LLM failed", "error", err)
+	}
+}
+
+// HasFunctionCallsInProgress reports whether any tool call of the current turn
+// has yet to report a final result.
+//
+// It is what tells something waiting on the whole batch, rather than on one
+// call, that the turn's calls are done: a caller acting on a tool result in its
+// context-updated callback reads this to know whether it is the last one, since
+// acting while siblings are still running would act on a half-finished turn.
+func (a *AssistantAggregator) HasFunctionCallsInProgress() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return len(a.inProgress) > 0
+}
+
+// HasSynchronousFunctionCallsInProgress reports whether a synchronous call is
+// in flight, one whose result the model waits for.
+//
+// A synchronous call leaves the context without its result until it returns,
+// so the model cannot run in the meantime; an asynchronous one (registered with
+// CancelOnInterruption false) has a placeholder result in the context and the
+// model runs on. A call announced but not yet started counts as synchronous.
+func (a *AssistantAggregator) HasSynchronousFunctionCallsInProgress() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, started := range a.inProgress {
+		if started == nil || started.CancelOnInterruption {
+			return true
+		}
+	}
+	return false
+}
+
+// Setup opens the lifetime the context-updated callbacks run under.
+func (a *AssistantAggregator) Setup(ctx context.Context, s processor.Setup) error {
+	if err := a.Base.Setup(ctx, s); err != nil {
+		return err
+	}
+	a.expressive = s.EnableExpressiveConversation
+	a.taskCtx, a.taskCancel = context.WithCancel(ctx)
+	return nil
+}
+
+// Cleanup cancels the context-updated callbacks and the summarization in
+// flight, and waits for them to return.
+func (a *AssistantAggregator) Cleanup(ctx context.Context) error {
+	a.releaseWork(ctx)
+	return a.Base.Cleanup(ctx)
+}
+
+// ProcessFrame collects LLM text into an assistant message.
+func (a *AssistantAggregator) ProcessFrame(ctx context.Context, f frames.Frame, dir processor.Direction) error {
+	if err := a.Base.ProcessFrame(ctx, f, dir); err != nil {
+		return err
+	}
+	if mf, ok := f.(*frames.LLMMarkerFrame); ok {
+		return a.handleMarker(ctx, mf)
+	}
+	if _, ok := f.(*frames.ExpressionMetadataFrame); ok {
+		a.mu.Lock()
+		a.taggedAfterLLM = true
+		a.mu.Unlock()
+	}
+	if handled, err := a.handleContextUpdate(ctx, f); handled {
+		return err
+	}
+	return a.route(ctx, f, dir)
+}
+
+// route folds one frame into the turn being aggregated and forwards it. It is
+// split from ProcessFrame so each stays readable: this is the frame taxonomy,
+// ProcessFrame is the sideband handling that runs ahead of it.
+func (a *AssistantAggregator) route(ctx context.Context, f frames.Frame, dir processor.Direction) error {
+	switch fr := f.(type) {
+	case *frames.LLMServiceMetadataFrame:
+		a.noteRealtimeService(fr)
+	case *frames.LLMFullResponseStartFrame:
+		// A new response is the run an owed push was waiting for: it reads the
+		// conversation as it stands, so nothing is owed after it.
+		a.mu.Lock()
+		a.contextPushOwed = false
+		a.mu.Unlock()
+		// A realtime service delivers the user's transcript late, sometimes only
+		// once it has begun answering, so the answer starting is what stands in
+		// for the end of the user's turn where the conversation is written.
+		a.armUserMessageHandoff()
+		a.openTurn(ctx)
+	case *frames.TTSStartedFrame:
+		// Speech that will be recorded opens a turn of its own when none is open.
+		// It is how an utterance the service speaks, with no response around it to
+		// mark where the turn begins, still gets one, while deferring to a turn the
+		// model already started.
+		if fr.AppendToContext {
+			a.openTurn(ctx)
+		}
+	case *frames.TextFrame, *frames.LLMTextFrame, *frames.TTSTextFrame, *frames.AggregatedTextFrame:
+		a.reportBackchannel(ctx, f)
+		a.routeText(f)
+	case *frames.LLMThoughtStartFrame, *frames.LLMThoughtTextFrame, *frames.LLMThoughtEndFrame:
+		a.routeThought(ctx, f)
+		return nil
+	case *frames.LLMAssistantPushAggregationFrame, *frames.LLMFullResponseEndFrame,
+		*frames.EndFrame, *frames.CancelFrame, *frames.InterruptionFrame:
+		a.writeUserMessageBeforeClosing(ctx, f)
+		if err := a.closeTurn(ctx, f); err != nil {
+			return err
+		}
+	case *frames.LLMRunFrame:
+		// An explicit request to run the model, pushed down at this half rather
+		// than up at the user half: the LLM service's own re-prompt after an
+		// incomplete turn is the one that arrives here. The service sits
+		// upstream of this processor, so the run it asks for has to travel back
+		// the other way. The frame is consumed, since running the model is what
+		// it asked for and nothing beyond this processor acts on it.
+		return a.pushContextFrame(ctx, processor.Upstream)
+	case *frames.FunctionCallsStartedFrame, *frames.FunctionCallInProgressFrame,
+		*frames.FunctionCallResultFrame, *frames.FunctionCallCancelFrame:
+		// Consumed, not forwarded. This aggregator is where a tool call becomes
+		// conversation, and it is the last processor in the pipeline, so there is
+		// nothing beyond it to tell. Every other consumer is reached by the LLM
+		// service broadcasting each of these frames upstream as well as down: the
+		// idle watchdog and the mute strategies run inside the user aggregator, and
+		// an RTVI processor sits between the LLM and the output.
+		return a.handleFunctionCallFrame(ctx, f)
+	case *frames.UserStartedSpeakingFrame, *frames.UserStoppedSpeakingFrame,
+		*frames.BotStartedSpeakingFrame, *frames.BotStoppedSpeakingFrame:
+		return a.handleSpeakingState(ctx, f, dir)
+	case *frames.ProposedUserStartedSpeakingFrame, *frames.ProposedUserStoppedSpeakingFrame:
+		if a.userHalfResolves(f) {
+			return nil
+		}
+	}
+	return a.pass(ctx, f, dir)
+}
+
+// pass forwards a frame route is done with, unless it stops here, and shows it
+// to the summarizer, which watches the conversation from beside the aggregator
+// and sees each frame once it has gone on, or been consumed, so compressing
+// never delays a turn.
+func (a *AssistantAggregator) pass(ctx context.Context, f frames.Frame, dir processor.Direction) error {
+	if !consumedHere(f) {
+		if err := a.PushFrame(ctx, f, dir); err != nil {
+			return err
+		}
+	}
+	a.summarizer.ProcessFrame(ctx, f)
+	return nil
+}
+
+// consumedHere reports whether f stops at the assistant aggregator: it is
+// where the reply's text and the response around it become conversation, and
+// nothing beyond it is told them a second time.
+func consumedHere(f frames.Frame) bool {
+	switch f.(type) {
+	case *frames.LLMFullResponseStartFrame, *frames.LLMFullResponseEndFrame,
+		*frames.LLMAssistantPushAggregationFrame,
+		*frames.TextFrame, *frames.LLMTextFrame, *frames.TTSTextFrame, *frames.AggregatedTextFrame:
+		return true
+	}
+	return false
+}
+
+// routeThought folds one piece of a reasoning model's thinking into the thought
+// being collected. The frames are consumed: a thought is reported as a whole
+// when it ends, and what the model reasoned is not what it said.
+func (a *AssistantAggregator) routeThought(ctx context.Context, f frames.Frame) {
+	switch fr := f.(type) {
+	case *frames.LLMThoughtStartFrame:
+		a.startThought(fr)
+	case *frames.LLMThoughtTextFrame:
+		a.aggregateThought(fr)
+	case *frames.LLMThoughtEndFrame:
+		a.endThought(ctx, fr)
+	}
+}
+
+// userHalfResolves reports whether the paired user half is the one resolving
+// this proposal.
+//
+// A broadcast sends a copy each way, so a proposal from a service sitting
+// between the two halves reaches the user half as the upstream copy while this
+// copy travels on. A proposal is resolved once, so it stops here when the user
+// half resolves it. No ordinary pipeline has a resolver downstream of this half,
+// so this guards the rule rather than fixing an escape that has been seen.
+func (a *AssistantAggregator) userHalfResolves(f frames.Frame) bool {
+	if a.pairedUser == nil {
+		return false
+	}
+	switch f.(type) {
+	case *frames.ProposedUserStartedSpeakingFrame:
+		return a.pairedUser.resolvesProposedStarts()
+	case *frames.ProposedUserStoppedSpeakingFrame:
+		return a.pairedUser.resolvesProposedStops()
+	}
+	return false
+}
+
+// closeTurn ends the assistant turn, for each of the things that ends one.
+//
+// A response ending and an utterance ending are the turn finishing. An
+// interruption and a cancellation cut it off, so what the bot said is not what
+// it meant to say, and the turn is reported as interrupted. The session ending
+// closes the turn out where it stands rather than losing it with the processor.
+func (a *AssistantAggregator) closeTurn(ctx context.Context, f frames.Frame) error {
+	switch f.(type) {
+	case *frames.EndFrame, *frames.CancelFrame:
+		_, canceled := f.(*frames.CancelFrame)
+		err := a.commit(ctx, canceled)
+		// The session is over, so what was running beside the conversation stops
+		// here rather than waiting for teardown: a callback still running would
+		// otherwise act on a conversation nothing is left to carry.
+		a.releaseWork(ctx)
+		return err
+	case *frames.InterruptionFrame:
+		// Whatever the bot already said is kept. The tool calls still running are
+		// left alone: each already has a placeholder result in the context, so the
+		// turn is balanced as it stands, and the LLM service resolves them by
+		// canceling the calls it registered to cancel.
+		return a.commitInterrupted(ctx)
+	default:
+		return a.commit(ctx, false)
+	}
+}
+
+// releaseWork stops what the aggregator has running beside the conversation: the
+// context-updated callbacks a tool result started, and the summarizer. It is
+// idempotent, so the session ending and teardown can both run it.
+func (a *AssistantAggregator) releaseWork(ctx context.Context) {
+	if a.taskCancel != nil {
+		a.taskCancel()
+	}
+	a.taskWG.Wait()
+	a.summarizer.Cleanup(ctx)
+}
+
+// reportBackchannel reports a backchannel the assistant starts saying. It is
+// reported once, by the segment the TTS service will speak, which the output
+// transport releases as its audio starts.
+func (a *AssistantAggregator) reportBackchannel(ctx context.Context, f frames.Frame) {
+	if agg, ok := f.(*frames.AggregatedTextFrame); ok &&
+		agg.TextType == frames.TextTypeBackchannel && agg.WillBeSpoken {
+		a.Events().Call(ctx, EventAssistantBackchannel, a,
+			AssistantBackchannel{Content: agg.Text, Timestamp: frames.NowTimestamp()})
+	}
+}
+
+// routeText folds one piece of the turn's text into the aggregation, taking each
+// kind of text frame for what it contributes to the conversation.
+func (a *AssistantAggregator) routeText(f frames.Frame) {
+	switch fr := f.(type) {
+	case *frames.LLMTextFrame:
+		// When a word-timestamp TTS drives the turn it excludes its text from the
+		// context (AppendToContext == false); the spoken words arrive as
+		// TTSTextFrames instead. Otherwise (the default) accumulate as before.
+		a.handleText(&fr.TextFrame, fr.Text)
+	case *frames.TTSTextFrame:
+		a.handleText(&fr.TextFrame, fr.Original())
+	case *frames.AggregatedTextFrame:
+		// A unit that is not spoken at all, a code block held back from the
+		// synthesizer, reaches the conversation as itself once the speech ahead of
+		// it has been said.
+		a.handleText(&fr.TextFrame, rawOrText(fr))
+	case *frames.TextFrame:
+		// Plain text put into the pipeline by something other than the model. It
+		// is part of the turn like anything else the bot says.
+		a.handleText(fr, fr.Text)
+	}
+}
+
+// startThought begins a new thought, discarding anything a previous one left.
+func (a *AssistantAggregator) startThought(fr *frames.LLMThoughtStartFrame) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.thought = nil
+	a.thoughtToContext = fr.AppendToContext
+	a.thoughtLLM = fr.LLM
+	a.thoughtStarted = frames.NowTimestamp()
+}
+
+// aggregateThought folds one chunk of reasoning into the thought being streamed.
+func (a *AssistantAggregator) aggregateThought(fr *frames.LLMThoughtTextFrame) {
+	if fr.Text == "" {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.thought = append(a.thought,
+		text.Part{Text: fr.Text, IncludesInterPartSpaces: fr.IncludesInterFrameSpaces})
+}
+
+// endThought closes the thought out: it is written to the conversation when the
+// provider asked for it back, and reported either way.
+//
+// A thought that is written goes in as that provider's own message, signature
+// and all, because only the provider it came from can make sense of it. Every
+// other provider skips a message that is not theirs.
+func (a *AssistantAggregator) endThought(ctx context.Context, fr *frames.LLMThoughtEndFrame) {
+	a.mu.Lock()
+	parts, startedAt := a.thought, a.thoughtStarted
+	toContext, llm := a.thoughtToContext, a.thoughtLLM
+	a.thought, a.thoughtStarted = nil, ""
+	a.mu.Unlock()
+
+	thought := text.Concatenate(parts)
+	if toContext {
+		a.context.AddMessage(frames.NewLLMSpecificMessage(llm, map[string]any{
+			"type":      "thought",
+			"text":      thought,
+			"signature": fr.Signature,
+		}))
+	}
+	a.Events().Call(ctx, EventAssistantThought, a,
+		AssistantThought{Content: thought, Timestamp: startedAt})
+}
+
+// handleMarker records a sideband marker the LLM service emitted.
+//
+// A marker that stands alone is the whole assistant turn, which is what an
+// incomplete-turn signal is: the spoken reply was suppressed and the marker is
+// the only thing that happened. A marker that does not is the prefix of a reply
+// still being aggregated, so it joins the aggregation and is written with the
+// text as one message.
+func (a *AssistantAggregator) handleMarker(ctx context.Context, fr *frames.LLMMarkerFrame) error {
+	// Recorded so a service configured with markers of its own still gets them
+	// stripped from the transcript: the defaults are known here, the rest is
+	// whatever has actually been seen.
+	a.mu.Lock()
+	if a.seenMarkers == nil {
+		a.seenMarkers = map[string]struct{}{}
+	}
+	a.seenMarkers[fr.Marker] = struct{}{}
+	a.mu.Unlock()
+
+	if fr.AppendToContextImmediately {
+		// The conversation is announced downstream, as a written turn is, and not
+		// sent back to the model: the marker is the model's whole answer, so
+		// running the model on it would answer the same turn twice.
+		a.context.AddAssistantMessage(fr.Marker)
+		if err := a.pushContextFrame(ctx, processor.Downstream); err != nil {
+			return err
+		}
+		return a.PushFrame(ctx,
+			frames.NewLLMContextAssistantTimestampFrame(frames.NowTimestamp()), processor.Downstream)
+	}
+	a.mu.Lock()
+	a.aggregation = append(a.aggregation, text.Part{Text: fr.Marker, IncludesInterPartSpaces: false})
+	a.mu.Unlock()
+	return nil
+}
+
+// markersSeen is every marker that has arrived on a marker frame, so a set other
+// than the defaults is stripped from the transcript too.
+// stripSeenMarkers removes every marker seen so far on a marker frame from
+// text, wherever it appears. Only those: a marker character in a reply whose
+// markers never came as frames is content, a bullet say, and is reported as
+// written. Text nothing was removed from is returned as it came; text something
+// was removed from is trimmed.
+func stripSeenMarkers(text string, seen []string) string {
+	found := false
+	for _, marker := range seen {
+		if marker != "" && strings.Contains(text, marker) {
+			text = strings.ReplaceAll(text, marker, "")
+			found = true
+		}
+	}
+	if !found {
+		return text
+	}
+	return strings.TrimSpace(text)
+}
+
+func (a *AssistantAggregator) markersSeen() []string {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return slices.Collect(maps.Keys(a.seenMarkers))
+}
+
+// handleContextUpdate applies a conversation change arriving from this side of
+// the pipeline, reporting whether it was one. Both halves of the pair handle
+// these, and both consume them: they share the conversation, so a frame that
+// reached one of them has been applied and must not travel on to the other.
+func (a *AssistantAggregator) handleContextUpdate(ctx context.Context, f frames.Frame) (bool, error) {
+	switch fr := f.(type) {
+	case *frames.LLMMessagesAppendFrame:
+		return true, a.handleMessagesAppend(ctx, fr)
+	case *frames.LLMMessagesUpdateFrame:
+		return true, a.handleMessagesUpdate(ctx, fr)
+	case *frames.LLMMessagesTransformFrame:
+		return true, a.handleMessagesTransform(ctx, fr)
+	case *frames.LLMSetToolsFrame:
+		// Consumed here. The user half forwards this one so a continuously
+		// running service learns of the change, which is what brings it this far;
+		// the two halves share the conversation, so applying it again settles
+		// nothing new and it stops here.
+		maybeAddToolChangeMessages(a.toolChangeMessages, a.context, fr.Tools)
+		a.context.SetTools(fr.Tools)
+		return true, nil
+	case *frames.LLMSetToolChoiceFrame:
+		a.context.SetToolChoice(fr.ToolChoice)
+		return true, nil
+	}
+	return false, nil
+}
+
+// handleMessagesAppend adds messages to the conversation from this side of the
+// pipeline, and runs the model on them when asked. It is what the LLM service's
+// own re-prompt reaches: the service pushes it downstream, so it arrives here
+// rather than at the user aggregator, and the run it asks for has to travel back
+// upstream to the service.
+//
+// A run it asks for is treated as a tool result's is: held while the bot speaks,
+// owed while the user speaks, and bundled with the appends and results queued
+// behind it. Run at once, a message appended mid-sentence would run the model on
+// a conversation that lacks the answer in progress, and the model would answer
+// it again.
+//
+// The frame is consumed, like its counterpart on the user side, so a
+// conversation both halves share is never appended to twice.
+func (a *AssistantAggregator) handleMessagesAppend(ctx context.Context, fr *frames.LLMMessagesAppendFrame) error {
+	for _, m := range fr.Messages {
+		a.context.AddMessage(m)
+	}
+	return a.settleRunRequest(ctx, fr.RunLLM)
+}
+
+// settleRunRequest records a request to run inference from a tool result or an
+// appended message, and makes the push if one is owed and the user does not
+// hold the floor. A push owed while the user speaks waits: the run their turn
+// brings settles it, or else the next result or append to arrive makes it.
+func (a *AssistantAggregator) settleRunRequest(ctx context.Context, runLLM bool) error {
+	a.mu.Lock()
+	if runLLM {
+		a.contextPushOwed = true
+	}
+	push := a.contextPushOwed && !a.userSpeaking
+	a.mu.Unlock()
+	if !push {
+		return nil
+	}
+	return a.maybePushContext(ctx)
+}
+
+// handleMessagesUpdate replaces the conversation from this side of the pipeline,
+// and runs the model on it when asked.
+func (a *AssistantAggregator) handleMessagesUpdate(ctx context.Context, fr *frames.LLMMessagesUpdateFrame) error {
+	a.context.SetMessages(fr.Messages)
+	if !fr.RunLLM {
+		return nil
+	}
+	return a.pushContextFrame(ctx, processor.Upstream)
+}
+
+// handleMessagesTransform rewrites the conversation from this side of the
+// pipeline, and runs the model on it when asked.
+func (a *AssistantAggregator) handleMessagesTransform(
+	ctx context.Context, fr *frames.LLMMessagesTransformFrame,
+) error {
+	a.context.TransformMessages(fr.Transform)
+	if !fr.RunLLM {
+		return nil
+	}
+	return a.pushContextFrame(ctx, processor.Upstream)
+}
+
+// handleText folds one piece of the turn's text into the aggregation. original
+// is what the piece contributes to the conversation, which for a spoken word is
+// its written form rather than the pronunciation handed to the synthesizer.
+//
+// A piece that says it does not belong in the conversation is dropped here. That
+// is how a turn driven by a word-timestamp TTS keeps the model's own text out:
+// the text arrives saying so, and the words the synthesizer actually spoke
+// arrive later saying the opposite, which is what makes an interruption leave
+// exactly the words that were heard.
+func (a *AssistantAggregator) handleText(fr *frames.TextFrame, original string) {
+	// The text as the LLM wrote it, which a unit that is only tags has without
+	// any words to show. Spaces count, too.
+	if !fr.AppendToContext || original == "" {
+		return
+	}
+	a.mu.Lock()
+	a.aggregation = append(a.aggregation,
+		text.Part{Text: original, IncludesInterPartSpaces: fr.IncludesInterFrameSpaces})
+	a.mu.Unlock()
+}
+
+// rawOrText returns what an aggregated unit contributes to the conversation: its
+// original written form where it has one, such as a code block with its
+// delimiters, and its text otherwise.
+func rawOrText(fr *frames.AggregatedTextFrame) string {
+	if fr.RawText != "" {
+		return fr.RawText
+	}
+	return fr.Text
+}
+
+// handleFunctionCallFrame applies one frame of a tool call's life to the
+// conversation. The four arrive on two different goroutines: the two system
+// frames as they are queued, the other two in turn behind the frames of the turn
+// they belong to.
+func (a *AssistantAggregator) handleFunctionCallFrame(ctx context.Context, f frames.Frame) error {
+	switch fr := f.(type) {
+	case *frames.FunctionCallsStartedFrame:
+		a.handleFunctionCallsStarted(fr)
+	case *frames.FunctionCallInProgressFrame:
+		a.handleFunctionCallInProgress(fr)
+	case *frames.FunctionCallResultFrame:
+		return a.handleFunctionCallResult(ctx, fr)
+	case *frames.FunctionCallCancelFrame:
+		return a.handleFunctionCallCancel(ctx, fr)
+	}
+	return nil
+}
+
+// handleFunctionCallsStarted records the announced calls as awaiting results. It
+// writes nothing to the context: each call's own FunctionCallInProgressFrame
+// writes its tool-use block and the placeholder answering it, which is what keeps
+// the conversation balanced at every instant rather than only once the turn ends.
+func (a *AssistantAggregator) handleFunctionCallsStarted(fr *frames.FunctionCallsStartedFrame) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, c := range fr.Calls {
+		a.inProgress[c.ID] = nil
+	}
+}
+
+// handleFunctionCallInProgress writes the assistant message requesting this one
+// call, immediately followed by the message that answers it: a placeholder
+// result for an ordinary call, or an async-tool started message for a call the
+// model does not wait on. The pair is written together, so no inference can ever
+// read a tool-use block with nothing answering it.
+func (a *AssistantAggregator) handleFunctionCallInProgress(fr *frames.FunctionCallInProgressFrame) {
+	a.context.AddAssistantToolCall(frames.ToolCall{ID: fr.ToolCallID, Name: fr.ToolName, Args: fr.Args})
+	if fr.CancelOnInterruption {
+		a.context.AddToolResult(frames.ToolResult{
+			ID:      fr.ToolCallID,
+			Name:    fr.ToolName,
+			Content: frames.ToolResultInProgress,
+		})
+	} else {
+		a.context.AddMessage(frames.NewAsyncToolStartedMessage(fr.ToolCallID))
+	}
+	a.mu.Lock()
+	a.inProgress[fr.ToolCallID] = fr
+	a.mu.Unlock()
+}
+
+// handleFunctionCallResult applies one tool result to the context and decides
+// whether generation re-runs on it. A final result replaces the call's
+// placeholder in place, which is what keeps it next to the tool call it answers
+// however long the call took and whatever was appended meanwhile.
+func (a *AssistantAggregator) handleFunctionCallResult(
+	ctx context.Context, fr *frames.FunctionCallResultFrame,
+) error {
+	a.mu.Lock()
+	started, running := a.inProgress[fr.ToolCallID]
+	a.mu.Unlock()
+	if !running {
+		slog.WarnContext(ctx, "tool result for a call that is not running",
+			"processor", a.Name(), "tool", fr.ToolName, "tool_call_id", fr.ToolCallID)
+		return nil
+	}
+
+	if started == nil {
+		// The call was announced but has not begun: there is no tool-use block in
+		// the conversation yet, so there is nothing for this result to answer.
+		slog.WarnContext(ctx, "tool result for a call that is not in progress",
+			"processor", a.Name(), "tool", fr.ToolName, "tool_call_id", fr.ToolCallID)
+		return nil
+	}
+
+	groupID := started.GroupID
+	props := fr.Properties
+	if props.Final() {
+		a.finishFunctionCall(fr, started)
+	} else {
+		a.recordIntermediateResult(ctx, fr)
+	}
+
+	// A push owed by an earlier result or append is made here once the way is
+	// clear, whether or not this result asks to run: a burst can end with an
+	// intermediate result, or one that declines, and the run asked for earlier in
+	// it must not be lost.
+	if err := a.settleRunRequest(ctx, a.shouldRunLLM(fr, props, groupID)); err != nil {
+		return err
+	}
+
+	// The callback is told the context now holds the result. It runs off the
+	// frame path so that whatever it does cannot hold up the pipeline.
+	if props != nil && props.OnContextUpdated != nil {
+		a.runContextUpdated(props.OnContextUpdated)
+	}
+	return nil
+}
+
+// shouldRunLLM decides whether this result re-runs generation. An explicit
+// choice, from the properties or the frame, wins. Otherwise a call that belongs
+// to a group re-runs only as the last of its group to report, so a turn that
+// requested several calls answers once rather than once per call; a call with no
+// group re-runs on its own.
+func (a *AssistantAggregator) shouldRunLLM(
+	fr *frames.FunctionCallResultFrame, props *frames.FunctionCallResultProperties, groupID string,
+) bool {
+	if fr.Result == "" {
+		return false
+	}
+	switch {
+	case props != nil && props.RunLLM != nil:
+		return *props.RunLLM
+	case fr.RunLLM != nil:
+		return *fr.RunLLM
+	case groupID != "":
+		return !a.groupStillRunning(groupID, fr.ToolCallID)
+	default:
+		return true
+	}
+}
+
+// groupStillRunning reports whether a call of groupID other than exclude has yet
+// to report. exclude is the call reporting now, which an intermediate result
+// leaves in the map.
+func (a *AssistantAggregator) groupStillRunning(groupID, exclude string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for id, started := range a.inProgress {
+		if started != nil && started.GroupID == groupID && id != exclude {
+			return true
+		}
+	}
+	return false
+}
+
+// finishFunctionCall applies a call's final result and stops tracking it. A
+// result that settles in place replaces the call's placeholder; a deferred one
+// gets an async-tool final message appended instead, since by now the
+// conversation has moved past the point the placeholder sits at.
+func (a *AssistantAggregator) finishFunctionCall(
+	fr *frames.FunctionCallResultFrame, started *frames.FunctionCallInProgressFrame,
+) {
+	deferred := a.isDeferred(started)
+
+	a.mu.Lock()
+	delete(a.inProgress, fr.ToolCallID)
+	a.mu.Unlock()
+
+	result := fr.Result
+	if result == "" {
+		result = toolResultCompleted
+	}
+	if deferred {
+		// The conversation moved on while the call ran, so the model is told about
+		// the result in a developer message rather than in the tool result it has
+		// already read.
+		a.context.AddMessage(frames.NewAsyncToolFinalMessage(fr.ToolCallID, result))
+		return
+	}
+	a.context.UpdateToolResult(fr.ToolCallID, result)
+}
+
+// isDeferred reports whether a call's final result has to be delivered as a
+// deferred message rather than settled into the placeholder answering it.
+//
+// A call the model does not wait on (CancelOnInterruption false) whose result
+// arrives before the conversation moved on is indistinguishable from one it
+// waits on, and settles the same way: its started placeholder becomes the tool
+// result, and the model reads an ordinary call. The conversation alone decides.
+//
+// The result is deferred when a user or developer message follows the
+// placeholder: something the user said, new task instructions, or an
+// intermediate update from this call. Assistant messages are ignored, so filler
+// spoken with a TTSSpeakFrame while the call runs does not defer it, whoever
+// spoke it, and neither does text the model wrote after seeing the placeholder
+// with no user turn in between, as when an ungrouped sibling's result runs
+// generation. Other calls' placeholders, results and deferred messages are
+// ignored too, so parallel fast calls all settle in place. A placeholder that is
+// no longer in the conversation, because it was rebuilt while the call ran, also
+// defers.
+func (a *AssistantAggregator) isDeferred(started *frames.FunctionCallInProgressFrame) bool {
+	if started == nil || started.CancelOnInterruption {
+		return false
+	}
+	afterPlaceholder := false
+	for _, m := range a.context.Messages() {
+		if m.IsLLMSpecific() {
+			continue
+		}
+		if !afterPlaceholder {
+			afterPlaceholder = answersToolCall(m, started.ToolCallID)
+			continue
+		}
+		if len(m.ToolResults) > 0 || m.Role == frames.RoleAssistant {
+			// A sibling's placeholder or result, or assistant output.
+			continue
+		}
+		if p, ok := frames.ParseAsyncToolMessage(m); ok && p.ToolCallID != started.ToolCallID {
+			// A sibling's deferred update or result.
+			continue
+		}
+		return true
+	}
+	return !afterPlaceholder
+}
+
+// answersToolCall reports whether the message carries the result answering
+// toolCallID, which is the placeholder while the call is still running.
+func answersToolCall(m frames.Message, toolCallID string) bool {
+	for _, r := range m.ToolResults {
+		if r.ID == toolCallID {
+			return true
+		}
+	}
+	return false
+}
+
+// recordIntermediateResult appends an async-tool intermediate message, leaving
+// the call running. Only a call the model does not wait on reports these.
+func (a *AssistantAggregator) recordIntermediateResult(
+	ctx context.Context, fr *frames.FunctionCallResultFrame,
+) {
+	if fr.Result == "" {
+		slog.WarnContext(ctx, "intermediate tool result with no result",
+			"processor", a.Name(), "tool", fr.ToolName, "tool_call_id", fr.ToolCallID)
+		return
+	}
+	a.context.AddMessage(frames.NewAsyncToolIntermediateMessage(fr.ToolCallID, fr.Result))
+}
+
+// handleFunctionCallCancel settles a canceled call in the conversation, so the
+// tool-use block it answers stays answered rather than being left in progress
+// for the rest of the session.
+//
+// An ordinary call's placeholder is marked canceled where it sits. A call the
+// model does not wait on is settled with an async-tool message instead, the same
+// channel its results would have arrived on.
+//
+// The frame says whether inference follows. Only a call canceled by its own
+// deadline asks for it, and only then is there nothing else to run it: an
+// interruption must not answer over the user, and a cancellation the model asked
+// for is answered by the result of the tool that asked.
+func (a *AssistantAggregator) handleFunctionCallCancel(
+	ctx context.Context, fr *frames.FunctionCallCancelFrame,
+) error {
+	a.mu.Lock()
+	started, running := a.inProgress[fr.ToolCallID]
+	if !running {
+		a.mu.Unlock()
+		return nil
+	}
+	delete(a.inProgress, fr.ToolCallID)
+	sync := started == nil || started.CancelOnInterruption
+	groupID := ""
+	if started != nil {
+		groupID = started.GroupID
+	}
+	speaking := a.userSpeaking
+	a.mu.Unlock()
+
+	if sync {
+		a.context.UpdateToolResult(fr.ToolCallID, toolResultCanceled)
+	} else {
+		a.context.AddMessage(frames.NewAsyncToolCanceledMessage(fr.ToolCallID))
+	}
+
+	if !fr.RunLLM || speaking {
+		return nil
+	}
+	// Hold off while siblings from the same response are still running:
+	// whichever of them settles last runs inference, with this cancellation
+	// already in the conversation.
+	if groupID != "" && a.groupStillRunning(groupID, fr.ToolCallID) {
+		return nil
+	}
+	return a.maybePushContext(ctx)
+}
+
+// maybePushContext re-runs generation on the updated context after a tool call
+// settles or a message is appended, unless doing so now would produce an answer
+// that another result or append is about to make stale, or one spoken over the
+// bot's current turn.
+//
+// A cascaded LLM reads the new result out of the context frame; a realtime
+// service reads it out of the context the same way, since neither is handed the
+// result frame itself. The push is what carries the result to the model in both.
+func (a *AssistantAggregator) maybePushContext(ctx context.Context) error {
+	if a.HasQueuedFrame(isResultOrAppend) {
+		// More results or appends are already on their way. Leaving the push to
+		// the last of them answers the whole batch with one inference instead of
+		// one each. The push stays owed until it happens, so the last frame makes
+		// it whether or not that frame asks to run.
+		return nil
+	}
+
+	a.mu.Lock()
+	speaking := a.botSpeaking
+	if speaking {
+		// Deferred rather than dropped: BotStoppedSpeakingFrame pushes it. Results
+		// arriving meanwhile accumulate in the context and share this one push, so
+		// the bot answers once rather than talking over itself.
+		a.pushOnBotStopped = true
+	}
+	a.mu.Unlock()
+	if speaking {
+		return nil
+	}
+	return a.pushContextFrame(ctx, processor.Upstream)
+}
+
+// Developer-role messages written to the conversation when the toolset changes
+// under WithToolChangeMessages. The names are sorted, comma-separated and
+// wrapped in backticks.
+const (
+	toolActivationMessage = "The following function(s) have just been added and may now be called: " +
+		"%s. Any previously available functions remain available."
+	toolDeactivationMessage = "The following function(s) have just been removed and should not be called: " +
+		"%s. Any previously available functions remain available. " +
+		"The removed function(s) may become available again later, in which case " +
+		"you will be informed."
+)
+
+// maybeAddToolChangeMessages appends a developer message describing what the new
+// toolset adds and removes against the one the conversation currently
+// advertises.
+//
+// It does nothing unless the aggregator was built with WithToolChangeMessages,
+// and nothing when the diff is empty. Only the standard tools are diffed; tools
+// written in one provider's own format are ignored.
+//
+// Both halves call it on every LLMSetToolsFrame they handle. Whichever half
+// handles the frame first computes a real diff against the shared conversation
+// and writes the announcement; by the time the other one sees it, if it does at
+// all, the conversation already holds the new tools, so its diff is empty and no
+// second message is written. That holds whichever way the frame travels.
+func maybeAddToolChangeMessages(enabled bool, ctx *frames.LLMContext, newTools []frames.Tool) {
+	if !enabled {
+		return
+	}
+	names := func(tools []frames.Tool) map[string]struct{} {
+		out := make(map[string]struct{}, len(tools))
+		for _, t := range tools {
+			out[t.Name] = struct{}{}
+		}
+		return out
+	}
+	old, fresh := names(ctx.Tools()), names(newTools)
+	added, removed := missingFrom(fresh, old), missingFrom(old, fresh)
+	if len(added) == 0 && len(removed) == 0 {
+		return
+	}
+
+	var parts []string
+	if len(added) > 0 {
+		parts = append(parts, fmt.Sprintf(toolActivationMessage, quoteNames(added)))
+	}
+	if len(removed) > 0 {
+		parts = append(parts, fmt.Sprintf(toolDeactivationMessage, quoteNames(removed)))
+	}
+	ctx.AddMessage(frames.Message{Role: frames.RoleDeveloper, Text: strings.Join(parts, " ")})
+}
+
+// missingFrom returns the names in a that b does not have.
+func missingFrom(a, b map[string]struct{}) []string {
+	var out []string
+	for n := range a {
+		if _, ok := b[n]; !ok {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// quoteNames renders tool names the way the announcement lists them: sorted,
+// comma-separated and wrapped in backticks.
+func quoteNames(names []string) string {
+	sort.Strings(names)
+	quoted := make([]string, len(names))
+	for i, n := range names {
+		quoted[i] = "`" + n + "`"
+	}
+	return strings.Join(quoted, ", ")
+}
+
+// isResultOrAppend reports whether f is a tool result or an appended message,
+// for the queue check above.
+func isResultOrAppend(f frames.Frame) bool {
+	switch f.(type) {
+	case *frames.FunctionCallResultFrame, *frames.LLMMessagesAppendFrame:
+		return true
+	}
+	return false
+}
+
+// pushContextFrame pushes the current context in dir: upstream it runs
+// generation, downstream it announces the conversation as it now stands. Either
+// way it clears any deferred or owed push, since this one covers it.
+func (a *AssistantAggregator) pushContextFrame(ctx context.Context, dir processor.Direction) error {
+	a.mu.Lock()
+	a.pushOnBotStopped = false
+	a.contextPushOwed = false
+	a.mu.Unlock()
+	return a.PushFrame(ctx, frames.NewLLMContextFrame(a.context), dir)
+}
+
+// pushDeferredContext runs the generation a tool result deferred while the bot
+// was speaking. It stays deferred while the user is speaking, whose turn ends by
+// running the LLM anyway.
+func (a *AssistantAggregator) pushDeferredContext(ctx context.Context) error {
+	a.mu.Lock()
+	deferred := a.pushOnBotStopped && !a.userSpeaking
+	a.mu.Unlock()
+	if !deferred {
+		return nil
+	}
+	return a.pushContextFrame(ctx, processor.Upstream)
+}
+
+// runContextUpdated runs a result's context-updated callback on a goroutine of
+// its own, tracked so Cleanup can cancel it and wait for it.
+func (a *AssistantAggregator) runContextUpdated(fn func(ctx context.Context) error) {
+	taskCtx := a.taskCtx
+	if taskCtx == nil {
+		// Setup has not run, so there is no lifetime to attach to.
+		return
+	}
+	a.taskWG.Go(func() {
+		if err := fn(taskCtx); err != nil && taskCtx.Err() == nil {
+			slog.Error("tool result context-updated callback", "processor", a.Name(), "err", err)
+		}
+	})
+}
+
+// handleSpeakingState tracks who holds the floor, which is what tells a tool
+// result whether re-running generation now would talk over somebody. The bot
+// falling silent is also when a deferred re-run finally happens.
+func (a *AssistantAggregator) handleSpeakingState(
+	ctx context.Context, f frames.Frame, dir processor.Direction,
+) error {
+	a.mu.Lock()
+	switch f.(type) {
+	case *frames.UserStartedSpeakingFrame:
+		a.userSpeaking = true
+	case *frames.UserStoppedSpeakingFrame:
+		a.userSpeaking = false
+	case *frames.BotStartedSpeakingFrame:
+		a.botSpeaking = true
+	case *frames.BotStoppedSpeakingFrame:
+		a.botSpeaking = false
+	}
+	a.mu.Unlock()
+
+	if err := a.PushFrame(ctx, f, dir); err != nil {
+		return err
+	}
+	if _, stopped := f.(*frames.BotStoppedSpeakingFrame); !stopped {
+		return nil
+	}
+	return a.pushDeferredContext(ctx)
+}
+
+// openTurn marks an assistant turn open and reports that the bot has begun.
+// Opening one that is already open changes nothing: the turn belongs to the
+// response, not to each frame of it.
+func (a *AssistantAggregator) openTurn(ctx context.Context) {
+	a.mu.Lock()
+	if a.turnStartedAt != "" {
+		a.mu.Unlock()
+		return
+	}
+	a.turnStartedAt = frames.NowTimestamp()
+	a.mu.Unlock()
+	a.Events().Call(ctx, EventAssistantTurnStarted, a)
+}
+
+// commit closes the assistant turn out, writing what it said to the
+// conversation as one message and reporting the turn. A turn that was never
+// opened writes nothing, so text arriving with no turn around it waits for one
+// rather than landing on its own.
+//
+// interrupted says whether the turn was cut off rather than finishing, which is
+// what tells a consumer that what the bot said is not what it meant to say.
+func (a *AssistantAggregator) commit(ctx context.Context, interrupted bool) error {
+	a.mu.Lock()
+	startedAt := a.turnStartedAt
+	a.turnStartedAt = ""
+	a.mu.Unlock()
+	if startedAt == "" {
+		return nil
+	}
+
+	said, err := a.pushAggregation(ctx)
+	if err != nil {
+		return err
+	}
+	// What is reported is what the bot said, so the protocol markers that
+	// prefixed the reply come out. The conversation keeps them, since the model
+	// reads its own earlier verdicts back.
+	if said != "" {
+		said = stripSeenMarkers(said, a.markersSeen())
+	}
+	// The context keeps the expression tags the LLM wrote; the transcript is the
+	// words.
+	if said != "" && a.expressive {
+		said = formatter.StripExpressionTags(said)
+	}
+
+	a.Events().Call(ctx, EventAssistantTurnStopped, a, AssistantTurnStopped{
+		Content:     said,
+		Interrupted: interrupted,
+		Timestamp:   startedAt,
+	})
+
+	// A turn that said nothing is reported but not announced to the pipeline:
+	// there is no text for anything downstream to record.
+	if said == "" {
+		return nil
+	}
+	return a.Broadcast(ctx, func() frames.Frame {
+		return frames.NewLLMContextAssistantTurnFrame(said, startedAt)
+	})
+}
+
+// pushAggregation writes what the turn has said so far to the conversation,
+// empties the aggregation, and announces the conversation as it now stands. It
+// returns what was written, which is empty when nothing was said.
+//
+// The timestamp frame that follows marks when the message was written, for
+// anything building a transcript alongside the conversation.
+func (a *AssistantAggregator) pushAggregation(ctx context.Context) (string, error) {
+	a.mu.Lock()
+	parts := a.aggregation
+	a.aggregation = nil
+	taggedAfterLLM := a.taggedAfterLLM
+	a.mu.Unlock()
+
+	said := text.Concatenate(parts)
+	// The LLM writes its own replies' tags, or a tagger writes them and the
+	// LLM, never taught them, reads its replies as plain words.
+	if said != "" && a.expressive && taggedAfterLLM {
+		said = formatter.StripExpressionTags(said)
+	}
+	if said == "" {
+		// Nothing was written and nothing is pushed, so a run a tool result
+		// deferred or owes is kept for whatever releases it.
+		return "", nil
+	}
+	a.context.AddAssistantMessage(said)
+
+	// This covers whatever a tool result deferred or owes, so that run is
+	// dropped rather than repeated behind it.
+	if err := a.pushContextFrame(ctx, processor.Downstream); err != nil {
+		return said, err
+	}
+	return said, a.PushFrame(ctx,
+		frames.NewLLMContextAssistantTimestampFrame(frames.NowTimestamp()), processor.Downstream)
+}
+
+// commitInterrupted closes out a turn cut off by an interruption: whatever the
+// bot had said by then is committed, so the context reflects what was actually
+// heard, and anything left over is dropped rather than carried into the next
+// turn.
+//
+// It does no tool balancing. Every call in flight already has a message
+// answering it, written when the call started, so the context is valid as it
+// stands. A call the interruption cancels is resolved by its own cancel frame,
+// which marks that message canceled where it sits. Appending anything here
+// instead would put it after whatever a new user turn has meanwhile added,
+// separating a result from the call it answers for the rest of the session.
+func (a *AssistantAggregator) commitInterrupted(ctx context.Context) error {
+	err := a.commit(ctx, true)
+	a.mu.Lock()
+	a.aggregation = nil
+	a.pushOnBotStopped = false
+	a.contextPushOwed = false
+	a.mu.Unlock()
+	return err
+}
+
+// suppressed runs the mute strategies and reports whether this user-input frame
+// should be dropped. It emits UserMute frames on a change of state.
+//
+// Whether this frame is dropped is decided by the mute state as it stood before
+// the frame arrived, not by what the frame does to it. The frame that starts the
+// bot speaking is what mutes the user, and it is not itself user input; the
+// frame that unmutes them is likewise the bot falling silent. Deciding after the
+// strategies had run would shift the mute window by one frame at each end.
+func (u *UserAggregator) suppressed(ctx context.Context, f frames.Frame) bool {
+	switch f.(type) {
+	case *frames.StartFrame, *frames.EndFrame, *frames.CancelFrame:
+		// Lifecycle frames are never muted and must not move the mute state:
+		// deciding on the StartFrame would announce the user muted before the
+		// StartFrame had reached anything downstream.
+		return false
+	}
+	u.muteMu.Lock()
+	defer u.muteMu.Unlock()
+
+	drop := u.muted && isUserInput(f)
+	if drop {
+		slog.DebugContext(ctx, "frame suppressed, the user is muted",
+			"processor", u.Name(), "frame", f.Name())
+	}
+
+	muted := false
+	for _, m := range u.muteStrategies {
+		if m.ShouldMute(f) { // call all, so each updates its state
+			muted = true
+		}
+	}
+	if muted != u.muted {
+		u.muted = muted
+		if muted {
+			u.Events().Call(ctx, EventUserMuteStarted, u)
+			_ = u.Broadcast(ctx, func() frames.Frame { return frames.NewUserMuteStartedFrame() })
+		} else {
+			u.Events().Call(ctx, EventUserMuteStopped, u)
+			_ = u.Broadcast(ctx, func() frames.Frame { return frames.NewUserMuteStoppedFrame() })
+		}
+	}
+	return drop
+}
+
+// isUserInput reports whether a frame carries something the user did, which is
+// what muting suppresses. Everything else passes whatever the mute state is.
+func isUserInput(f frames.Frame) bool {
+	switch f.(type) {
+	case *frames.InterruptionFrame,
+		*frames.VADUserStartedSpeakingFrame, *frames.VADUserStoppedSpeakingFrame,
+		*frames.ProposedUserStartedSpeakingFrame, *frames.ProposedUserStoppedSpeakingFrame,
+		*frames.UserStartedSpeakingFrame, *frames.UserStoppedSpeakingFrame,
+		frames.InputAudioFrame,
+		*frames.InterimTranscriptionFrame, *frames.TranscriptionFrame,
+		*frames.EagerTranscriptionFrame, *frames.UserBackchannelFrame:
+		return true
+	}
+	return false
+}
+
+// queuedBroadcast sends a frame a strategy raised both ways: the downstream copy
+// is queued back into this processor rather than pushed, so it flows through the
+// aggregation and the strategies on its way out, while the upstream copy goes
+// straight to the neighbor.
+//
+// The two copies are unrelated frames rather than a paired broadcast. The
+// downstream one has not been sent anywhere yet: it still has to be handled
+// here, and whether it travels on at all is for that handling to decide.
+func (u *UserAggregator) queuedBroadcast(ctx context.Context, build func() frames.Frame) {
+	_ = u.QueueFrame(ctx, build(), processor.Downstream)
+	_ = u.PushFrame(ctx, build(), processor.Upstream)
+}
+
+// Push implements turns.Emitter.
+func (u *UserAggregator) Push(ctx context.Context, f frames.Frame, dir processor.Direction) error {
+	return u.PushFrame(ctx, f, dir)
+}
+
+// Broadcast, which turns.Emitter also requires, is promoted from processor.Base.
+
+// onTurnStarted broadcasts the turn-start decision and barges in, and feeds the
+// idle controller a synthetic user-started frame so it tracks the turn.
+// The aggregation deliberately survives this. The words that opened the turn are
+// the turn's first words: a start strategy that holds out for a few of them only
+// decides once they have been transcribed, and by then they are already
+// aggregated. Clearing here would throw away exactly the speech that caused the
+// turn, leaving it to close having produced nothing. Speech that must not count
+// is dropped explicitly instead, by a strategy asking for it through
+// onResetAggregation.
+func (u *UserAggregator) onTurnStarted(
+	ctx context.Context, strategy turns.StartStrategy, params turns.UserTurnStartedParams,
+) {
+	// Unless the bot is waiting for the user, it is thinking, speaking or
+	// running a function call, and the interruption below cancels that.
+	interruptedBot := params.EnableInterruptions && !u.idle.WaitingForUser()
+	u.mu.Lock()
+	u.turnStartedAt = frames.NowTimestamp()
+	u.wholeTurn = ""
+	u.turnInterruptedBot = interruptedBot
+	u.turnAnswerVoided = false
+	u.mu.Unlock()
+
+	if params.EnableUserSpeakingFrames {
+		_ = u.Broadcast(ctx, func() frames.Frame { return frames.NewUserStartedSpeakingFrame() })
+	}
+	u.idle.Process(frames.NewUserStartedSpeakingFrame())
+	if params.EnableInterruptions {
+		_ = u.BroadcastInterruption(ctx)
+	}
+	u.Events().Call(ctx, EventUserTurnStarted, u, strategy)
+}
+
+// onInferenceTriggered commits what the user has said so far and runs the LLM on
+// it, without the turn being over.
+//
+// For most strategies this arrives together with the turn ending and is the
+// moment the answer starts being written. It matters on its own when
+// finalization is deferred to a separate judge: the detector says there is
+// enough to answer, and the answer begins while the judge is still deciding,
+// rather than after it. Anything the user adds before the turn actually ends is
+// committed by onTurnStopped, which runs the LLM again on it.
+func (u *UserAggregator) onInferenceTriggered(
+	ctx context.Context, strategy turns.StopStrategy, speculation *turns.UserTurnSpeculation,
+) {
+	if speculation != nil && !u.realtimeMode() {
+		// The turn is still open, so nothing is committed: the inference runs
+		// against a provisional conversation and the aggregation keeps
+		// accumulating for whenever the turn does end.
+		u.runSpeculativeInference(ctx, *speculation)
+		u.Events().Call(ctx, EventUserTurnInferenceTriggered, u, strategy)
+		return
+	}
+	if u.realtimeMode() {
+		// Nothing is committed here. The service is generating from the audio
+		// rather than from the conversation, and the user's transcript arrives
+		// late; the assistant starting to answer is what writes it.
+		u.Events().Call(ctx, EventUserTurnInferenceTriggered, u, strategy)
+		return
+	}
+	// What is committed now is the segment since the last commit, so it is kept
+	// alongside the rest of the turn: the report of the turn ending carries
+	// everything the user said, not just the tail nobody answered yet.
+	segment, _ := u.maybeRun(ctx, u.turn.ProcessFromHook)
+	u.rememberSegment(segment)
+	u.Events().Call(ctx, EventUserTurnInferenceTriggered, u, strategy)
+}
+
+// runSpeculativeInference runs an inference for a turn that has not ended.
+//
+// The turn is still open, so the conversation must not record it. The inference
+// runs against a provisional copy carrying the speculated turn and its reading: nothing
+// here touches the real conversation, and the aggregation keeps accumulating for
+// whenever the turn does end. The reply is held downstream until the turn is
+// confirmed, and discarded if it is not.
+func (u *UserAggregator) runSpeculativeInference(ctx context.Context, s turns.UserTurnSpeculation) {
+	// The turn is broadcast as a speculation first. Queued ahead of the
+	// inference, it passes the LLM before the response is held, while the turn
+	// written once it ends waits for the inference to finish.
+	u.mu.Lock()
+	startedAt := u.turnStartedAt
+	var perception []expressive.PerceptionSignal
+	if u.expressive {
+		perception = s.Perception
+	}
+	// The speculated turn is what of the turn the conversation lacks:
+	// transcripts committed earlier in the turn but not written, then the
+	// prediction. What an earlier inference in the turn wrote is already there.
+	said := text.Concatenate(append(slices.Clone(u.aggregation), text.Part{Text: s.Text}))
+	u.mu.Unlock()
+	_ = u.Broadcast(ctx, func() frames.Frame {
+		turn := frames.NewLLMContextUserTurnFrame(said, startedAt)
+		turn.Perception = perception
+		turn.Speculation = true
+		return turn
+	})
+
+	provisional := frames.NewLLMContext(u.context.System())
+	provisional.SetMessages(append(u.context.Messages(), frames.Message{
+		Role: frames.RoleUser,
+		Text: withPerception(said, perception),
+	}))
+	provisional.SetTools(u.context.Tools())
+	provisional.SetToolChoice(u.context.ToolChoice())
+
+	f := frames.NewLLMContextFrame(provisional)
+	f.Speculation = true
+	_ = u.PushFrame(ctx, f, processor.Downstream)
+	// A stop strategy that waits for the inference decides on this one too. It
+	// runs from the controller's hook, which holds its lock.
+	u.turn.ProcessFromHook(f)
+}
+
+// onTurnResumed voids the answer started for the turn so far when the user
+// speaks again in it. An interruption stops that answer wherever it got to. A
+// turn that does not interrupt the bot only withdraws a speculation.
+func (u *UserAggregator) onTurnResumed(ctx context.Context, params turns.UserTurnResumedParams) {
+	if !params.InferenceTriggered {
+		return
+	}
+	if params.EnableInterruptions {
+		_ = u.BroadcastInterruption(ctx)
+		// An answer ran only if the turn's words were written for it.
+		u.mu.Lock()
+		u.turnAnswerVoided = u.wholeTurn != ""
+		u.mu.Unlock()
+		return
+	}
+	_ = u.Broadcast(ctx, func() frames.Frame { return frames.NewUserTurnResponseCancelFrame() })
+}
+
+// onSpeculationCanceled withdraws a speculative reply.
+//
+// It is broadcast rather than queued, so it reaches the gate holding that reply
+// ahead of the turn end that may follow it. Queued, it would arrive after, and
+// the gate would have released the reply this withdraws.
+func (u *UserAggregator) onSpeculationCanceled(ctx context.Context) {
+	_ = u.Broadcast(ctx, func() frames.Frame { return frames.NewUserTurnResponseCancelFrame() })
+}
+
+// onResetAggregation drops the speech aggregated so far, at a start strategy's
+// request. It is how words that must not count toward a turn are discarded:
+// anything said before a wake phrase, or an utterance too short to open one.
+// Since a turn beginning no longer clears the aggregation, this is the only way
+// such speech is kept out of the conversation.
+func (u *UserAggregator) onResetAggregation(context.Context, turns.StartStrategy) {
+	u.mu.Lock()
+	u.aggregation = nil
+	u.perception = nil
+	u.turnPerception = nil
+	u.mu.Unlock()
+}
+
+// onStopTimeout reports a turn closed because no stop strategy decided it had
+// ended.
+func (u *UserAggregator) onStopTimeout(ctx context.Context) {
+	u.Events().Call(ctx, EventUserTurnStopTimeout, u)
+}
+
+// rememberSegment folds a committed segment into what the whole turn has said.
+func (u *UserAggregator) rememberSegment(segment string) {
+	if segment == "" {
+		return
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.wholeTurn == "" {
+		u.wholeTurn = segment
+		return
+	}
+	u.wholeTurn = strings.TrimSpace(u.wholeTurn + " " + segment)
+}
+
+// onTurnStopped broadcasts the turn-stop decision, feeds the idle controller a
+// synthetic user-stopped frame, and commits the turn.
+//
+// Committing here rather than on a received UserStoppedSpeakingFrame is the
+// point of driving the turn from inside the aggregator: the frame that ended
+// the turn has already been folded into the aggregation by the time this runs,
+// so the user's last words are part of the message the model is given.
+func (u *UserAggregator) onTurnStopped(
+	ctx context.Context, strategy turns.StopStrategy, params turns.UserTurnStoppedParams,
+) {
+	if params.EnableUserSpeakingFrames {
+		_ = u.Broadcast(ctx, func() frames.Frame { return frames.NewUserStoppedSpeakingFrame() })
+	}
+	u.idle.Process(frames.NewUserStoppedSpeakingFrame())
+
+	if u.realtimeMode() {
+		// The turn ending is not what finalizes the user's message here: the
+		// assistant starting to answer is, and the message is written then. The
+		// turn is still reported, with nothing to carry; a listener that wants
+		// the text takes EventUserTurnMessageAdded instead.
+		u.mu.Lock()
+		startedAt, userID := u.turnStartedAt, u.userID
+		u.mu.Unlock()
+		u.Events().Call(ctx, EventUserTurnStopped, u, UserTurnStopped{
+			Strategy:  strategy,
+			Timestamp: startedAt,
+			UserID:    userID,
+		})
+		return
+	}
+	// A turn end confirming a speculation has its reply already: running the
+	// model again would answer the same turn twice.
+	u.reportTurnStopped(ctx, strategy, false, params.ConfirmsSpeculation, u.turn.ProcessFromHook)
+}
+
+// reportTurnStopped commits whatever the turn had left to say and reports the
+// turn as a whole.
+//
+// onSessionEnd reports only a turn that has something unreported left in it. The
+// session ending is not itself the end of a turn, so a turn already reported
+// must not be reported a second time on the way out.
+func (u *UserAggregator) reportTurnStopped(
+	ctx context.Context, strategy turns.StopStrategy, onSessionEnd, confirmsSpeculation bool,
+	feed func(frames.Frame),
+) {
+	// Like an empty turn, a voided answer is not recovered when the session
+	// ends.
+	if onSessionEnd {
+		u.mu.Lock()
+		u.turnAnswerVoided = false
+		u.mu.Unlock()
+	}
+	// The message is written to the conversation either way: the committed
+	// transcript is what the conversation records, never the speculated one. Only
+	// the inference is skipped, the speculative reply having already answered it.
+	segment, _ := u.commitTurn(ctx, !confirmsSpeculation, feed)
+	u.rememberSegment(segment)
+
+	u.mu.Lock()
+	content, startedAt, userID := u.wholeTurn, u.turnStartedAt, u.userID
+	u.wholeTurn = ""
+	perception := u.turnPerception
+	u.turnPerception = nil
+	u.mu.Unlock()
+
+	if !onSessionEnd || content != "" {
+		u.mu.Lock()
+		u.turnStartedAt = ""
+		u.mu.Unlock()
+		u.Events().Call(ctx, EventUserTurnStopped, u, UserTurnStopped{
+			Strategy:   strategy,
+			Content:    content,
+			Timestamp:  startedAt,
+			UserID:     userID,
+			Perception: perception,
+		})
+	}
+
+	u.mu.Lock()
+	interruptedBot := u.turnInterruptedBot
+	u.turnInterruptedBot = false
+	if content != "" {
+		u.emptyTurnRecoveries = 0
+	}
+	u.mu.Unlock()
+
+	if content == "" && !onSessionEnd {
+		// An empty turn does not run the LLM, so the bot stays silent unless a
+		// recovery runs it. Without one, restart the idle timer, which this
+		// turn's start canceled.
+		if !u.maybeRecoverEmptyUserTurn(ctx, interruptedBot, nil) {
+			u.idle.WaitForUser()
+		}
+	}
+}
+
+// maybeRecoverEmptyUserTurn runs the LLM for a user turn with no transcript,
+// and reports whether it did. It also covers the part of a turn after its
+// answer was voided, when the user said nothing new. interruptedBot is whether
+// the turn interrupted a response in progress.
+//
+// turnInference is set when the run is the turn's own inference, which a stop
+// strategy such as LLMTurnCompletionStop waits for: the frame that runs it is
+// handed to the turn controller through it, as commitTurn's feed is.
+func (u *UserAggregator) maybeRecoverEmptyUserTurn(
+	ctx context.Context, interruptedBot bool, turnInference func(frames.Frame),
+) bool {
+	u.mu.Lock()
+	cfg := u.emptyUserTurn
+	if cfg == nil {
+		u.mu.Unlock()
+		return false
+	}
+	prompt := cfg.Prompt(interruptedBot)
+	if prompt == "" {
+		u.mu.Unlock()
+		return false
+	}
+	if u.emptyTurnRecoveries >= cfg.MaxRecoveries() {
+		u.mu.Unlock()
+		slog.DebugContext(ctx, "empty user turn left unanswered, too many in a row", "processor", u.Name())
+		return false
+	}
+	u.mu.Unlock()
+
+	// A pending function call result runs the LLM itself, and a muted user
+	// should not be prompted to speak.
+	u.muteMu.Lock()
+	muted := u.muted
+	u.muteMu.Unlock()
+	if muted || u.idle.FunctionCallsInProgress() {
+		return false
+	}
+
+	kind := "idle"
+	if interruptedBot {
+		kind = "interrupted"
+	}
+	slog.DebugContext(ctx, "empty user turn, running the LLM", "processor", u.Name(), "turn", kind)
+	u.mu.Lock()
+	u.emptyTurnRecoveries++
+	u.mu.Unlock()
+	u.context.AddMessage(frames.Message{Role: frames.RoleDeveloper, Text: prompt})
+	var err error
+	if turnInference != nil {
+		err = u.runLLM(ctx, turnInference)
+	} else {
+		err = u.PushFrame(ctx, frames.NewLLMContextFrame(u.context), processor.Downstream)
+	}
+	if err != nil {
+		slog.DebugContext(ctx, "pushing the context for an empty user turn failed", "error", err)
+	}
+	return true
+}
+
+var _ turns.Emitter = (*UserAggregator)(nil)
+
+// noteRealtimeService records that the service describing itself is a realtime
+// one. The broadcast reaches both halves; this one needs the flag only for the
+// handoff, since the user half owns the strategies.
+func (a *AssistantAggregator) noteRealtimeService(fr *frames.LLMServiceMetadataFrame) {
+	if !fr.Realtime {
+		return
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.realtime == nil {
+		on := true
+		a.realtime = &on
+	}
+}
+
+// armUserMessageHandoff has the user half start writing its message, which in
+// speech-to-speech mode happens as the answer starts rather than at the end of
+// the user's turn.
+func (a *AssistantAggregator) armUserMessageHandoff() {
+	if !a.realtimeMode() || a.pairedUser == nil {
+		return
+	}
+	a.pairedUser.realtimeHandoff()
+}
+
+// writeUserMessageBeforeClosing writes the user's message once the answer is
+// complete, before this half writes the answer itself.
+//
+// By then even a slow transcript has landed, so it goes in whether or not the
+// wait armed when the answer started has elapsed. Writing it first is what keeps
+// the conversation in the order it happened.
+func (a *AssistantAggregator) writeUserMessageBeforeClosing(ctx context.Context, f frames.Frame) {
+	if _, ok := f.(*frames.LLMFullResponseEndFrame); !ok {
+		return
+	}
+	if !a.realtimeMode() || a.pairedUser == nil {
+		return
+	}
+	a.pairedUser.realtimeHandoffNow(ctx)
+}
+
+// realtimeMode reports whether the pipeline is driven by a speech-to-speech
+// service.
+func (a *AssistantAggregator) realtimeMode() bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.realtime != nil && *a.realtime
+}
+
+// realtimeHandoff arms the write of the user's message, which in
+// speech-to-speech mode happens as the assistant starts answering rather than
+// when the turn ends.
+//
+// It is deferred by the transcript latency the transcription service published,
+// because a realtime service delivers the user's transcript in pieces and
+// sometimes only after it has begun answering. The answer completing writes it
+// regardless, so nothing is lost if the wait was too short.
+func (u *UserAggregator) realtimeHandoff() {
+	u.mu.Lock()
+	wait := stt.DefaultTTFSP99
+	if u.ttfsP99 != nil {
+		wait = *u.ttfsP99
+	}
+	u.cancelHandoff()
+	ctx := u.sessionCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	stopped := false
+	timer := time.AfterFunc(wait, func() {
+		u.mu.Lock()
+		if stopped {
+			u.mu.Unlock()
+			return
+		}
+		u.handoffCancel = nil
+		u.mu.Unlock()
+		u.writeUserMessage(ctx)
+	})
+	u.handoffCancel = func() {
+		stopped = true
+		timer.Stop()
+	}
+	u.mu.Unlock()
+}
+
+// realtimeHandoffNow writes the user's message without waiting any longer.
+func (u *UserAggregator) realtimeHandoffNow(ctx context.Context) {
+	u.mu.Lock()
+	u.cancelHandoff()
+	u.mu.Unlock()
+	u.writeUserMessage(ctx)
+}
+
+// writeUserMessage commits whatever the user has said, and forgets when the turn
+// began so the next one is stamped for itself.
+func (u *UserAggregator) writeUserMessage(ctx context.Context) {
+	segment, _ := u.maybeRun(ctx, u.turn.Process)
+	if segment == "" {
+		return
+	}
+	u.rememberSegment(segment)
+	u.mu.Lock()
+	u.wholeTurn = ""
+	u.turnStartedAt = ""
+	u.mu.Unlock()
+}
+
+// cancelHandoff stops a pending write. The caller holds u.mu.
+func (u *UserAggregator) cancelHandoff() {
+	if u.handoffCancel != nil {
+		u.handoffCancel()
+		u.handoffCancel = nil
+	}
+}

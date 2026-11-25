@@ -1,0 +1,835 @@
+// Package rtvi implements the RTVI protocol over a transport's messaging
+// channel: a JSON message format and a processor that completes the client
+// handshake and reports pipeline events to the client.
+//
+// RTVI (Real-Time Voice Interface) is the protocol the Pipecat client SDKs
+// speak, so a jargo server interoperates with existing RTVI web, iOS and
+// Android clients. Messages are JSON objects of the form
+// {"label":"rtvi-ai","type":...,"id":...,"data":...} exchanged over the WebRTC
+// data channel.
+package rtvi
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/gojargo/jargo/frames"
+	"github.com/gojargo/jargo/pipeline/capabilities"
+)
+
+const (
+	// MessageLabel tags every RTVI message.
+	MessageLabel = "rtvi-ai"
+	// ProtocolVersion is the RTVI protocol version this implementation speaks.
+	ProtocolVersion = "2.3.0"
+	// LegacySupportedMajor is the older protocol generation still served. A
+	// client of that generation is deprecated but answered rather than turned
+	// away, and is told its own version back in the bot-ready rather than this
+	// one, so it stays on the paths it understands.
+	LegacySupportedMajor = 1
+	// LibraryName is what this implementation calls itself in the bot-ready.
+	LibraryName = "jargo"
+)
+
+// Message types exchanged over the data channel.
+const (
+	TypeClientReady        = "client-ready"
+	TypeSendText           = "send-text"
+	TypeDisconnectBot      = "disconnect-bot"
+	TypeClientMessage      = "client-message"
+	TypeFunctionCallResult = "llm-function-call-result"
+	TypeRawAudio           = "raw-audio"
+	TypeRawAudioBatch      = "raw-audio-batch"
+	TypeBotReady           = "bot-ready"
+	TypeServerMessage      = "server-message"
+	TypeServerResponse     = "server-response"
+	TypeErrorResponse      = "error-response"
+	TypeError              = "error"
+	// The user-transcription, bot-tts-text and bot-llm-text messages are
+	// deprecated, replaced by the raw text messages and user-input. See
+	// UserTranscription, BotTTSText and BotLLMText.
+	TypeUserTranscription    = "user-transcription"
+	TypeUserInput            = "user-input"
+	TypeBotOutput            = "bot-output"
+	TypeBotTranscription     = "bot-transcription"
+	TypeBotTTSText           = "bot-tts-text"
+	TypeBotLLMText           = "bot-llm-text"
+	TypeSTTRawText           = "stt-raw-text"
+	TypeLLMRawText           = "llm-raw-text"
+	TypeTTSRawText           = "tts-raw-text"
+	TypeBotLLMMarker         = "bot-llm-marker"
+	TypeUserLLMText          = "user-llm-text"
+	TypeUserMuteStarted      = "user-mute-started"
+	TypeUserMuteStopped      = "user-mute-stopped"
+	TypeUserStartedSpeaking  = "user-started-speaking"
+	TypeUserStoppedSpeaking  = "user-stopped-speaking"
+	TypeVADUserStarted       = "vad-user-started-speaking"
+	TypeVADUserStopped       = "vad-user-stopped-speaking"
+	TypeDTMF                 = "dtmf"
+	TypeBotStartedSpeaking   = "bot-started-speaking"
+	TypeBotStoppedSpeaking   = "bot-stopped-speaking"
+	TypeBotInterrupted       = "bot-interrupted"
+	TypeBotLLMStarted        = "bot-llm-started"
+	TypeBotLLMStopped        = "bot-llm-stopped"
+	TypeBotTTSStarted        = "bot-tts-started"
+	TypeBotTTSStopped        = "bot-tts-stopped"
+	TypeLLMFunctionCallStart = "llm-function-call-started"
+	TypeLLMFunctionCall      = "llm-function-call-in-progress"
+	TypeLLMFunctionCallStop  = "llm-function-call-stopped"
+	TypeMetrics              = "metrics"
+	TypeUserAudioLevel       = "user-audio-level"
+	TypeBotAudioLevel        = "bot-audio-level"
+)
+
+// Message is the RTVI message envelope. Outgoing event messages omit id; bot-ready
+// and responses echo the request id.
+type Message struct {
+	Label string `json:"label"`
+	Type  string `json:"type"`
+	ID    string `json:"id,omitempty"`
+	Data  any    `json:"data,omitempty"`
+}
+
+// newMessage builds a Message with the RTVI label.
+func newMessage(msgType, id string, data any) Message {
+	return Message{Label: MessageLabel, Type: msgType, ID: id, Data: data}
+}
+
+// Incoming is a received RTVI message with its data left as raw JSON for
+// type-specific decoding.
+type Incoming struct {
+	Label string          `json:"label"`
+	Type  string          `json:"type"`
+	ID    string          `json:"id"`
+	Data  json.RawMessage `json:"data"`
+}
+
+// ParseIncoming decodes a received RTVI message.
+func ParseIncoming(raw []byte) (Incoming, error) {
+	var m Incoming
+	err := json.Unmarshal(raw, &m)
+	return m, err
+}
+
+// SendTextOptions controls how the pipeline processes a send-text message.
+// Both fields default to true when absent, matching the RTVI client SDKs.
+type SendTextOptions struct {
+	RunImmediately *bool `json:"run_immediately,omitempty"`
+	AudioResponse  *bool `json:"audio_response,omitempty"`
+}
+
+// SendTextData is the payload of a send-text message: user text to inject into
+// the conversation, with options controlling whether the LLM runs immediately.
+type SendTextData struct {
+	Content string           `json:"content"`
+	Options *SendTextOptions `json:"options,omitempty"`
+}
+
+// RunImmediately reports whether the LLM should run as soon as the text is
+// appended. Absent options (or an absent flag) default to true.
+func (d SendTextData) RunImmediately() bool {
+	return d.Options == nil || d.Options.RunImmediately == nil || *d.Options.RunImmediately
+}
+
+// AudioResponse reports whether the reply to the injected text should be
+// spoken. Absent options (or an absent flag) default to true.
+func (d SendTextData) AudioResponse() bool {
+	return d.Options == nil || d.Options.AudioResponse == nil || *d.Options.AudioResponse
+}
+
+// ParseSendTextData decodes the data payload of a send-text message.
+//
+// The content is required, though it may be empty.
+func ParseSendTextData(raw json.RawMessage) (SendTextData, error) {
+	var present struct {
+		Content *string `json:"content"`
+	}
+	if err := json.Unmarshal(raw, &present); err != nil {
+		return SendTextData{}, err
+	}
+	if present.Content == nil {
+		return SendTextData{}, errNoContent
+	}
+	var d SendTextData
+	err := json.Unmarshal(raw, &d)
+	return d, err
+}
+
+// The ways a client message's data fails validation.
+var (
+	errNoContent = errors.New("content: field required")
+	errNoButtons = errors.New("buttons: at least one key required")
+	errBadButton = errors.New("buttons: a key is one of 0-9, * and #")
+)
+
+// ParseDTMFData decodes the data payload of a dtmf message: one key or more,
+// each one of 0 to 9, * and #.
+func ParseDTMFData(raw json.RawMessage) (DTMFData, error) {
+	var d DTMFData
+	if err := json.Unmarshal(raw, &d); err != nil {
+		return DTMFData{}, err
+	}
+	if len(d.Buttons) == 0 {
+		return DTMFData{}, errNoButtons
+	}
+	for _, b := range d.Buttons {
+		if len(b) != 1 || !strings.ContainsAny(b, "0123456789*#") {
+			return DTMFData{}, fmt.Errorf("%w, got %q", errBadButton, b)
+		}
+	}
+	return d, nil
+}
+
+// AboutClientData describes the client an RTVI session is with: which client
+// library it uses, on what platform, and whatever else it cares to say. It is
+// what a client sends with its client-ready, and the same shape a bot-ready
+// sends back about itself.
+type AboutClientData struct {
+	Library         string `json:"library"`
+	LibraryVersion  string `json:"library_version,omitempty"`
+	Platform        string `json:"platform,omitempty"`
+	PlatformVersion string `json:"platform_version,omitempty"`
+	PlatformDetails any    `json:"platform_details,omitempty"`
+}
+
+// ClientReadyData is the payload of a client-ready message: the protocol version
+// the client speaks, and what it is.
+type ClientReadyData struct {
+	Version string          `json:"version"`
+	About   AboutClientData `json:"about,omitzero"`
+}
+
+// ParseClientReadyData decodes the data payload of a client-ready message.
+func ParseClientReadyData(raw json.RawMessage) (ClientReadyData, error) {
+	var d ClientReadyData
+	err := json.Unmarshal(raw, &d)
+	return d, err
+}
+
+// BotReadyData is the payload of a bot-ready message: the protocol version the
+// session settled on, what the bot is, and what it does.
+type BotReadyData struct {
+	Version string           `json:"version"`
+	About   *AboutClientData `json:"about,omitempty"`
+	// Capabilities is what the bot does in this session (media sent and
+	// received, metrics), so the client can show only the UI that applies. A
+	// field the bot cannot determine is left out. Added in protocol 2.2.0.
+	Capabilities *capabilities.BotCapabilities `json:"capabilities,omitempty"`
+}
+
+// BotReady builds a bot-ready message in reply to the client-ready with id,
+// declaring version and describing the bot with about. A nil about describes
+// this library.
+func BotReady(id, version string, about *AboutClientData) Message {
+	return botReady(id, version, about, nil)
+}
+
+// botReady is BotReady also saying what the bot does, when caps is set.
+func botReady(id, version string, about *AboutClientData, caps *capabilities.BotCapabilities) Message {
+	if about == nil {
+		about = &AboutClientData{Library: LibraryName, LibraryVersion: LibraryVersion()}
+	}
+	return newMessage(TypeBotReady, id, BotReadyData{Version: version, About: about, Capabilities: caps})
+}
+
+// RawClientMessageData is the payload of a client-message: the client's own
+// message type and whatever it carries, both opaque to the protocol. It is how
+// a client asks the bot something the protocol has no message for.
+type RawClientMessageData struct {
+	T string          `json:"t"`
+	D json.RawMessage `json:"d,omitempty"`
+}
+
+// ParseRawClientMessageData decodes the data payload of a client-message.
+func ParseRawClientMessageData(raw json.RawMessage) (RawClientMessageData, error) {
+	var d RawClientMessageData
+	err := json.Unmarshal(raw, &d)
+	return d, err
+}
+
+// RawServerResponseData is the payload of a server-response: the type of the
+// client message being answered, so the client can pair the answer with what it
+// asked, and the answer itself.
+type RawServerResponseData struct {
+	T string `json:"t"`
+	D any    `json:"d,omitempty"`
+}
+
+// ServerResponse builds the answer to the client message with id, which asked
+// something of type msgType.
+func ServerResponse(id, msgType string, data any) Message {
+	return newMessage(TypeServerResponse, id, RawServerResponseData{T: msgType, D: data})
+}
+
+// ServerMessage builds an unprompted message to the client, carrying whatever
+// the bot wants to tell it that the protocol has no message for.
+func ServerMessage(data any) Message {
+	return newMessage(TypeServerMessage, "", data)
+}
+
+// ErrorResponseData is the payload of an error-response.
+type ErrorResponseData struct {
+	Error string `json:"error"`
+}
+
+// ErrorResponse builds the refusal of the client message with id. It is what a
+// client gets back instead of a server-response when its request could not be
+// carried out, so a request never simply goes unanswered.
+func ErrorResponse(id, err string) Message {
+	return newMessage(TypeErrorResponse, id, ErrorResponseData{Error: err})
+}
+
+// FunctionCallResultData is the payload of an llm-function-call-result: a tool
+// call the client ran on the bot's behalf, and what it produced.
+type FunctionCallResultData struct {
+	FunctionName string          `json:"function_name"`
+	ToolCallID   string          `json:"tool_call_id"`
+	Arguments    json.RawMessage `json:"arguments"`
+	Result       json.RawMessage `json:"result"`
+}
+
+// ParseFunctionCallResultData decodes the data payload of an
+// llm-function-call-result message.
+func ParseFunctionCallResultData(raw json.RawMessage) (FunctionCallResultData, error) {
+	var d FunctionCallResultData
+	err := json.Unmarshal(raw, &d)
+	return d, err
+}
+
+// ResultText is the result as the conversation records it. A result sent as a
+// JSON string is the string itself; anything else is its JSON text, which is
+// what a model reading the tool result expects to see.
+func (d FunctionCallResultData) ResultText() string {
+	var str string
+	if err := json.Unmarshal(d.Result, &str); err == nil {
+		return str
+	}
+	return string(d.Result)
+}
+
+// RawAudioData is the payload of a raw-audio or raw-audio-batch message: audio
+// the client captured itself, base64-encoded 16-bit PCM, one chunk or a batch of
+// them. It is how a client that does its own capture feeds the pipeline over the
+// message channel rather than a media track.
+type RawAudioData struct {
+	//nolint:tagliatelle // RTVI wire fields, camelCase in the protocol
+	Base64Audio string `json:"base64Audio,omitempty"`
+	//nolint:tagliatelle // RTVI wire fields, camelCase in the protocol
+	Base64AudioBatch []string `json:"base64AudioBatch,omitempty"`
+	//nolint:tagliatelle // RTVI wire fields, camelCase in the protocol
+	SampleRate int `json:"sampleRate"`
+	//nolint:tagliatelle // RTVI wire fields, camelCase in the protocol
+	NumChannels int `json:"numChannels"`
+}
+
+// Chunks are the encoded audio chunks the message carries, in order. A batch is
+// taken whole when there is one; otherwise the single chunk stands alone.
+func (d RawAudioData) Chunks() []string {
+	if len(d.Base64AudioBatch) > 0 {
+		return d.Base64AudioBatch
+	}
+	if d.Base64Audio == "" {
+		return nil
+	}
+	return []string{d.Base64Audio}
+}
+
+// ParseRawAudioData decodes the data payload of a raw-audio or raw-audio-batch
+// message.
+func ParseRawAudioData(raw json.RawMessage) (RawAudioData, error) {
+	var d RawAudioData
+	err := json.Unmarshal(raw, &d)
+	return d, err
+}
+
+// ErrorData is the payload of an error message.
+type ErrorData struct {
+	Error string `json:"error"`
+	Fatal bool   `json:"fatal"`
+}
+
+// Error builds an error message.
+func Error(msg string, fatal bool) Message {
+	return newMessage(TypeError, "", ErrorData{Error: msg, Fatal: fatal})
+}
+
+// TextData is the payload of text messages (bot-transcription, bot-tts-text,
+// bot-llm-text).
+type TextData struct {
+	Text string `json:"text"`
+}
+
+// SpokenStatus is where a segment of the bot's output has got to in playback.
+// It is empty for a segment that is not going to be spoken at all, which has no
+// playback to be anywhere in.
+type SpokenStatus string
+
+// The playback states a spoken segment passes through.
+const (
+	// SpokenNew is a segment that is about to be spoken and has not started.
+	SpokenNew SpokenStatus = "new"
+	// SpokenInProgress is a segment partway through being spoken.
+	SpokenInProgress SpokenStatus = "in-progress"
+	// SpokenCompleted is a segment whose last word has been spoken.
+	SpokenCompleted SpokenStatus = "completed"
+)
+
+// SpokenProgressData is how far through a segment the bot has spoken, split at
+// the word being said now. A client renders the whole segment and highlights the
+// accumulated part.
+type SpokenProgressData struct {
+	// AccumulatedText is what has been spoken so far, the current word included.
+	AccumulatedText string `json:"accumulated_text"`
+	// RemainingText is what has not been spoken yet.
+	RemainingText string `json:"remaining_text"`
+}
+
+// BotOutputData is the payload of a bot-output message: one segment of what the
+// bot is saying, with what is known about how it is being said.
+//
+// The optional fields belong to different protocol generations, and each is
+// omitted rather than sent empty so a client sees only the ones its generation
+// understands. Spoken is the older generation's account of whether the text has
+// been spoken; the rest describe the segment's playback to a current client.
+type BotOutputData struct {
+	// Text is the segment as the client should render it.
+	Text string `json:"text"`
+	// OutputType is what kind of text the message holds: a sentence, a word, a
+	// backchannel, or a custom type such as "code" that a pattern aggregator
+	// gave it.
+	OutputType frames.TextType `json:"output_type"`
+	// TextType is the same as OutputType, sent for the clients that read it.
+	//
+	// Deprecated: read OutputType. BotOutput fills it from OutputType.
+	TextType frames.TextType `json:"text_type"`
+	// AggregatedBy is the same as OutputType, sent for the clients that read it.
+	//
+	// Deprecated: read OutputType. BotOutput fills it from OutputType.
+	AggregatedBy frames.TextType `json:"aggregated_by"`
+	// SegmentID identifies the segment, so progress reports can be matched to
+	// the text they are about.
+	SegmentID *uint64 `json:"segment_id,omitempty"`
+	// Spoken reports whether the text has been spoken. Older clients only.
+	Spoken *bool `json:"spoken,omitempty"`
+	// WillBeSpoken reports whether the synthesizer is going to speak the text.
+	WillBeSpoken *bool `json:"will_be_spoken,omitempty"`
+	// SpokenStatus is where the segment has got to in playback.
+	SpokenStatus SpokenStatus `json:"spoken_status,omitempty"`
+	// SpokenProgress splits the segment at the word being spoken now.
+	SpokenProgress *SpokenProgressData `json:"spoken_progress,omitempty"`
+	// Delivery is the delivery of the text just spoken, such as
+	// ["cheerful", "emphasis"], empty for the voice's baseline. It changes
+	// within a segment where its delivery does, so a segment's "new" message
+	// has none. Present in expressive conversation (alpha). Added in protocol
+	// 2.3.0.
+	Delivery []string `json:"delivery,omitzero"`
+}
+
+// BotOutput builds a bot-output message. Whichever of OutputType and its
+// deprecated names is missing is filled from the others, since the message
+// carries all three.
+func BotOutput(d BotOutputData) Message {
+	return newMessage(TypeBotOutput, "", d.withOutputType())
+}
+
+// withOutputType fills whichever of OutputType and its deprecated names are
+// missing from the first one given.
+func (d BotOutputData) withOutputType() BotOutputData {
+	//nolint:staticcheck // the deprecated names are still sent
+	for _, given := range []frames.TextType{d.OutputType, d.TextType, d.AggregatedBy} {
+		if given == "" {
+			continue
+		}
+		if d.OutputType == "" {
+			d.OutputType = given
+		}
+		if d.TextType == "" { //nolint:staticcheck // the deprecated names are still sent
+			d.TextType = given
+		}
+		if d.AggregatedBy == "" { //nolint:staticcheck // the deprecated names are still sent
+			d.AggregatedBy = given
+		}
+		break
+	}
+	return d
+}
+
+// UnmarshalJSON decodes a bot-output payload, filling whichever of OutputType
+// and its deprecated names is missing, so a message from an older bot reads
+// the same.
+func (d *BotOutputData) UnmarshalJSON(data []byte) error {
+	type plain BotOutputData
+	var p plain
+	if err := json.Unmarshal(data, &p); err != nil {
+		return err
+	}
+	*d = BotOutputData(p).withOutputType()
+	return nil
+}
+
+// BotTranscription builds a bot-transcription message.
+func BotTranscription(text string) Message {
+	return newMessage(TypeBotTranscription, "", TextData{Text: text})
+}
+
+// BotTTSText builds a bot-tts-text message.
+//
+// Deprecated: use TTSRawText.
+func BotTTSText(text string) Message {
+	return newMessage(TypeBotTTSText, "", TextData{Text: text})
+}
+
+// BotLLMText builds a bot-llm-text message.
+//
+// Deprecated: use LLMRawText.
+func BotLLMText(text string) Message {
+	return newMessage(TypeBotLLMText, "", TextData{Text: text})
+}
+
+// LLMRawText builds an llm-raw-text message: a chunk of text as the LLM
+// streamed it.
+func LLMRawText(text string) Message {
+	return newMessage(TypeLLMRawText, "", TextData{Text: text})
+}
+
+// TTSRawText builds a tts-raw-text message: text the TTS speaks, as it is
+// spoken.
+func TTSRawText(text string) Message {
+	return newMessage(TypeTTSRawText, "", TextData{Text: text})
+}
+
+// BotLLMMarkerData is the payload of a bot-llm-marker message: the sideband
+// marker the bot's LLM emitted in a response, such as the turn-completion
+// markers, with the response's own text behind it.
+type BotLLMMarkerData struct {
+	// Text is the marker as the model produced it, or empty when the response
+	// carried none.
+	Text string `json:"text"`
+	// Kind is what the marker meant, in the emitter's vocabulary: the
+	// turn-completion protocol's "complete", "short" or "long". Empty when the
+	// emitter gave none.
+	Kind string `json:"kind,omitempty"`
+	// Raw is the response's text as the model produced it, markers included.
+	// It is sent empty when the response carried no text.
+	Raw string `json:"raw"`
+	// Markers are every marker the emitter recognizes, sent as an empty list
+	// when it gave none.
+	Markers []string `json:"markers"`
+}
+
+// BotLLMMarker builds a bot-llm-marker message, sent once per response and only
+// to a client that asked to see them.
+func BotLLMMarker(d BotLLMMarkerData) Message {
+	return newMessage(TypeBotLLMMarker, "", d)
+}
+
+// UserLLMText builds a user-llm-text message: what the user said as the model
+// is about to read it.
+func UserLLMText(text string) Message {
+	return newMessage(TypeUserLLMText, "", TextData{Text: text})
+}
+
+// LLMFunctionCallData is the payload of a llm-function-call-in-progress message.
+// The tool call id is always present; the name and the arguments are omitted
+// unless the observer's report level for the function allows them (see
+// FunctionCallReportLevel), because either can carry information a client has no
+// business seeing.
+type LLMFunctionCallData struct {
+	ToolCallID   string          `json:"tool_call_id"`
+	FunctionName string          `json:"function_name,omitempty"`
+	Arguments    json.RawMessage `json:"arguments,omitempty"`
+}
+
+// LLMFunctionCall builds a llm-function-call-in-progress message carrying as
+// much of the call as level allows.
+func LLMFunctionCall(name, toolCallID string, args json.RawMessage, level FunctionCallReportLevel) Message {
+	d := LLMFunctionCallData{ToolCallID: toolCallID}
+	if level == ReportName || level == ReportArguments || level == ReportFull {
+		d.FunctionName = name
+	}
+	if level == ReportArguments || level == ReportFull {
+		d.Arguments = args
+	}
+	return newMessage(TypeLLMFunctionCall, "", d)
+}
+
+// LLMFunctionCallStartData is the payload of a llm-function-call-started
+// message: the model has asked for a call, before it begins executing. The name
+// is omitted unless the observer's report level for the function allows it.
+type LLMFunctionCallStartData struct {
+	FunctionName string `json:"function_name,omitempty"`
+}
+
+// LLMFunctionCallStart builds a llm-function-call-started message carrying as
+// much of the call as level allows.
+func LLMFunctionCallStart(name string, level FunctionCallReportLevel) Message {
+	var d LLMFunctionCallStartData
+	if level == ReportName || level == ReportArguments || level == ReportFull {
+		d.FunctionName = name
+	}
+	return newMessage(TypeLLMFunctionCallStart, "", d)
+}
+
+// LLMFunctionCallStoppedData is the payload of a llm-function-call-stopped
+// message, sent when a call completes with a result or is canceled. As with the
+// in-progress payload, the name and the result are omitted unless the observer's
+// report level for the function allows them.
+type LLMFunctionCallStoppedData struct {
+	ToolCallID string `json:"tool_call_id"`
+	// Canceled reports whether the call was canceled rather than completing. The
+	// wire name keeps the protocol's spelling, which the clients already send.
+	Canceled     bool   `json:"cancelled"` //nolint:misspell // the protocol spells it this way
+	FunctionName string `json:"function_name,omitempty"`
+	// Result is what the call returned, as a value: the JSON it holds when it
+	// is JSON, an object or a number say, and the text as a string otherwise,
+	// an empty one included. It is nil, and left out, only when it is not
+	// reported.
+	Result any `json:"result,omitempty"`
+}
+
+// LLMFunctionCallStopped builds a llm-function-call-stopped message carrying as
+// much of the outcome as level allows. A canceled call has no result to report.
+func LLMFunctionCallStopped(
+	name, toolCallID, result string, canceled bool, level FunctionCallReportLevel,
+) Message {
+	d := LLMFunctionCallStoppedData{ToolCallID: toolCallID, Canceled: canceled}
+	if level == ReportName || level == ReportArguments || level == ReportFull {
+		d.FunctionName = name
+	}
+	if level == ReportFull && !canceled {
+		d.Result = resultValue(result)
+	}
+	return newMessage(TypeLLMFunctionCallStop, "", d)
+}
+
+// resultValue is a call's result as the value a client reads: the JSON the
+// result holds, or the text itself when it holds none.
+func resultValue(result string) any {
+	if json.Valid([]byte(result)) {
+		return json.RawMessage(result)
+	}
+	return result
+}
+
+// DTMFData is the payload of a dtmf message: the keypad keys the client
+// pressed, in the order they were pressed.
+type DTMFData struct {
+	Buttons []string `json:"buttons"`
+}
+
+// UserTranscriptionData is the payload of a user-transcription message.
+//
+// Deprecated: use STTRawTextData.
+type UserTranscriptionData struct {
+	Text      string `json:"text"`
+	UserID    string `json:"user_id"`
+	Timestamp string `json:"timestamp"`
+	Final     bool   `json:"final"`
+}
+
+// UserTranscription builds a user-transcription message.
+//
+// Deprecated: use STTRawText, or UserInput for what the user said.
+func UserTranscription(text, userID, timestamp string, final bool) Message {
+	return newMessage(TypeUserTranscription, "", UserTranscriptionData{
+		Text:      text,
+		UserID:    userID,
+		Timestamp: timestamp,
+		Final:     final,
+	})
+}
+
+// STTRawTextData is the payload of an stt-raw-text message.
+type STTRawTextData struct {
+	// Text is the transcribed text.
+	Text string `json:"text"`
+	// UserID identifies the user who spoke.
+	UserID string `json:"user_id"`
+	// Timestamp is when the user said it.
+	Timestamp string `json:"timestamp"`
+	// Final is whether the transcription is final, as opposed to interim.
+	Final bool `json:"final"`
+}
+
+// STTRawText builds an stt-raw-text message: a transcription as the STT
+// produced it, interim ones included.
+func STTRawText(text, userID, timestamp string, final bool) Message {
+	return newMessage(TypeSTTRawText, "", STTRawTextData{
+		Text:      text,
+		UserID:    userID,
+		Timestamp: timestamp,
+		Final:     final,
+	})
+}
+
+// UserInputType says what kind of input a user-input message reports.
+type UserInputType string
+
+// The kinds of user input.
+const (
+	// UserInputTranscription is speech transcribed by the STT.
+	UserInputTranscription UserInputType = "transcription"
+	// UserInputChat is text the client sent.
+	UserInputChat UserInputType = "chat"
+	// UserInputBackchannel is a short acknowledgment the user said while the bot
+	// talks, such as "mhm".
+	UserInputBackchannel UserInputType = "backchannel"
+)
+
+// UserInputData is the payload of a user-input message.
+type UserInputData struct {
+	// Text is what the user said or typed.
+	Text string `json:"text"`
+	// InputType is what kind of input it is.
+	InputType UserInputType `json:"input_type"`
+	// Timestamp is when the user said or sent it.
+	Timestamp string `json:"timestamp"`
+	// Final is whether the text is final. Only an interim transcription is not.
+	Final bool `json:"final"`
+	// UserID identifies who spoke or typed, an empty one included. For chat it
+	// is nil, and left out, unless the transport knows the sender, such as
+	// LiveKit.
+	UserID *string `json:"user_id,omitempty"`
+	// MsgID is, for chat, the id of the client's send-text message.
+	MsgID string `json:"msg_id,omitempty"`
+	// Perception is, for a transcription, how the user said it, when it comes
+	// with a reading. Part of expressive conversation (alpha).
+	Perception []UserPerceptionSignal `json:"perception,omitempty"`
+}
+
+// UserPerceptionLabel is a label of a perception signal, with how sure the
+// reading is.
+type UserPerceptionLabel struct {
+	// Label is the label, such as "frustrated".
+	Label string `json:"label"`
+	// Confidence is how sure the reading is, from 0 to 1.
+	Confidence float64 `json:"confidence"`
+}
+
+// UserPerceptionSignal is one signal of a reading of how the user spoke.
+type UserPerceptionSignal struct {
+	// Name is what is read, such as "tone".
+	Name string `json:"name"`
+	// Labels is the likeliest labels, likeliest first, for a signal read as
+	// labels.
+	Labels []UserPerceptionLabel `json:"labels"`
+	// Value is the measure, for a signal read as a value.
+	Value *float64 `json:"value,omitempty"`
+}
+
+// UserInput builds a user-input message: what the user said or typed. It is the
+// user's counterpart of bot-output. A backchannel does not interrupt the bot or
+// reach the LLM.
+func UserInput(d UserInputData) Message {
+	return newMessage(TypeUserInput, "", d)
+}
+
+// MetricData is one timing or count entry in a metrics message (ttfb,
+// processing or characters). Value is in seconds for timings, or a count.
+type MetricData struct {
+	Processor string  `json:"processor"`
+	Value     float64 `json:"value"`
+	Model     string  `json:"model,omitempty"`
+}
+
+// TokenMetricData is one LLM token-usage entry in a metrics message: the
+// usage itself, with the counts the service did not report left out.
+type TokenMetricData struct {
+	PromptTokens              int64  `json:"prompt_tokens"`
+	CompletionTokens          int64  `json:"completion_tokens"`
+	TotalTokens               int64  `json:"total_tokens"`
+	CacheReadInputTokens      *int64 `json:"cache_read_input_tokens,omitempty"`
+	CacheCreationInputTokens  *int64 `json:"cache_creation_input_tokens,omitempty"`
+	ReasoningTokens           *int64 `json:"reasoning_tokens,omitempty"`
+	InputAudioTokens          *int64 `json:"input_audio_tokens,omitempty"`
+	OutputAudioTokens         *int64 `json:"output_audio_tokens,omitempty"`
+	CacheReadInputAudioTokens *int64 `json:"cache_read_input_audio_tokens,omitempty"`
+}
+
+// STTUsageMetricData is one speech-to-text usage entry in a metrics message.
+type STTUsageMetricData struct {
+	Processor string        `json:"processor"`
+	Model     string        `json:"model,omitempty"`
+	Value     STTUsageValue `json:"value"`
+}
+
+// STTUsageValue is what a speech-to-text service was used for: how much audio
+// it transcribed.
+type STTUsageValue struct {
+	AudioSeconds float64 `json:"audio_seconds"`
+}
+
+// TTFAMetricData is one time-to-first-audible-sample entry, reported with the
+// breakdown that makes it up: the time to first byte it builds on, and the
+// silence padded on before the first audible sample. TTFB here is the same
+// measurement reported under "ttfb", not another one.
+type TTFAMetricData struct {
+	Processor      string  `json:"processor"`
+	Model          string  `json:"model,omitempty"`
+	TTFA           float64 `json:"ttfa"`
+	TTFB           float64 `json:"ttfb"`
+	LeadingSilence float64 `json:"leading_silence"`
+}
+
+// TTFATMetricData is one time-to-first-answer-token entry, reported with the
+// breakdown that makes it up: the time to first byte it builds on, and the
+// thinking time between that and the first answer token. TTFB here is the same
+// measurement reported under "ttfb", not another one.
+type TTFATMetricData struct {
+	Processor    string  `json:"processor"`
+	Model        string  `json:"model,omitempty"`
+	TTFAT        float64 `json:"ttfat"`
+	TTFB         float64 `json:"ttfb"`
+	ThinkingTime float64 `json:"thinking_time"`
+}
+
+// MetricsData is the payload of a metrics message: each kind is a list so a
+// single message can report several processors at once.
+type MetricsData struct {
+	TTFB            []MetricData         `json:"ttfb,omitempty"`
+	TTFA            []TTFAMetricData     `json:"ttfa,omitempty"`
+	TTFAT           []TTFATMetricData    `json:"ttfat,omitempty"`
+	Processing      []MetricData         `json:"processing,omitempty"`
+	Characters      []MetricData         `json:"characters,omitempty"`
+	STTUsage        []STTUsageMetricData `json:"stt_usage,omitempty"`
+	TextAggregation []MetricData         `json:"text_aggregation,omitempty"`
+	Tokens          []TokenMetricData    `json:"tokens,omitempty"`
+	Turn            []TurnMetricData     `json:"turn,omitempty"`
+}
+
+// TurnMetricData is one end-of-turn prediction: whether the analyzer judged the
+// turn finished, how confident it was, and how long deciding took.
+type TurnMetricData struct {
+	Processor    string  `json:"processor"`
+	Complete     bool    `json:"complete"`
+	Probability  float64 `json:"probability"`
+	ProcessingMs float64 `json:"processing_ms"`
+}
+
+// Metrics builds a metrics message from data.
+func Metrics(data MetricsData) Message {
+	return newMessage(TypeMetrics, "", data)
+}
+
+// AudioLevelData is how loud one side of the conversation currently is.
+type AudioLevelData struct {
+	// Value is the volume on the 0..1 scale audio/loudness measures.
+	Value float64 `json:"value"`
+}
+
+// UserAudioLevel builds a message reporting how loud the user is.
+func UserAudioLevel(level float64) Message {
+	return newMessage(TypeUserAudioLevel, "", AudioLevelData{Value: level})
+}
+
+// BotAudioLevel builds a message reporting how loud the bot is.
+func BotAudioLevel(level float64) Message {
+	return newMessage(TypeBotAudioLevel, "", AudioLevelData{Value: level})
+}
+
+// event builds a data-less event message (speaking events).
+func event(msgType string) Message {
+	return newMessage(msgType, "", nil)
+}

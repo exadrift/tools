@@ -1,0 +1,374 @@
+// Package controller drives a voice-activity detector and reports what it hears.
+// It owns the detection state, the resampling the detector needs, and the watch
+// for audio that stops arriving, and it reports speech starting, continuing and
+// stopping through handlers the caller supplies.
+//
+// It is separate from the pipeline processor that usually hosts it (see
+// processor/vadproc) so that anything else needing the same detection can drive
+// it too: a speech-to-speech service running its own detection alongside the
+// provider's, say. It sits beside the detector rather than inside a processor
+// for that reason.
+//
+// It is its own package rather than part of audio/vad because it works in
+// frames, and the frames package refers to vad.Params.
+package controller
+
+import (
+	"context"
+	"log/slog"
+	"sync"
+	"time"
+
+	"github.com/gojargo/jargo/audio/resample"
+	"github.com/gojargo/jargo/audio/vad"
+	"github.com/gojargo/jargo/frames"
+	"github.com/gojargo/jargo/processor"
+)
+
+// analyzerSampleRate is the fallback analyzer rate, used when the input rate is
+// not one the analyzer accepts (Silero also runs natively at 8 kHz).
+const analyzerSampleRate = 16000
+
+// DefaultAudioIdleTimeout is how long the audio can stop arriving mid-speech
+// before the user is taken to have stopped.
+const DefaultAudioIdleTimeout = time.Second
+
+// DefaultSpeechActivityPeriod is the least time between two reports that the
+// user is still speaking.
+const DefaultSpeechActivityPeriod = 200 * time.Millisecond
+
+// Handlers receives what the controller decides. Any of them may be nil.
+type Handlers struct {
+	// OnSpeechStarted reports that the user began speaking.
+	OnSpeechStarted func(ctx context.Context)
+	// OnSpeechStopped reports that the user stopped speaking, including when the
+	// audio stopped arriving rather than going quiet.
+	OnSpeechStopped func(ctx context.Context)
+	// OnSpeechActivity reports that the user is still speaking. It fires while
+	// speech is being heard, at most once per SpeechActivityPeriod.
+	OnSpeechActivity func(ctx context.Context)
+	// OnPushFrame sends a frame through whatever hosts the controller.
+	OnPushFrame func(ctx context.Context, f frames.Frame, dir processor.Direction)
+	// OnBroadcastFrame sends a frame both ways through whatever hosts the
+	// controller. build is called once per direction.
+	OnBroadcastFrame func(ctx context.Context, build func() frames.Frame)
+}
+
+// Config configures a Controller.
+type Config struct {
+	// AudioIdleTimeout is how long to wait, with the user speaking and no audio
+	// arriving at all, before taking the speech to have stopped. It covers the
+	// audio going away mid-utterance, a muted microphone being the usual case:
+	// the detector never sees the silence that would have ended the speech, so
+	// without this the user is left speaking for good.
+	//
+	// Leave it nil for DefaultAudioIdleTimeout. A zero duration turns the watch
+	// off, so it is a pointer rather than a plain value: the two have to be told
+	// apart, and a struct field cannot say which of them it was left as.
+	AudioIdleTimeout *time.Duration
+
+	// SpeechActivityPeriod is the least time between two OnSpeechActivity
+	// reports. Speech is heard one short chunk at a time, and whatever is
+	// counting on the user still being there needs to hear about it far less
+	// often than that, so the report is paced rather than made per chunk.
+	//
+	// Leave it nil for DefaultSpeechActivityPeriod. A zero duration reports
+	// every chunk, so it is a pointer rather than a plain value: the two have to
+	// be told apart, and a struct field cannot say which of them it was left as.
+	SpeechActivityPeriod *time.Duration
+}
+
+// Controller drives a detector over incoming audio and reports what it hears.
+type Controller struct {
+	analyzer       vad.Analyzer
+	handlers       Handlers
+	idleTimeout    time.Duration
+	activityPeriod time.Duration
+
+	resampler    *resample.Resampler
+	inRate       int
+	analyzerRate int
+
+	// mu guards the speaking state, which the idle watch reads and writes
+	// alongside whatever is feeding in audio.
+	mu          sync.Mutex
+	speaking    bool
+	lastAudioAt time.Time
+	// activityAt is when the last OnSpeechActivity went out, which is what paces
+	// the next one.
+	activityAt time.Time
+
+	// watchMu serializes the idle watch's lifecycle, which Start, Stop and
+	// Cleanup all reach and which the frame goroutine and the teardown reach
+	// from different goroutines. Upstream is single-threaded and needs none of
+	// this; it is jargo's own. It is never taken by the watch itself, so holding
+	// it while waiting for the watch to finish cannot deadlock.
+	watchMu    sync.Mutex
+	idleCancel context.CancelFunc
+	idleWG     sync.WaitGroup
+}
+
+// New builds a Controller around analyzer. The analyzer is required.
+func New(analyzer vad.Analyzer, handlers Handlers, cfg Config) *Controller {
+	idle := DefaultAudioIdleTimeout
+	if cfg.AudioIdleTimeout != nil {
+		idle = *cfg.AudioIdleTimeout
+	}
+	activity := DefaultSpeechActivityPeriod
+	if cfg.SpeechActivityPeriod != nil {
+		activity = *cfg.SpeechActivityPeriod
+	}
+	return &Controller{
+		analyzer:       analyzer,
+		handlers:       handlers,
+		idleTimeout:    idle,
+		activityPeriod: activity,
+	}
+}
+
+// Params returns the detection parameters in force.
+func (c *Controller) Params() vad.Params { return c.analyzer.Params() }
+
+// ProcessFrame drives the detector from one frame. It acts on incoming audio and
+// on a request to change the parameters; anything else it ignores. Its owner
+// starts and stops it around the session with Start and Stop.
+func (c *Controller) ProcessFrame(ctx context.Context, f frames.Frame) error {
+	switch fr := f.(type) {
+	case frames.InputAudioFrame:
+		c.handleAudio(ctx, fr.AudioData())
+	case *frames.VADParamsUpdateFrame:
+		c.analyzer.SetParams(fr.Params)
+		c.ReportParams(ctx)
+	}
+	return nil
+}
+
+// Start announces the parameters the detector runs with and brings up the watch
+// for the audio going missing. Its owner calls it on the StartFrame. It pairs
+// with Stop.
+//
+// The watch runs from here rather than from Setup because it looks for audio
+// going missing mid-turn, and there is no audio to miss until the session starts.
+func (c *Controller) Start(ctx context.Context) {
+	c.ReportParams(ctx)
+	c.startIdleWatch(ctx)
+}
+
+// Stop tears the idle watch down, leaving the detector alone. Its owner calls it
+// at the end of the session: left running, the watch reports what ending looks
+// like rather than anything real, since no audio arrives once the session is
+// over. The detector may be shared, so releasing it waits for Cleanup.
+func (c *Controller) Stop() { c.stopIdleWatch() }
+
+// Cleanup stops the idle watch and releases the detector and resampler.
+func (c *Controller) Cleanup() {
+	c.Stop()
+	if c.analyzer != nil {
+		_ = c.analyzer.Close()
+	}
+	if c.resampler != nil {
+		c.resampler.Close()
+		c.resampler = nil
+	}
+}
+
+// PushFrame sends a frame through whatever hosts the controller.
+func (c *Controller) PushFrame(ctx context.Context, f frames.Frame, dir processor.Direction) {
+	if c.handlers.OnPushFrame != nil {
+		c.handlers.OnPushFrame(ctx, f, dir)
+	}
+}
+
+// BroadcastFrame sends a frame both ways through whatever hosts the controller.
+func (c *Controller) BroadcastFrame(ctx context.Context, build func() frames.Frame) {
+	if c.handlers.OnBroadcastFrame != nil {
+		c.handlers.OnBroadcastFrame(ctx, build)
+	}
+}
+
+// ReportParams broadcasts the detection parameters in force, so a processor
+// downstream can size its own behavior to them.
+func (c *Controller) ReportParams(ctx context.Context) {
+	params := c.analyzer.Params()
+	c.BroadcastFrame(ctx, func() frames.Frame {
+		vp := params
+		return frames.NewSpeechControlParamsFrame(&vp, nil)
+	})
+}
+
+// Setup configures the detector for the pipeline's input rate, which is known
+// from the moment the controller is set up.
+func (c *Controller) Setup(s processor.Setup) error {
+	// Prefer the input rate so no resampling is needed: Silero runs natively at
+	// 8 kHz as well as 16 kHz. Fall back to the default rate, and resample, only
+	// if the detector rejects the input rate.
+	rate := s.AudioInSampleRate
+	if rate <= 0 {
+		rate = analyzerSampleRate
+	}
+	if err := c.analyzer.SetSampleRate(rate); err != nil {
+		rate = analyzerSampleRate
+		if err := c.analyzer.SetSampleRate(rate); err != nil {
+			return err
+		}
+	}
+	c.analyzerRate = rate
+	return nil
+}
+
+// handleAudio runs detection over one chunk and reports what it heard.
+func (c *Controller) handleAudio(ctx context.Context, f *frames.AudioRawData) {
+	state := c.analyzer.AnalyzeAudio(c.toAnalyzerRate(f))
+
+	now := time.Now()
+
+	c.mu.Lock()
+	c.lastAudioAt = now
+	started := state == vad.StateSpeaking && !c.speaking
+	stopped := state == vad.StateQuiet && c.speaking
+	switch {
+	case started:
+		c.speaking = true
+	case stopped:
+		c.speaking = false
+	}
+	// Speech arrives one short chunk at a time, and nothing counting on the user
+	// still being there needs telling that often, so the report is paced.
+	activityDue := c.speaking && now.Sub(c.activityAt) >= c.activityPeriod
+	if activityDue {
+		c.activityAt = now
+	}
+	c.mu.Unlock()
+
+	switch {
+	case started:
+		if c.handlers.OnSpeechStarted != nil {
+			c.handlers.OnSpeechStarted(ctx)
+		}
+	case stopped:
+		if c.handlers.OnSpeechStopped != nil {
+			c.handlers.OnSpeechStopped(ctx)
+		}
+	}
+
+	if activityDue && c.handlers.OnSpeechActivity != nil {
+		c.handlers.OnSpeechActivity(ctx)
+	}
+}
+
+// startIdleWatch brings up the watch that ends speech when the audio stops
+// arriving altogether.
+func (c *Controller) startIdleWatch(ctx context.Context) {
+	if c.idleTimeout <= 0 {
+		return
+	}
+	c.watchMu.Lock()
+	defer c.watchMu.Unlock()
+	c.stopIdleWatchLocked()
+
+	c.mu.Lock()
+	c.lastAudioAt = time.Now()
+	c.mu.Unlock()
+
+	// Detached from the frame's context, which does not outlive the frame.
+	runCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	c.idleCancel = cancel
+	c.idleWG.Add(1)
+	go c.idleWatch(runCtx)
+}
+
+// stopIdleWatch tears the watch down.
+func (c *Controller) stopIdleWatch() {
+	c.watchMu.Lock()
+	defer c.watchMu.Unlock()
+	c.stopIdleWatchLocked()
+}
+
+// stopIdleWatchLocked tears the watch down and waits for it to finish. The
+// caller holds watchMu.
+//
+// It waits whether or not it was the one to cancel: a second stop returning
+// while the watch is still running would let the cleanup behind it release the
+// detector out from under it.
+func (c *Controller) stopIdleWatchLocked() {
+	cancel := c.idleCancel
+	c.idleCancel = nil
+	if cancel != nil {
+		cancel()
+	}
+	c.idleWG.Wait()
+}
+
+// idleWatch ends the user's speech when no audio has arrived for the idle
+// timeout. The detector only ever hears silence as speech ending, so audio that
+// stops mid-utterance (a microphone muted part-way through, typically) would
+// otherwise leave the user speaking for good, and the turn would never close.
+func (c *Controller) idleWatch(ctx context.Context) {
+	defer c.idleWG.Done()
+	for {
+		c.mu.Lock()
+		deadline := c.lastAudioAt.Add(c.idleTimeout)
+		c.mu.Unlock()
+
+		if remaining := time.Until(deadline); remaining > 0 {
+			// Audio is still recent, so wait out only what is left of the window.
+			if !sleepCtx(ctx, remaining) {
+				return
+			}
+			continue
+		}
+
+		c.mu.Lock()
+		idled := c.speaking
+		if idled {
+			c.speaking = false
+		}
+		c.mu.Unlock()
+
+		if idled {
+			slog.Warn("vad: no audio while the user was speaking, ending the speech",
+				"timeout", c.idleTimeout)
+			if c.handlers.OnSpeechStopped != nil {
+				c.handlers.OnSpeechStopped(ctx)
+			}
+		}
+
+		if !sleepCtx(ctx, c.idleTimeout) {
+			return
+		}
+	}
+}
+
+// sleepCtx waits for d, reporting false if ctx was done first.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// toAnalyzerRate returns the frame's audio resampled to the analyzer rate, mono.
+func (c *Controller) toAnalyzerRate(f *frames.AudioRawData) []byte {
+	if f.SampleRate == c.analyzerRate {
+		return f.Audio
+	}
+	if c.resampler == nil || c.inRate != f.SampleRate {
+		if c.resampler != nil {
+			c.resampler.Close()
+			c.resampler = nil
+		}
+		r, err := resample.New(f.SampleRate, c.analyzerRate, 1)
+		if err != nil {
+			slog.Error("vad: create resampler",
+				"from", f.SampleRate, "to", c.analyzerRate, "err", err)
+			return f.Audio
+		}
+		c.resampler = r
+		c.inRate = f.SampleRate
+	}
+	return c.resampler.Process(f.Audio)
+}

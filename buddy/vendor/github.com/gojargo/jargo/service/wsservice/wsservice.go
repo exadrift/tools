@@ -1,0 +1,454 @@
+// Package wsservice is the shared base for services that talk to a provider
+// over a WebSocket held open for the length of a call.
+//
+// Such a connection drops for ordinary reasons: a network blip, a server
+// recycling, a proxy timing out an idle socket. Left alone that ends the
+// service for the rest of the call, so the base reconnects. It runs the receive
+// loop, and when the connection fails it retries with an exponential backoff,
+// reporting each failed attempt without ending the call. Retrying has two
+// limits: a connection that keeps failing the instant it is established is not
+// waiting on the network, and a handshake the server refused outright (a
+// rejected key, say) will be refused again. Either way the base gives up rather
+// than retry into a wall.
+//
+// A service supplies the provider-specific half through Handler and owns the
+// socket itself; the base only says when to open it, close it, and read from it.
+package wsservice
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"sync"
+	"time"
+
+	"github.com/coder/websocket"
+	"github.com/gojargo/jargo/frames"
+	"github.com/gojargo/jargo/utils/network"
+)
+
+// DefaultMaxRetries is how many times the base redials before it reports the
+// connection lost.
+const DefaultMaxRetries = 3
+
+// ErrVerification is returned by a reconnect attempt that redialed without an
+// error but did not leave a live connection behind.
+//
+//nolint:gochecknoglobals // sentinel error
+var ErrVerification = errors.New("wsservice: websocket reconnection failed verification")
+
+// ErrNotConnected is returned by a send that had no connection to send on.
+//
+//nolint:gochecknoglobals // sentinel error
+var ErrNotConnected = errors.New("wsservice: no websocket connected")
+
+// ReportError reports a connection error to the pipeline. The base calls it for
+// every failed reconnect attempt and once more when it stops retrying, so a
+// service typically pushes a non-fatal error frame: the call continues, and the
+// application decides what a lost provider connection means for it.
+//
+// forceTreatAsPermanent says the failure will keep recurring, which is what the base
+// reports when it has stopped trying. A service passes it through to
+// PushErrorFrame, whose verdict the base then reads back to decide whether
+// reconnecting is worth attempting at all.
+type ReportError func(ctx context.Context, ef *frames.ErrorFrame, forceTreatAsPermanent bool)
+
+// Handler is the service-specific half of a WebSocket service. The service owns
+// the socket; these are the three things the base needs to drive it, plus the
+// liveness check that decides whether a redial actually worked.
+type Handler interface {
+	// ConnectWebsocket opens the connection. It is called for the redial of
+	// every reconnect attempt, so it must be safe to call repeatedly.
+	ConnectWebsocket(ctx context.Context) error
+	// DisconnectWebsocket closes the connection. It is called before every
+	// redial, so it must tolerate there being nothing to close.
+	DisconnectWebsocket(ctx context.Context) error
+	// ReceiveMessages reads from the connection until it ends, handling each
+	// message. Returning nil means the peer closed the connection gracefully;
+	// returning an error means it failed. Either way the base decides whether
+	// to reconnect and calls it again.
+	ReceiveMessages(ctx context.Context) error
+	// Connected reports whether there is a live connection. The base asks after
+	// a redial, because a service that reports its dial failure by leaving no
+	// connection behind would otherwise look like it had succeeded.
+	Connected() bool
+	// Usable reports whether the service can still do its job. Every service
+	// embedding processor.Base has it. Reconnecting cannot fix whatever made a
+	// service unusable, so the base stops trying once this is false.
+	Usable() bool
+}
+
+// Config configures a Base. A zero field takes its default.
+type Config struct {
+	// ReconnectOnError says whether a failed connection is reconnected at all.
+	// Nil enables it. Setting it to false turns every failure into a reported
+	// error and ends the receive loop, for a service whose session cannot be
+	// resumed by redialing.
+	ReconnectOnError *bool
+	// MaxRetries is how many times a reconnect redials before giving up.
+	MaxRetries int
+	// ReconnectBackoffMinWait is the shortest wait between two reconnection
+	// attempts; zero uses four seconds.
+	ReconnectBackoffMinWait time.Duration
+	// ReconnectBackoffMaxWait is the longest wait between two reconnection
+	// attempts; zero uses ten seconds. A provider that refuses a burst of
+	// redials wants a longer ceiling than one that simply dropped the socket.
+	ReconnectBackoffMaxWait time.Duration
+	// QuickFailure configures when repeated instant failures end the retrying.
+	QuickFailure network.QuickFailureConfig
+}
+
+// Base runs the receive loop and the reconnection around it. Embed it in a
+// service that holds a WebSocket open, and hand it the Handler that owns the
+// socket.
+type Base struct {
+	handler          Handler
+	reconnectOnError bool
+	maxRetries       int
+	minWait, maxWait time.Duration
+	tracker          *network.QuickFailureTracker
+
+	mu                  sync.Mutex
+	disconnecting       bool
+	reconnectInProgress bool
+	lastConnect         time.Time
+
+	// now and sleep are the clock, replaced in tests so a backoff does not cost
+	// the wall-clock time it asks for.
+	now   func() time.Time
+	sleep func(ctx context.Context, d time.Duration)
+}
+
+// New builds a Base driving handler.
+func New(handler Handler, cfg Config) *Base {
+	b := &Base{
+		handler:          handler,
+		reconnectOnError: cfg.ReconnectOnError == nil || *cfg.ReconnectOnError,
+		maxRetries:       cfg.MaxRetries,
+		minWait:          cfg.ReconnectBackoffMinWait,
+		maxWait:          cfg.ReconnectBackoffMaxWait,
+		tracker:          network.NewQuickFailureTracker(cfg.QuickFailure),
+		now:              time.Now,
+		sleep:            sleepContext,
+	}
+	if b.maxRetries <= 0 {
+		b.maxRetries = DefaultMaxRetries
+	}
+	if b.minWait <= 0 {
+		b.minWait = network.DefaultMinWait
+	}
+	if b.maxWait <= 0 {
+		b.maxWait = network.DefaultMaxWait
+	}
+	if b.maxWait < b.minWait {
+		b.maxWait = b.minWait
+	}
+	return b
+}
+
+// Connect readies the base for a fresh connection: reconnection is allowed
+// again, and the streak of instant failures starts over. Call it from the
+// service's own connect, before opening the socket.
+func (b *Base) Connect() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.disconnecting = false
+	b.tracker.Reset()
+}
+
+// Disconnect marks the disconnection as deliberate, so the receive loop ending
+// is read as the shutdown it is rather than as a connection to restore. Call it
+// from the service's own disconnect, before closing the socket.
+func (b *Base) Disconnect() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.disconnecting = true
+}
+
+// Disconnecting reports whether a deliberate disconnect is under way.
+func (b *Base) Disconnecting() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.disconnecting
+}
+
+// ReceiveTaskHandler reads from the connection until there is nothing left to
+// recover, reconnecting in between. It returns when the service is
+// disconnecting, or when reconnecting has stopped being worth trying. Run it in a goroutine of its own for as long
+// as the service is connected.
+func (b *Base) ReceiveTaskHandler(ctx context.Context, report ReportError) {
+	for {
+		b.setLastConnect(b.now())
+
+		err := b.handler.ReceiveMessages(ctx)
+
+		var message string
+		switch {
+		case err == nil || isNormalClosure(err):
+			// The peer closed the connection gracefully: a server recycling its
+			// sockets during a deploy closes with going away, and one that simply
+			// ends the session with a normal closure. Either way the connection
+			// is gone while the call carries on, so it is worth restoring. A
+			// close the service asked for is told apart by Disconnecting, not by
+			// its code.
+			message = "connection closed by server"
+			err = nil
+		case isCloseError(err):
+			message = fmt.Sprintf("connection closed, but with an error: %v", err)
+		default:
+			message = fmt.Sprintf("error receiving messages: %v", err)
+		}
+
+		if !b.maybeTryReconnect(ctx, message, err, report) {
+			return
+		}
+	}
+}
+
+// maybeTryReconnect decides whether the connection just lost is worth restoring
+// and restores it when it is. It reports whether the receive loop should carry
+// on.
+func (b *Base) maybeTryReconnect(ctx context.Context, message string, err error, report ReportError) bool {
+	if b.Disconnecting() {
+		// The service asked for this, so there is nothing to report and nothing
+		// to reconnect.
+		slog.Debug("websocket receive loop ended during disconnect", "err", err)
+		return false
+	}
+
+	if ctx.Err() != nil {
+		// The session is over: the read did not fail, it was stopped. Redialing
+		// would dial on the same finished context and fail every attempt, which
+		// reads in the log like a provider that went down at the end of every
+		// call.
+		slog.Debug("websocket receive loop ended with the session", "err", err)
+		return false
+	}
+
+	if errors.Is(err, ErrNotConfirmed) {
+		// The connection never carried a session, so it counts as failing right
+		// after connecting, and the receive loop gives up after a few in a row
+		// rather than retrying forever.
+		b.setLastConnect(b.now())
+	}
+
+	if last := b.lastConnectTime(); !last.IsZero() {
+		lasted := b.now().Sub(last)
+		result := b.tracker.Record(lasted)
+		if result.QuickFailure {
+			slog.Warn("websocket connection failed immediately after connecting",
+				"lasted", lasted,
+				"consecutive", b.tracker.Count(),
+				"limit", b.tracker.MaxConsecutiveFailures())
+		}
+		if result.GiveUp {
+			// Redialing keeps succeeding and the connection keeps dying, so
+			// waiting longer between attempts is not the answer, and the service
+			// is finished until something about it changes.
+			giveUp := fmt.Sprintf("connection failed %d times immediately after connecting",
+				b.tracker.MaxConsecutiveFailures())
+			slog.Error(giveUp)
+			reportError(ctx, report, frames.NewErrorFrame(giveUp), nil, true)
+			return false
+		}
+	}
+
+	slog.Warn(message)
+
+	if !b.reconnectOnError {
+		// reconnectOnError governs this loop alone: a service that turns it off
+		// reconnects on demand in SendWithRetry instead. Reporting the drop as
+		// terminal would close that path too.
+		reportError(ctx, report, frames.NewErrorFrame(message), err, false)
+		return false
+	}
+	return b.TryReconnect(ctx, report)
+}
+
+// TryReconnect redials until it has a live connection or has run out of
+// attempts, waiting longer after each failure. It reports whether it succeeded.
+// Every failed attempt is reported, and so is running out of them.
+func (b *Base) TryReconnect(ctx context.Context, report ReportError) bool {
+	if !b.beginReconnect() {
+		slog.Warn("websocket reconnect attempt aborted: already in progress")
+		return false
+	}
+	if !b.handler.Usable() {
+		// Reconnecting cannot fix whatever made the service unusable.
+		b.endReconnect()
+		slog.Error("not reconnecting: the service is no longer usable")
+		return false
+	}
+	defer b.endReconnect()
+
+	var lastErr error
+	for attempt := 1; attempt <= b.maxRetries; attempt++ {
+		ok, err := b.reconnectWebsocket(ctx, attempt)
+		if ctx.Err() != nil {
+			// The session ended while this was redialing. The attempt did not
+			// fail, it was stopped, so there is nothing to report.
+			slog.Debug("websocket reconnection stopped with the session", "attempt", attempt)
+			return false
+		}
+		switch {
+		case err != nil:
+			lastErr = err
+			slog.Error("websocket reconnection attempt failed", "attempt", attempt, "err", err)
+			reportError(ctx, report,
+				frames.NewErrorFrame(fmt.Sprintf("reconnection attempt %d failed: %v", attempt, err)),
+				err, false)
+			if !b.handler.Usable() {
+				// The attempt was refused for a reason reporting it identified as
+				// terminal: a rejected key, or a model the account cannot use. The
+				// next attempt is refused the same way, so retrying only delays the
+				// news.
+				slog.Error("abandoning reconnection: the service is no longer usable")
+				return false
+			}
+		case ok:
+			slog.Info("websocket reconnected", "attempt", attempt)
+			b.setLastConnect(b.now())
+			return true
+		}
+		b.sleep(ctx, network.ExponentialBackoffTime(attempt,
+			b.minWait, b.maxWait, network.DefaultMultiplier))
+		if ctx.Err() != nil {
+			// Stopped while waiting out the backoff.
+			slog.Debug("websocket reconnection stopped with the session", "attempt", attempt)
+			return false
+		}
+	}
+
+	message := fmt.Sprintf("failed to reconnect after %d attempts", b.maxRetries)
+	if lastErr != nil {
+		message = fmt.Sprintf("%s: %v", message, lastErr)
+	}
+	slog.Error(message)
+	// Out of attempts, so the service is finished until something about it
+	// changes, whatever the last failure was.
+	reportError(ctx, report, frames.NewErrorFrame(message), lastErr, true)
+	return false
+}
+
+// reportError hands ef to report, if there is one, carrying the error behind it
+// so the category can be worked out from it.
+func reportError(
+	ctx context.Context, report ReportError, ef *frames.ErrorFrame, err error, forceTreatAsPermanent bool,
+) {
+	if report == nil {
+		return
+	}
+	ef.Err = err
+	report(ctx, ef, forceTreatAsPermanent)
+}
+
+// reconnectWebsocket closes what is left of the old connection and opens a new
+// one, then checks it is really there.
+func (b *Base) reconnectWebsocket(ctx context.Context, attempt int) (bool, error) {
+	slog.Warn("reconnecting websocket", "attempt", attempt)
+	if err := b.handler.DisconnectWebsocket(ctx); err != nil {
+		return false, err
+	}
+	if err := b.handler.ConnectWebsocket(ctx); err != nil {
+		return false, err
+	}
+	if !b.handler.Connected() {
+		return false, ErrVerification
+	}
+	return true, nil
+}
+
+// SendWithRetry sends and, when that fails, reconnects and sends once more. It
+// returns the failure that stood when there was no connection left to send on,
+// and nil once the message is away.
+//
+// Deprecated: it has no replacement. Send on the websocket directly and leave
+// reconnecting to the receive loop.
+func (b *Base) SendWithRetry(ctx context.Context, send func() error, report ReportError) error {
+	err := b.sendOnce(send)
+	if err == nil {
+		return nil
+	}
+	slog.Error("websocket send failed, will try to reconnect", "err", err)
+
+	if !b.TryReconnect(ctx, report) {
+		slog.Error("websocket send failed; unable to reconnect", "err", err)
+		return err
+	}
+	slog.Info("websocket reconnected, retrying the send")
+	return b.sendOnce(send)
+}
+
+// sendOnce sends, treating a missing connection as the send failure it is so the
+// caller reconnects rather than silently dropping the message.
+func (b *Base) sendOnce(send func() error) error {
+	if !b.handler.Connected() {
+		return ErrNotConnected
+	}
+	return send()
+}
+
+// ReconnectInProgress reports whether the receive loop is redialing. A service
+// whose connection the loop owns until it is back holds off on using it
+// meanwhile.
+func (b *Base) ReconnectInProgress() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.reconnectInProgress
+}
+
+func (b *Base) beginReconnect() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.reconnectInProgress {
+		return false
+	}
+	b.reconnectInProgress = true
+	return true
+}
+
+func (b *Base) endReconnect() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.reconnectInProgress = false
+}
+
+func (b *Base) setLastConnect(t time.Time) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.lastConnect = t
+}
+
+func (b *Base) lastConnectTime() time.Time {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.lastConnect
+}
+
+// isCloseError reports whether err is the peer closing the connection, as
+// opposed to a read failing for some other reason.
+func isCloseError(err error) bool {
+	return websocket.CloseStatus(err) != -1
+}
+
+// isNormalClosure reports whether err is the peer closing the connection
+// gracefully, with a normal closure or going away.
+func isNormalClosure(err error) bool {
+	switch websocket.CloseStatus(err) {
+	case websocket.StatusNormalClosure, websocket.StatusGoingAway:
+		return true
+	default:
+		return false
+	}
+}
+
+// sleepContext waits for d, or until ctx ends.
+func sleepContext(ctx context.Context, d time.Duration) {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+	case <-timer.C:
+	}
+}

@@ -1,0 +1,445 @@
+package pipeline
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"runtime"
+	"runtime/debug"
+	"sync"
+	"sync/atomic"
+	"time"
+	"weak"
+
+	"github.com/gojargo/jargo/frames"
+	"github.com/gojargo/jargo/internal/goid"
+	"github.com/gojargo/jargo/processor"
+)
+
+// observerDrainTimeout bounds how long the pipeline waits, once it has stopped,
+// for an observer to work through what is still queued for it. An observer that
+// has not finished by then is dropped where it stands rather than holding up the
+// shutdown for good.
+const observerDrainTimeout = 5 * time.Second
+
+// observerProxy stands in for the observers a task runs with. It is the one
+// observer handed to the processors; every frame reported to it is passed on to
+// each of the real observers.
+//
+// The point of it is that watching does not slow the pipeline down. Observers
+// are reported to on the goroutine the frame is traveling on, so anything one of
+// them does slowly is done in the middle of the conversation. Each observer here
+// gets a queue and a goroutine of its own instead, so a slow one falls behind on
+// its own rather than holding up the frames or the other observers.
+//
+// Delivery to a single observer stays in order, which is what the stateful ones
+// need: a turn cannot end before it starts.
+//
+// It also tells a frame's first push from the ones that follow, and only passes
+// the first one to observers that want a frame once.
+type observerProxy struct {
+	mu        sync.Mutex
+	observers []*observerWorker
+	started   bool
+	stopped   bool
+	// framesPushed holds the frames pushed so far, weakly: an entry goes away
+	// with its frame, so this tracks the frames in flight, not every frame ever
+	// pushed. A frame is known by its identity rather than its id, since a frame
+	// rebuilt from a bus carries none.
+	framesPushed map[weak.Pointer[frames.BaseFrame]]struct{}
+}
+
+// observerWorker is one observer with the queue of reports waiting for it.
+//
+// Each has a quit of its own rather than sharing the proxy's, so a single
+// observer can be dropped while the pipeline runs without disturbing the rest.
+type observerWorker struct {
+	observer processor.Observer
+	// everyPush is whether the observer observes every push of a frame, rather
+	// than only its first.
+	everyPush bool
+	queue     *reportQueue
+	quit      chan struct{}
+	done      chan struct{}
+	// finishing says no more reports are coming, so the worker delivers what is
+	// left and then stops. It is how a normal shutdown differs from dropping an
+	// observer mid-run, which stops it where it stands.
+	finishing chan struct{}
+	// stopping makes cancel idempotent, so an observer removed after the
+	// pipeline stopped is not canceled twice.
+	stopping sync.Once
+	// draining makes finish idempotent.
+	draining sync.Once
+	// goroutine is the number of the goroutine delivering to the observer, so
+	// an observer removing itself from one of its own callbacks is recognized.
+	goroutine atomic.Uint64
+}
+
+// pipelineStarted is what a worker queues to itself to report the pipeline
+// having started, so the report reaches the observer in order with the frames
+// rather than overtaking them.
+type pipelineStarted struct{}
+
+// setupStarted is what a worker queues to report that it has begun setting its
+// processors up. It carries the instant rather than leaving the observer to read
+// a clock, since it is delivered off the frame path and so a moment later.
+type setupStarted struct{ at time.Time }
+
+func newObserverWorker(o processor.Observer) *observerWorker {
+	return &observerWorker{
+		observer:  o,
+		everyPush: processor.ObservesEveryPush(o),
+		queue:     newReportQueue(),
+		quit:      make(chan struct{}),
+		done:      make(chan struct{}),
+		finishing: make(chan struct{}),
+	}
+}
+
+// newObserverProxy builds a proxy over the given observers.
+func newObserverProxy(observers []processor.Observer) *observerProxy {
+	p := &observerProxy{framesPushed: map[weak.Pointer[frames.BaseFrame]]struct{}{}}
+	for _, o := range observers {
+		p.observers = append(p.observers, newObserverWorker(o))
+	}
+	return p
+}
+
+// start runs a goroutine per observer. Reports made before this are dropped, as
+// there is nothing yet to deliver them.
+func (p *observerProxy) start() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.started {
+		return
+	}
+	p.started = true
+	for _, w := range p.observers {
+		go w.run()
+	}
+}
+
+// stop ends the observer goroutines and waits for them to finish.
+//
+// What is still queued is delivered first. An observer runs behind the frames,
+// so at the moment the pipeline stops it is typically still working through the
+// end of the conversation, and the reports it has not reached yet are the ones
+// that say how the conversation ended. Dropping them loses exactly the part a
+// stateful observer needs to close its books.
+//
+// The wait is bounded by observerDrainTimeout, so an observer that cannot keep
+// up does not hold the shutdown open for good.
+func (p *observerProxy) stop() {
+	p.mu.Lock()
+	if p.stopped || !p.started {
+		p.stopped = true
+		p.mu.Unlock()
+		return
+	}
+	p.stopped = true
+	workers := p.observers
+	p.mu.Unlock()
+
+	for _, w := range workers {
+		w.finish()
+	}
+	for _, w := range workers {
+		cleanupObserver(w.observer)
+	}
+}
+
+// cleanupObserver lets an observer release what it holds, once nothing reports
+// to it any more. Tearing down is best effort: an observer that fails is logged
+// and the rest are still cleaned up.
+func cleanupObserver(o processor.Observer) {
+	c, ok := o.(processor.CleanupObserver)
+	if !ok {
+		return
+	}
+	if err := c.Cleanup(context.Background()); err != nil {
+		slog.Error("cleaning up an observer failed", "observer", fmt.Sprintf("%T", o), "err", err)
+	}
+}
+
+// add registers another observer while the pipeline runs, starting its goroutine
+// if the others are already running.
+func (p *observerProxy) add(o processor.Observer) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.stopped {
+		return
+	}
+	w := newObserverWorker(o)
+	p.observers = append(p.observers, w)
+	if !p.started {
+		return
+	}
+	go w.run()
+}
+
+// remove drops an observer while the pipeline runs. It stops reporting to it
+// before returning, so a caller may release whatever the observer holds.
+//
+// An observer removing itself does so from one of its own callbacks, on the
+// goroutine delivering to it, which cannot wait for itself to end. Its worker is
+// told to stop instead, and ends once the callback returns.
+func (p *observerProxy) remove(o processor.Observer) {
+	p.mu.Lock()
+	var found *observerWorker
+	kept := p.observers[:0:0]
+	for _, w := range p.observers {
+		if found == nil && w.observer == o {
+			found = w
+			continue
+		}
+		kept = append(kept, w)
+	}
+	p.observers = kept
+	started := p.started
+	p.mu.Unlock()
+
+	// Nothing is running before the pipeline starts, so there is no goroutine to
+	// end: dropping it from the list is the whole of it.
+	if found == nil || !started {
+		return
+	}
+	if found.onWorkerGoroutine() {
+		found.stop()
+	} else {
+		found.cancel()
+	}
+	// The pipeline cleans up only the observers still registered when it stops,
+	// so a removed one is cleaned up here.
+	cleanupObserver(o)
+}
+
+// pipelineStarted reports the pipeline having started to every observer. It goes
+// through the same queues as the frames, so an observer hears it in order.
+func (p *observerProxy) pipelineStarted() { p.send(pipelineStarted{}) }
+
+// setupStarted reports the pipeline having begun setting its processors up.
+func (p *observerProxy) setupStarted(at time.Time) { p.send(setupStarted{at: at}) }
+
+// OnPushFrame implements processor.Observer, queueing the push for the
+// observers. A repeated push only reaches the observers that want every push.
+func (p *observerProxy) OnPushFrame(data processor.FramePushed) {
+	p.mu.Lock()
+	workers := p.observers
+	if !p.started || len(workers) == 0 {
+		p.mu.Unlock()
+		return
+	}
+	base := data.Frame.Base()
+	key := weak.Make(base)
+	_, seen := p.framesPushed[key]
+	data.FirstPush = !seen
+	if data.FirstPush {
+		p.framesPushed[key] = struct{}{}
+		runtime.AddCleanup(base, p.forget, key)
+	}
+	p.mu.Unlock()
+
+	for _, w := range workers {
+		if data.FirstPush || w.everyPush {
+			w.queue.push(data)
+		}
+	}
+}
+
+// forget drops a frame the pipeline has let go of from the frames pushed.
+func (p *observerProxy) forget(key weak.Pointer[frames.BaseFrame]) {
+	p.mu.Lock()
+	delete(p.framesPushed, key)
+	p.mu.Unlock()
+}
+
+// pushedFrames is how many frames the proxy is tracking, for tests.
+func (p *observerProxy) pushedFrames() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return len(p.framesPushed)
+}
+
+// OnProcessorSetup implements processor.SetupObserver.
+func (p *observerProxy) OnProcessorSetup(data processor.ProcessorSetUp) { p.send(data) }
+
+// OnProcessFrame implements processor.ProcessObserver.
+func (p *observerProxy) OnProcessFrame(data processor.FrameProcessed) { p.send(data) }
+
+// send hands a report to every observer's queue without blocking the pipeline.
+func (p *observerProxy) send(data any) {
+	p.mu.Lock()
+	workers := p.observers
+	started := p.started
+	p.mu.Unlock()
+	if !started {
+		return
+	}
+	for _, w := range workers {
+		w.queue.push(data)
+	}
+}
+
+// run delivers this observer's reports, in order, until the worker is canceled
+// or has delivered everything left to it.
+func (w *observerWorker) run() {
+	defer close(w.done)
+	w.goroutine.Store(goid.Current())
+	for {
+		data, ok := w.queue.get(w.quit, w.finishing)
+		if !ok {
+			return
+		}
+		w.deliver(data)
+	}
+}
+
+// finish tells the worker that no more reports are coming and waits for it to
+// deliver what is left, giving up after observerDrainTimeout and stopping it
+// where it stands. It is safe to call more than once.
+func (w *observerWorker) finish() {
+	w.draining.Do(func() { close(w.finishing) })
+	select {
+	case <-w.done:
+	case <-time.After(observerDrainTimeout):
+		w.cancel()
+	}
+}
+
+// cancel ends this worker's goroutine and waits for it to finish. It is safe to
+// call more than once, and from more than one goroutine.
+func (w *observerWorker) cancel() {
+	w.stop()
+	<-w.done
+}
+
+// stop tells this worker's goroutine to end without waiting for it: it returns
+// once the report it is delivering, if any, has been delivered.
+func (w *observerWorker) stop() {
+	w.stopping.Do(func() { close(w.quit) })
+}
+
+// onWorkerGoroutine reports whether the caller is the goroutine delivering to
+// this worker's observer.
+func (w *observerWorker) onWorkerGoroutine() bool {
+	id := w.goroutine.Load()
+	return id != 0 && id == goid.Current()
+}
+
+// deliver passes one report to the observer. An observer that panics is logged
+// and given the next report all the same: it runs on a goroutine of its own, so
+// an unrecovered panic would end the process and every session in it, and an
+// observer left behind would get nothing more while its queue kept growing.
+func (w *observerWorker) deliver(data any) {
+	defer func() {
+		if r := recover(); r != nil {
+			slog.Error("uncaught panic in observer",
+				"observer", fmt.Sprintf("%T", w.observer), "panic", r, "stack", string(debug.Stack()))
+		}
+	}()
+	switch d := data.(type) {
+	case processor.FramePushed:
+		w.observer.OnPushFrame(d)
+	case processor.FrameProcessed:
+		if po, ok := w.observer.(processor.ProcessObserver); ok {
+			po.OnProcessFrame(d)
+		}
+	case processor.ProcessorSetUp:
+		if so, ok := w.observer.(processor.SetupObserver); ok {
+			so.OnProcessorSetup(d)
+		}
+	case setupStarted:
+		if so, ok := w.observer.(processor.SetupStartedObserver); ok {
+			so.OnPipelineSetupStarted(d.at)
+		}
+	case pipelineStarted:
+		if ps, ok := w.observer.(processor.PipelineStartedObserver); ok {
+			ps.OnPipelineStarted()
+		}
+	}
+}
+
+// reportQueue is an unbounded, concurrency-safe FIFO of reports with a single
+// consumer, holding what is waiting for one observer.
+//
+// It is unbounded because nothing is dropped while the pipeline runs, however
+// far behind an observer falls. The stateful ones are counting, and one that
+// lost the start of a turn or the close of a tool call would report a
+// conversation that never happened. Producers never block, so an observer that
+// cannot keep up grows its queue rather than holding up the frames.
+type reportQueue struct {
+	mu     sync.Mutex
+	items  []any
+	notify chan struct{}
+}
+
+func newReportQueue() *reportQueue {
+	return &reportQueue{notify: make(chan struct{}, 1)}
+}
+
+// push appends a report. It never blocks and never drops.
+func (q *reportQueue) push(data any) {
+	q.mu.Lock()
+	q.items = append(q.items, data)
+	q.mu.Unlock()
+
+	// Wake a waiting get. The buffer of one means a signal is never lost: if no
+	// one is waiting the pending wake is coalesced and drained on the next get.
+	select {
+	case q.notify <- struct{}{}:
+	default:
+	}
+}
+
+// tryGet pops the next report without blocking, reporting false when none is
+// waiting.
+func (q *reportQueue) tryGet() (any, bool) {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	if len(q.items) == 0 {
+		return nil, false
+	}
+	data := q.items[0]
+	// Clear the slot, so the backing array does not keep a report, and the
+	// frame in it, alive after it has been delivered.
+	q.items[0] = nil
+	q.items = q.items[1:]
+	return data, true
+}
+
+// get returns the next report, blocking until one is waiting, quit is closed, or
+// finishing is closed and nothing is left.
+//
+// quit stops the worker where it stands, whatever is still queued. finishing is
+// the orderly end: what is already queued is handed over first, and only an
+// empty queue ends the loop.
+func (q *reportQueue) get(quit, finishing <-chan struct{}) (any, bool) {
+	for {
+		select {
+		case <-quit:
+			return nil, false
+		default:
+		}
+		if data, ok := q.tryGet(); ok {
+			return data, true
+		}
+		// Nothing waiting, so an orderly end has nothing left to deliver.
+		select {
+		case <-finishing:
+			return nil, false
+		default:
+		}
+		select {
+		case <-quit:
+			return nil, false
+		case <-finishing:
+		case <-q.notify:
+		}
+	}
+}
+
+// Compile-time interface checks.
+var (
+	_ processor.Observer        = (*observerProxy)(nil)
+	_ processor.ProcessObserver = (*observerProxy)(nil)
+)

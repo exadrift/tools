@@ -1,0 +1,144 @@
+// Package service holds what every AI service in a pipeline has in common,
+// whatever it does: transcription, generation or synthesis.
+//
+// A concrete service embeds Base rather than a bare frame processor, which is
+// what gives it the behavior the rest of the pipeline expects of a service:
+// describing itself to the processors around it, and describing itself again
+// when asked.
+package service
+
+import (
+	"context"
+	"log/slog"
+	"slices"
+	"strings"
+
+	"github.com/gojargo/jargo/frames"
+	"github.com/gojargo/jargo/processor"
+)
+
+// MetadataDescriber is implemented by a service that describes itself to the
+// rest of the pipeline: the name it answers to, and whatever else downstream
+// processors need to know about it, such as the turn-taking a transcriber with
+// its own end-of-turn detection recommends.
+//
+// Each call must return a fresh frame. The metadata goes out in both directions,
+// as two frames, so the two halves cannot share one.
+type MetadataDescriber interface {
+	// ServiceMetadataFrame is the metadata to broadcast, or nil to broadcast
+	// nothing.
+	ServiceMetadataFrame() frames.ServiceMetadata
+}
+
+// Base is the foundation of every AI service. Embed it in a concrete service
+// and pass the concrete value as self, the same way a frame processor is built:
+//
+//	type Synth struct{ *service.Base }
+//
+//	func NewSynth() *Synth {
+//	    s := &Synth{}
+//	    s.Base = service.New("Synth", s)
+//	    return s
+//	}
+//
+// Implement MetadataDescriber on the concrete service to have it described to
+// the pipeline.
+type Base struct {
+	*processor.Base
+}
+
+// New builds a service Base named name on behalf of self, the concrete service
+// embedding it.
+func New(name string, self processor.Processor, opts ...processor.Option) *Base {
+	b := &Base{Base: processor.New(name, self, opts...)}
+	b.Events().Register(EventConnectionError, false)
+	return b
+}
+
+// EventConnectionError fires when the service's connection to its provider
+// fails: each failed attempt to restore it, and giving up. The handler is given
+// the error's message.
+//
+//	events.On(svc.Events(), service.EventConnectionError,
+//	    func(ctx context.Context, msg string) { … })
+const EventConnectionError = "on_connection_error"
+
+// ReportConnectionError reports a failure of the service's connection to its
+// provider: it fires EventConnectionError with the message, then pushes the
+// error frame. forceTreatAsPermanent says the failure will keep recurring, as
+// it does once reconnecting has been given up on.
+func (b *Base) ReportConnectionError(ctx context.Context, ef *frames.ErrorFrame, forceTreatAsPermanent bool) {
+	b.Events().Call(ctx, EventConnectionError, b.Self(), ef.Error)
+	b.PushErrorFrame(ctx, ef, forceTreatAsPermanent)
+}
+
+// SettingsUpdated records that this service's settings have actually changed.
+//
+// New settings may be the ones that make the service work, so a service written
+// off for a rejected model or voice is given another chance rather than being
+// left unable to take work for the rest of the run. Call it from a settings
+// update that changed something, and not from one that changed nothing.
+func (b *Base) SettingsUpdated(ctx context.Context) {
+	// Through Self, so a service that does more when it becomes usable again is
+	// the one that decides: an embedded method is not an override, and calling
+	// it here directly would skip whatever the concrete service does.
+	b.Self().SetUsable(ctx, true)
+}
+
+// WarnUnhandledUpdatedSettings reports settings an update changed that will not
+// take effect while the service runs: a service that applies some fields at
+// runtime and only stores the rest calls it with the rest, so a caller who asked
+// for them hears that rather than assuming they took effect. It does nothing
+// when there is nothing to report.
+func (b *Base) WarnUnhandledUpdatedSettings(ctx context.Context, unhandled []string) {
+	if len(unhandled) == 0 {
+		return
+	}
+	fields := slices.Sorted(slices.Values(unhandled))
+	slog.WarnContext(ctx, "runtime update of these settings is not currently supported",
+		"service", b.Name(), "fields", strings.Join(fields, ", "))
+}
+
+// BroadcastServiceMetadata sends this service's metadata both ways through the
+// pipeline, so processors on either side of it learn what it is. It does nothing
+// for a service that does not describe itself.
+func (b *Base) BroadcastServiceMetadata(ctx context.Context) {
+	d, ok := b.Self().(MetadataDescriber)
+	if !ok {
+		return
+	}
+	if d.ServiceMetadataFrame() == nil {
+		return
+	}
+	_ = b.Broadcast(ctx, func() frames.Frame { return d.ServiceMetadataFrame() })
+}
+
+// ProcessFrame handles what every service handles. A concrete service overrides
+// it and calls this first.
+func (b *Base) ProcessFrame(ctx context.Context, f frames.Frame, dir processor.Direction) error {
+	if err := b.Base.ProcessFrame(ctx, f, dir); err != nil {
+		return err
+	}
+	if _, ok := f.(*frames.ServiceSwitcherRequestMetadataFrame); ok {
+		// A switcher has just made this service the active one and wants the
+		// pipeline told, since what it knows describes the service replaced.
+		b.BroadcastServiceMetadata(ctx)
+	}
+	return nil
+}
+
+// PushFrame forwards a frame, and describes the service to the pipeline once it
+// has started.
+//
+// The metadata goes out after the StartFrame rather than while it is being
+// handled, so the processors it reaches have been started themselves and are
+// ready to make sense of it.
+func (b *Base) PushFrame(ctx context.Context, f frames.Frame, dir processor.Direction) error {
+	if err := b.Base.PushFrame(ctx, f, dir); err != nil {
+		return err
+	}
+	if _, isStart := f.(*frames.StartFrame); isStart && dir == processor.Downstream {
+		b.BroadcastServiceMetadata(ctx)
+	}
+	return nil
+}

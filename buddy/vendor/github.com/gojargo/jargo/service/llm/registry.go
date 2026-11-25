@@ -1,0 +1,232 @@
+package llm
+
+import (
+	"context"
+	"log/slog"
+	"time"
+	"unsafe"
+
+	"github.com/gojargo/jargo/frames"
+)
+
+// SyncToolHandlers brings the registry into line with the toolset the
+// conversation advertises: it registers the handler any advertised tool carries,
+// and drops the ones it registered that way for tools no longer advertised. What
+// the model can call and what actually answers therefore stay the same thing,
+// without an application having to keep two lists in step.
+//
+// It runs on every inference, since the conversation carries its current toolset
+// each time. Only handlers registered from a toolset are ever dropped: one
+// registered by hand is the application's to remove.
+//
+// It takes the toolset rather than the conversation carrying it, because a
+// service generating continuously is told about a new toolset on its own and
+// has no conversation to read it from.
+//
+// When the toolset advertises nothing, the handlers come from the tools the
+// service was configured with instead, if it implements [ServiceToolsHolder].
+// Only standard tools carry handlers, so custom tools written in a provider's
+// own format contribute nothing to register.
+//
+// It ends by settling what the registry decides: the cancel tools, and the
+// system instruction, whose guidance on asynchronous tools and on canceling
+// them depends on which handlers are registered.
+func (b *Base) SyncToolHandlers(ctx context.Context, tools frames.ToolsSchema) {
+	if tools.Empty() {
+		// No tools advertised? Fall back to the service's own configured tools.
+		if holder, ok := b.gen.(ServiceToolsHolder); ok {
+			tools = holder.ServiceTools()
+		}
+	}
+	advertised := make(map[string]bool, len(tools.Standard))
+	for _, t := range tools.Standard {
+		if t.Handler == nil {
+			// Advertise-only. Something must have registered a handler by hand, or
+			// the call falls through to the missing-function answer.
+			continue
+		}
+		advertised[t.Name] = true
+		b.registerToolHandler(ctx, t)
+	}
+	b.dropUnadvertisedToolHandlers(advertised)
+	b.forgetUnadvertisedRemovals(advertised)
+
+	// What the registry holds decides both whether the asynchronous-tool
+	// guidance belongs in the system instruction and whether the cancel tools
+	// do, and it is settled only here: tools advertised on a conversation
+	// register during this sync, and a conversation can advertise nothing.
+	b.syncCancelTools()
+	b.composeSystemInstruction()
+}
+
+// ServiceToolsHolder is an optional interface a Generator implements when it
+// accepts tools configured on the service itself, as an alternative to
+// advertising them through the conversation. The realtime services do: their
+// tools can be given when the service is built.
+//
+// ServiceTools returns those tools as configured, or an empty schema when there
+// are none. They are what [Base.SyncToolHandlers] registers handlers from when
+// the conversation advertises no tools, so a handler carried by a configured
+// tool needs no separate RegisterFunction call.
+//
+// A service implementing it must follow the same preference wherever it settles
+// the tools a session carries: the conversation's own tools when it advertises
+// any, and the configured ones otherwise.
+type ServiceToolsHolder interface {
+	ServiceTools() frames.ToolsSchema
+}
+
+// forgetUnadvertisedRemovals stops holding a removal against a tool the toolset
+// no longer advertises. The removal is only there to keep the toolset from
+// undoing it, so once the tool is gone there is nothing left to undo, and
+// advertising it again registers its handler afresh.
+func (b *Base) forgetUnadvertisedRemovals(advertised map[string]bool) {
+	b.handlersMu.Lock()
+	defer b.handlersMu.Unlock()
+	for name := range b.unregisteredByHand {
+		if !advertised[name] {
+			delete(b.unregisteredByHand, name)
+		}
+	}
+}
+
+// registerToolHandler registers the handler a tool carries, unless the name is
+// already claimed or its handler was removed by hand. Registering by hand always
+// wins: it is the more deliberate act, and silently replacing it would make
+// which handler runs depend on the order two unrelated calls happened in. So
+// does unregistering by hand, or the removal would be undone here on the very
+// next inference and the call would go on being answered.
+//
+// A name the toolset itself registered is rebound when the tool now carries a
+// different handler, so a toolset that re-declares a tool under the same name
+// with a new handler has the new one run. The same handler advertised again is
+// left alone, so a context sent on every turn does not re-register it each
+// time.
+func (b *Base) registerToolHandler(ctx context.Context, t frames.Tool) {
+	b.handlersMu.Lock()
+	existing, claimed := b.handlers[t.Name]
+	removed := b.unregisteredByHand[t.Name]
+	b.handlersMu.Unlock()
+	if claimed && !existing.fromToolset {
+		b.warnRedundantRegistration(ctx, t.Name)
+		return
+	}
+	if removed {
+		return
+	}
+
+	h, ok := t.Handler.(FunctionCallHandler)
+	if !ok {
+		// A plain function with the right signature converts; anything else is a
+		// mistake worth naming, since the tool will otherwise look registered and
+		// answer only that it is unavailable.
+		fn, isFunc := t.Handler.(func(context.Context, FunctionCallParams) error)
+		if !isFunc {
+			slog.ErrorContext(ctx, "advertised tool carries a handler of the wrong type",
+				"service", b.Name(), "function", t.Name, "handler", t.Handler)
+			return
+		}
+		h = fn
+	}
+	if claimed && sameHandler(existing.handler, h) {
+		return
+	}
+
+	b.RegisterFunction(t.Name, h, toolCallOptions(t)...)
+	b.handlersMu.Lock()
+	if item, ok := b.handlers[t.Name]; ok {
+		// Marked as the toolset's, so a later sync that stops advertising the tool
+		// takes its handler away too.
+		item.fromToolset = true
+		b.handlers[t.Name] = item
+	}
+	b.handlersMu.Unlock()
+
+	if claimed {
+		slog.DebugContext(ctx, "rebound an advertised tool to its new handler",
+			"service", b.Name(), "function", t.Name)
+		return
+	}
+	slog.DebugContext(ctx, "registered the handler an advertised tool carries",
+		"service", b.Name(), "function", t.Name)
+}
+
+// warnRedundantRegistration warns, once per tool, that a tool registered by
+// hand is advertised carrying a handler of its own, which would have registered
+// it anyway. The hand-registered handler is the one that runs.
+func (b *Base) warnRedundantRegistration(ctx context.Context, name string) {
+	b.handlersMu.Lock()
+	warned := b.warnedRedundantRegistrations[name]
+	if !warned {
+		if b.warnedRedundantRegistrations == nil {
+			b.warnedRedundantRegistrations = make(map[string]bool)
+		}
+		b.warnedRedundantRegistrations[name] = true
+	}
+	b.handlersMu.Unlock()
+	if warned {
+		return
+	}
+	slog.WarnContext(ctx, "a tool registered with RegisterFunction is advertised carrying a handler of its own; "+
+		"the registration is unnecessary when the handler is on the tool",
+		"service", b.Name(), "function", name)
+}
+
+// sameHandler reports whether a and b are the same function value: the same
+// closure, not merely closures built from the same code.
+//
+// Go does not compare functions, and reflect identifies one only by its code
+// pointer, which every closure of a function literal shares. So a toolset that
+// builds a fresh handler per step from one literal would look unchanged. What
+// does tell two closures apart is the closure itself, which a func value points
+// to and an interface holding one carries as its data word.
+func sameHandler(a, b FunctionCallHandler) bool {
+	return funcData(a) == funcData(b)
+}
+
+// funcData returns the data word of an interface holding h: the closure a func
+// value points to.
+func funcData(h FunctionCallHandler) unsafe.Pointer {
+	var v any = h
+	//nolint:gosec // reads the data word of an interface value, which the runtime lays out as a pair of words
+	return (*[2]unsafe.Pointer)(unsafe.Pointer(&v))[1]
+}
+
+// toolCallOptions turns the call options a tool carries into registration
+// options. A tool that sets neither registers with the service's own defaults,
+// which is what an advertised tool that says nothing about how it runs should
+// get.
+func toolCallOptions(t frames.Tool) []RegisterOption {
+	var opts []RegisterOption
+	if t.CancelOnInterruption != nil {
+		opts = append(opts, WithCancelOnInterruption(*t.CancelOnInterruption))
+	}
+	if t.TimeoutSecs != nil {
+		opts = append(opts, WithTimeout(time.Duration(*t.TimeoutSecs*float64(time.Second))))
+	}
+	if t.CancellableByLLM != nil {
+		opts = append(opts, WithCancellableByLLM(*t.CancellableByLLM))
+	}
+	if t.Cleanup != nil {
+		if c, ok := t.Cleanup.(ToolCleanup); ok {
+			opts = append(opts, WithToolCleanup(c))
+		} else {
+			slog.Error("advertised tool names a resource of the wrong type",
+				"function", t.Name, "cleanup", t.Cleanup)
+		}
+	}
+	return opts
+}
+
+// dropUnadvertisedToolHandlers removes the handlers that came from a toolset no
+// longer advertising them. Handlers registered by hand, the catch-all and the
+// service's own built-in tools are left alone.
+func (b *Base) dropUnadvertisedToolHandlers(advertised map[string]bool) {
+	b.handlersMu.Lock()
+	defer b.handlersMu.Unlock()
+	for name, item := range b.handlers {
+		if item.fromToolset && !advertised[name] {
+			delete(b.handlers, name)
+		}
+	}
+}

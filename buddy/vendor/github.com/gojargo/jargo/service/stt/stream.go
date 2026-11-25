@@ -1,0 +1,1477 @@
+// Package stt is the shared base for speech-to-text services. It offers two
+// shapes: StreamService for providers that transcribe continuously over a live
+// connection (the result is a stream of interim and final transcriptions), and
+// SegmentService for batch providers that transcribe a whole utterance at once
+// (delimited by a turn detector upstream).
+//
+// A concrete provider supplies only the part that differs — a Connector that
+// opens a session, or a Transcriber that transcribes one segment — while the
+// frame contract and lifecycle live here.
+package stt
+
+import (
+	"context"
+	"errors"
+	"log/slog"
+	"sync"
+	"time"
+
+	"github.com/gojargo/jargo/frames"
+	"github.com/gojargo/jargo/language"
+	"github.com/gojargo/jargo/processor"
+	"github.com/gojargo/jargo/service"
+	"github.com/gojargo/jargo/service/settings"
+	"github.com/gojargo/jargo/service/wsservice"
+	"github.com/gojargo/jargo/telemetry/metrics"
+	"github.com/gojargo/jargo/telemetry/tracing"
+	errs "github.com/gojargo/jargo/utils/errors"
+)
+
+// errNoSession is returned when a Connector reports neither a session nor an
+// error, which leaves nothing to transcribe on.
+//
+//nolint:gochecknoglobals // sentinel error
+var errNoSession = errors.New("stt: connector returned no session")
+
+// Result is one transcription result from a streaming STT provider.
+type Result struct {
+	// Text is the transcribed text.
+	Text string
+	// Final reports whether this is a finalized result rather than an interim
+	// partial.
+	Final bool
+	// EndOfTurn reports whether this result marks the end of the user's turn,
+	// the point at which the aggregator may trigger the LLM.
+	EndOfTurn bool
+	// Language is the detected language as a BCP-47 tag, or "" when unknown.
+	Language string
+	// Speech reports a speech boundary the provider detected itself. Most
+	// providers leave it unset and let the pipeline's own detection decide when
+	// the user is speaking; a provider running detection server-side sets it so
+	// the pipeline can defer to that instead. A result may carry a boundary and
+	// no text.
+	Speech SpeechState
+	// EagerEndOfTurn reports that the provider predicts the turn has ended,
+	// without having committed to it. The text is what it heard for the turn so
+	// far, and the prediction is withdrawn with EagerEndOfTurnWithdrawn if the
+	// user turns out to be mid-sentence.
+	//
+	// It is only acted on by a service configured for it, since answering a
+	// prediction spends an inference on every one, including the withdrawn ones.
+	EagerEndOfTurn bool
+	// EagerEndOfTurnWithdrawn reports that a prediction the provider made has
+	// turned out to be wrong, most often because the user resumed speaking.
+	EagerEndOfTurnWithdrawn bool
+	// FromFinalize reports that this result is the provider answering the
+	// finalize it was asked for. Only a provider that confirms a flush sets it,
+	// and only then is the transcript that follows the last one for the
+	// utterance: a result may be final without being the end of the turn. A
+	// provider that flushes without confirming leaves it unset and says what it
+	// knows through EndOfTurn instead.
+	FromFinalize bool
+}
+
+// SpeechState is a speech boundary a provider detected on its own.
+type SpeechState int
+
+const (
+	// SpeechUnknown means the result says nothing about speech boundaries,
+	// which is the case for every provider that leaves detection to the
+	// pipeline.
+	SpeechUnknown SpeechState = iota
+	// SpeechStarted means the provider heard the user begin speaking.
+	SpeechStarted
+	// SpeechStopped means the provider heard the user stop.
+	SpeechStopped
+)
+
+// Stream is a live STT session opened by a Connector. The service writes audio
+// with Send and reads results with Recv until Recv returns an error (including
+// io.EOF), then calls Close.
+type Stream interface {
+	// Send writes a chunk of 16-bit mono PCM audio to the session.
+	Send(audio []byte) error
+	// Recv blocks for the next batch of results, returning an error when the
+	// session ends.
+	Recv() ([]Result, error)
+	// Close tears the session down.
+	Close() error
+}
+
+// Connector opens a streaming STT session for the given input sample rate.
+type Connector interface {
+	Connect(ctx context.Context, sampleRate int) (Stream, error)
+}
+
+// ErrorClassifier is an optional interface a Connector implements when the
+// provider signals failures through its own protocol rather than an HTTP status,
+// so the shared classification has nothing to read. Returning the zero category
+// leaves the shared classification to decide.
+//
+// The service holds it, since the service is the processor whose usability an
+// error decides. It mirrors the classification hook the original puts on the
+// service class for the same reason.
+type ErrorClassifier interface {
+	ClassifyError(err error) errs.Category
+}
+
+const (
+	// keepaliveSilence is how much silence one keepalive submits.
+	keepaliveSilence = 100 * time.Millisecond
+	// DefaultKeepaliveInterval is how often the idle check runs when a provider
+	// asks for a keepalive without saying how often to look.
+	DefaultKeepaliveInterval = 5 * time.Second
+)
+
+// KeepaliveOptions says how a provider wants an idle session held open.
+type KeepaliveOptions struct {
+	// Timeout is how long a session may carry no audio before silence is sent
+	// to keep it open. Zero disables the keepalive, which is right for a
+	// provider that leaves an idle session alone.
+	Timeout time.Duration
+	// Interval is how often the session is checked for having gone idle. Zero
+	// takes DefaultKeepaliveInterval.
+	Interval time.Duration
+}
+
+// Keepaliver is an optional interface a Connector implements when the provider
+// closes a session that carries no audio for a while. Silence only reaches the
+// service during a call when nobody is speaking, and a service switched out of
+// the pipeline sends nothing at all, so an idle session is a normal thing to
+// have and a closed one costs the next thing the user says. A Connector that
+// does not implement this gets no keepalive, which is right for a provider that
+// leaves an idle session open.
+type Keepaliver interface {
+	Keepalive() KeepaliveOptions
+}
+
+// KeepaliveSender is an optional interface a Stream implements when the silence
+// has to be wrapped in the provider's own protocol, or replaced by a protocol
+// message of its own, rather than submitted as raw audio. A Stream that does not
+// implement it has the silence sent with Send, and that silence is audio the
+// provider bills for, so it counts towards the session's usage. Silence a
+// provider swaps for a protocol message is not audio and is not counted.
+type KeepaliveSender interface {
+	SendKeepalive(silence []byte) error
+}
+
+const (
+	// DefaultTurnWatchdogMinTimeout is the shortest gap in the audio a provider
+	// is left to sit through before silence is submitted, when a provider asks
+	// for a watchdog without saying how long to wait.
+	DefaultTurnWatchdogMinTimeout = 500 * time.Millisecond
+	// DefaultTurnWatchdogInterval is how often the gap is measured.
+	DefaultTurnWatchdogInterval = 100 * time.Millisecond
+)
+
+// TurnWatchdogOptions says how a provider wants a stalled turn nudged along.
+type TurnWatchdogOptions struct {
+	// MinTimeout is the shortest gap in the audio the provider is left to sit
+	// through. The gap actually waited for is the larger of this and twice the
+	// last chunk's duration, so a pipeline sending long chunks is not nudged
+	// between two of them. Nil takes DefaultTurnWatchdogMinTimeout; zero leaves
+	// only the twice-a-chunk floor.
+	MinTimeout *time.Duration
+	// Interval is how often the gap is measured. Zero takes
+	// DefaultTurnWatchdogInterval.
+	Interval time.Duration
+}
+
+// TurnWatchdoger is an optional interface a Connector implements when the
+// provider decides the end of a turn from the audio it is fed, and so reports
+// nothing at all if the audio stops arriving mid-turn. The turn then hangs open
+// until something else closes it.
+//
+// Silence is submitted to close the gap, but only while a turn is open: a
+// provider that has not reported one has nothing stalled, and outside a turn an
+// idle session is the keepalive's business. Implementing this asks for the
+// watchdog; a Connector that does not gets none, which is right for a provider
+// whose turn boundary does not depend on the audio continuing to flow.
+type TurnWatchdoger interface {
+	TurnWatchdog() TurnWatchdogOptions
+}
+
+// SessionEnder is an optional interface a Stream implements when something it
+// reports lives in one session, so a session that ends without the service
+// asking leaves it open: a turn the provider started and never got to end, say.
+// EndSession is called once such a session has ended, and returns the results
+// that close what it left open. It is not called for a session the service
+// closed itself.
+type SessionEnder interface {
+	EndSession() []Result
+}
+
+// Drainer is an optional interface a Stream implements when the provider is told
+// the session is ending and answers with results it was still holding. Drain
+// sends that request and returns how long the results already on their way
+// should be waited for; the session is then torn down whether or not they
+// arrived. A Stream that does not implement it is closed at once, which is right
+// for a provider with nothing left to say by then.
+type Drainer interface {
+	Drain() (window time.Duration, err error)
+}
+
+// Finalizer is an optional interface a Stream implements when the provider has
+// to be told the speech has ended before it flushes the transcript for it.
+// Finalize is called once the VAD reports the user stopped, and the session
+// carries on afterwards for the next utterance. A Stream that does not implement
+// it is left to the provider's own endpointing.
+type Finalizer interface {
+	Finalize() error
+}
+
+// SpeechStarter is an optional interface a Stream implements when the start of
+// an utterance is something the session itself has to know about. SpeechStarted
+// is called once the VAD reports the user began speaking. It is where a session
+// that builds a transcript across several results drops what it was holding: the
+// utterance before it is over whether or not the provider ever closed it, and
+// text left over from it would otherwise be read as the beginning of this one. A
+// Stream that keeps nothing between utterances does not implement it.
+type SpeechStarter interface {
+	SpeechStarted()
+}
+
+// SettingsHolder is an optional interface a provider implements when part of
+// what it was built with can change while the pipeline runs: the language it
+// transcribes, the model it uses. The value returned is the provider's own
+// store, a pointer to a settings value, which an update is merged into.
+//
+// Either kind of provider may implement it, a Connector or a Transcriber, and
+// either kind of service applies an update the same way.
+type SettingsHolder interface {
+	Settings() any
+}
+
+// SettingsUpdater is an optional interface a provider implements to act on a
+// settings change. A provider that holds settings without implementing this
+// still has them updated; it simply picks them up the next time it is used.
+type SettingsUpdater interface {
+	SettingsHolder
+	// UpdateSettings is called once the changed fields have been written to the
+	// store, with what changed and what each field held before. Returning true
+	// asks for the session to be reopened, which is what a provider needs when
+	// the setting is fixed at the point the session opens and cannot be changed
+	// on a session already running. A segmented service has no session to
+	// reopen and transcribes the next segment with the settings as they stand,
+	// so it ignores the request.
+	UpdateSettings(ctx context.Context, changed settings.Changed) (reopen bool, err error)
+}
+
+// LanguageNamer is an optional interface a provider implements to name a
+// language the way that provider does. Providers disagree on the codes, so a
+// caller naming a language neutrally has it converted before it is stored,
+// leaving the store holding the code the provider itself uses. Without that the
+// stored value and the next update would be in different vocabularies, and a
+// change would be reported for two spellings of the same language.
+type LanguageNamer interface {
+	ServiceLanguage(l language.Language) string
+}
+
+// EagerEndOfTurner is an optional interface a Connector implements when its
+// provider predicts the end of a turn before committing to it.
+//
+// Answering a prediction spends an inference on every one, including the ones
+// the provider withdraws, so it is the provider's own configuration that says
+// whether the service acts on them.
+type EagerEndOfTurner interface {
+	// EagerEndOfTurn reports whether the provider is configured to predict.
+	EagerEndOfTurn() bool
+}
+
+// Metadata describes an STT service to downstream processors. A Connector or
+// Transcriber implements Describer to provide it at pipeline start.
+type Metadata struct {
+	// UserTurnStrategies are the user turn strategies the service recommends. A
+	// service that does its own server-side end-of-turn detection returns
+	// turns.ExternalStrategies here, so the user aggregator adopts them unless
+	// the application configured its own.
+	//
+	// It holds a turns.UserTurnStrategies, carried untyped for the same reason
+	// frames.ServiceMetadataFrame carries it untyped.
+	UserTurnStrategies any
+	// TTFSP99 is the time-to-final-segment P99 latency reported on the metadata
+	// frame (see frames.STTMetadataFrame). Nil describes the service with
+	// DefaultTTFSP99; zero describes it with no wait at all.
+	TTFSP99 *time.Duration
+	// SupportsTTFS reports whether TTFS means anything for this service; nil
+	// defaults to true. A service whose server defines the turn boundary sets it
+	// false, and is described with no wait at all rather than a measured one.
+	SupportsTTFS *bool
+	// Model is the provider's model identifier, e.g. "nova-3". It labels the
+	// metrics and is what a cost-tracking backend prices the transcription
+	// against, so it should be the identifier the provider bills under.
+	Model string
+}
+
+// ttfs is the latency a described service is published with: none when TTFS
+// does not apply to it, its own measurement when it carries one, and the
+// fallback when it does not.
+func (m Metadata) ttfs(service string) time.Duration {
+	if m.SupportsTTFS != nil && !*m.SupportsTTFS {
+		return 0
+	}
+	if m.TTFSP99 != nil {
+		return *m.TTFSP99
+	}
+	slog.Warn("stt: no TTFS p99 latency measured for this service, using the fallback",
+		"service", service, "fallback", DefaultTTFSP99)
+	return DefaultTTFSP99
+}
+
+// TTFSP99Or is the latency a provider describes itself with: the configured
+// one when set, zero included, and the provider's measured default otherwise.
+func TTFSP99Or(configured *time.Duration, def time.Duration) *time.Duration {
+	if configured != nil {
+		return configured
+	}
+	return &def
+}
+
+// Describer is an optional interface a Connector or Transcriber implements to
+// describe its STT service. When unimplemented, the base broadcasts a plain
+// STTMetadataFrame carrying only the service name.
+type Describer interface {
+	Metadata() Metadata
+}
+
+// StreamService is the shared processor for streaming STT providers. It manages
+// the session lifecycle, forwards input audio to the Stream, and turns results
+// into InterimTranscriptionFrames and TranscriptionFrames.
+//
+// The session is held open for the length of the call, so it can drop while the
+// call carries on. The service reopens it rather than transcribing nothing for
+// the rest of the call: see service/wsservice, which runs the read loop and the
+// reconnection around it. A dropped session costs the audio spoken during the
+// gap, which is why the reconnect is immediate rather than waiting for the next
+// utterance.
+type StreamService struct {
+	*service.Base
+	conn    Connector
+	cfgRate int
+	model   string
+	ws      *wsservice.Base
+	ttfb    *ttfbTracker
+	tracer  *segmentTracer
+
+	// eagerEndOfTurn reports whether this service answers a predicted end of
+	// turn ahead of the committed one, and eagerPending whether a prediction is
+	// outstanding. Both are read and written on the read loop, which is the only
+	// goroutine that emits results.
+	eagerEndOfTurn bool
+	eagerPending   bool
+
+	sampleRate int
+	mu         sync.Mutex
+	stream     Stream
+	// sendFailed records that the session refused the audio it was last given,
+	// which takes it out of use until the read loop replaces it. Writing on
+	// indefinitely is how a call goes quiet with nothing in the log to say
+	// whether the provider heard nothing or the audio never reached it, and
+	// repeating the send would repeat the warning for every 20ms of speech.
+	// What the session no longer takes is still audio the call submitted, so it
+	// still counts towards usage.
+	sendFailed bool
+	// sessionCancel ends the current session, replaced on every reconnect.
+	sessionCancel context.CancelFunc
+	// readCancel ends the read loop, and with it the whole connection. It
+	// outlives any one session, so a reconnect does not stop the loop.
+	readCancel context.CancelFunc
+	// audioBytes is the audio submitted since usage was last reported.
+	audioBytes int64
+	// speaking tracks the boundary a provider that runs its own detection last
+	// reported, so the frames go out in pairs however the provider repeats
+	// itself.
+	speaking bool
+	wg       sync.WaitGroup
+
+	// The finalize asked of the provider and the answer that came back. A
+	// provider that confirms the flush it was asked for is the only one that
+	// says which transcript closes the utterance, so the request is recorded and
+	// matched against the confirmation rather than read off any one result.
+	//
+	// finalizeRequested is set when the provider is told the speech ended, and
+	// stands unanswered for a provider that does not confirm.
+	finalizeRequested bool
+	// finalizePending is set once the provider confirms, and marks the next
+	// transcript as the last one for the utterance.
+	finalizePending bool
+
+	// keepalive is what the provider asked for; a zero Timeout means none.
+	keepalive KeepaliveOptions
+	// watchdog is what the provider asked for to keep a turn from stalling, and
+	// watchdogWanted whether it asked at all.
+	watchdog       TurnWatchdogOptions
+	watchdogWanted bool
+	// watchdogCancel stops the watchdog goroutine, nil when none is running.
+	watchdogCancel context.CancelFunc
+	watchdogWG     sync.WaitGroup
+	// lastChunk is how long the last chunk of audio submitted plays for. The
+	// watchdog waits out at least two of them, so a pipeline sending long chunks
+	// is not nudged in the gap between two ordinary ones.
+	lastChunk time.Duration
+	// lastAudio is when audio last went to the provider, which is what says
+	// whether the session has gone idle.
+	lastAudio time.Time
+	// keepaliveCancel stops the keepalive goroutine, nil when none is running.
+	keepaliveCancel context.CancelFunc
+	keepaliveWG     sync.WaitGroup
+
+	// Reopening the session for a settings change. Doing it while the user is
+	// mid-sentence would drop what they are saying, so it waits for the turn to
+	// end, and the audio that arrives in the gap is held rather than sent to a
+	// session that is being replaced.
+	//
+	// canReopen is false from the moment speech is detected until the turn ends.
+	canReopen bool
+	// needReopen records a reopen asked for while the user was speaking.
+	needReopen bool
+	// reopening is set while the session is being replaced, which is what says
+	// to hold incoming audio rather than send it.
+	reopening bool
+	// held is the audio that arrived while the session was being replaced, sent
+	// on once the new one is up so the words spoken across the gap are not lost.
+	held []heldAudio
+
+	// muted records that an STTMuteFrame asked for the audio to go
+	// untranscribed. The audio arriving while it stands is dropped rather than
+	// sent, so it is neither transcribed nor billed.
+	muted bool
+	// userID is the user the audio last sent was attributed to, "" when it
+	// named nobody. The transcripts the service emits carry it.
+	userID string
+
+	// settingsMu serializes reading the provider's settings against changing
+	// them. A session is opened from the read loop when one drops, and an update
+	// set applies settings updates to the provider's own store.
+	set *providerSettings
+}
+
+// heldAudio is a chunk held while the session is being replaced, with the user
+// it was attributed to.
+type heldAudio struct {
+	audio  []byte
+	userID string
+}
+
+// audioUserID is the user an input audio frame is attributed to, "" for audio
+// that names nobody.
+func audioUserID(f frames.InputAudioFrame) string {
+	if u, ok := f.(*frames.UserAudioRawFrame); ok {
+		return u.UserID
+	}
+	return ""
+}
+
+// CurrentSettings is the service's current settings, for code outside the
+// service to read, or nil when its provider keeps none. They are still changed
+// through an STTUpdateSettingsFrame.
+func (s *StreamService) CurrentSettings() any { return s.set.settings() }
+
+// StopAllMetrics reports the time to first byte being measured, as far as it
+// has got, implementing processor.MetricsStopper. An interruption is what calls
+// it: the transcript the measurement was waiting for will not come.
+func (s *StreamService) StopAllMetrics(ctx context.Context) { s.ttfb.reportNow(ctx) }
+
+// NewStream builds a streaming STT service named name driven by conn. A non-zero
+// sampleRate overrides the transport's input rate.
+func NewStream(name string, conn Connector, sampleRate int) *StreamService {
+	s := &StreamService{conn: conn, cfgRate: sampleRate}
+	if d, ok := conn.(Describer); ok {
+		s.model = d.Metadata().Model
+	}
+	if e, ok := conn.(EagerEndOfTurner); ok {
+		s.eagerEndOfTurn = e.EagerEndOfTurn()
+	}
+	if k, ok := conn.(Keepaliver); ok {
+		s.keepalive = k.Keepalive()
+		if s.keepalive.Interval <= 0 {
+			s.keepalive.Interval = DefaultKeepaliveInterval
+		}
+	}
+	if w, ok := conn.(TurnWatchdoger); ok {
+		s.watchdogWanted = true
+		s.watchdog = w.TurnWatchdog()
+		if s.watchdog.MinTimeout == nil {
+			s.watchdog.MinTimeout = new(DefaultTurnWatchdogMinTimeout)
+		}
+		if s.watchdog.Interval <= 0 {
+			s.watchdog.Interval = DefaultTurnWatchdogInterval
+		}
+	}
+	s.canReopen = true
+	s.Base = service.New(name, s)
+	s.set = &providerSettings{provider: conn, name: s.Name, onModel: s.setModel, onChanged: s.SettingsUpdated}
+	// The connection's reconnection settings come from the provider's
+	// configuration, where it has any.
+	var wsCfg wsservice.Config
+	if o, ok := conn.(wsservice.Optioner); ok {
+		wsCfg = o.WebsocketOptions().Config()
+	}
+	s.ws = wsservice.New(s, wsCfg)
+	s.ttfb = newTTFBTracker(s.Base.Base, s.modelName)
+	s.tracer = newSegmentTracer(s.Base.Base, func() tracing.STTAttributes {
+		return tracing.STTAttributes{
+			Service:  s.TypeName(),
+			Model:    s.modelName(),
+			Settings: s.traceSettings(),
+			// A streaming service is sent audio continuously and is told where
+			// the speech is by the voice activity detector upstream of it.
+			VADEnabled: true,
+		}
+	})
+	s.ttfb.onReport = func(d time.Duration, end time.Time) {
+		s.tracer.recordTTFB(d)
+		// A wait that ended without the transcript it was for leaves a segment
+		// nothing will close, so it is closed here at the moment measured to.
+		s.tracer.abandon(end)
+	}
+	return s
+}
+
+// STTService marks this processor as a speech-to-text service.
+//
+// It says what a type assertion cannot: that the processor transcribes speech
+// rather than merely handling transcripts. An observer outside this package
+// asserts for it to tell a transcript a transcriber produced from one that
+// arrived some other way.
+func (s *StreamService) STTService() {}
+
+// traceSettings renders the provider's settings for a transcription span. A
+// provider that keeps no settings of its own contributes none.
+func (s *StreamService) traceSettings() map[string]any { return s.set.traceSettings() }
+
+// setModel relabels what this service reports with the model now in force.
+func (s *StreamService) setModel(model string) {
+	s.mu.Lock()
+	s.model = model
+	s.mu.Unlock()
+}
+
+// SetTTFBTimeout sets how long the service waits after the speech ends for the
+// transcript that closes it, before reporting the latency against whatever
+// arrived in the meantime. Zero restores DefaultTTFBTimeout. Raise it for a
+// provider whose final transcript regularly takes longer than the default, which
+// would otherwise be timed against an interim.
+func (s *StreamService) SetTTFBTimeout(d time.Duration) { s.ttfb.setTimeout(d) }
+
+// modelName is the model the transcription is measured and priced against.
+func (s *StreamService) modelName() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.model
+}
+
+// Setup resolves the rate the service transcribes at and opens the connection. A
+// rate configured on the service wins; otherwise it takes the pipeline's input
+// rate, which it knows from the moment it is set up rather than when the
+// StartFrame arrives.
+func (s *StreamService) Setup(ctx context.Context, st processor.Setup) error {
+	if err := s.Base.Setup(ctx, st); err != nil {
+		return err
+	}
+	s.sampleRate = s.cfgRate
+	if s.sampleRate == 0 {
+		s.sampleRate = st.AudioInSampleRate
+	}
+	// Dialing here rather than on the StartFrame is what keeps it off the frame
+	// path: a pipeline sets its processors up at once, so several services
+	// connect together instead of one after another as the frame reaches them,
+	// and a service that cannot connect is reported before the pipeline starts.
+	// A refusal that will recur (a rejected key) leaves it unusable in time for a
+	// switcher to move off it; anything else is retried by the read loop.
+	//
+	// The connection outlives this call, so it is not tied to a context that
+	// ends with it.
+	s.connect(context.WithoutCancel(ctx))
+	return nil
+}
+
+// ProcessFrame manages the connection lifecycle and streams audio.
+func (s *StreamService) ProcessFrame(ctx context.Context, f frames.Frame, dir processor.Direction) error {
+	if err := s.Base.ProcessFrame(ctx, f, dir); err != nil {
+		return err
+	}
+	switch fr := f.(type) {
+	case *frames.StartFrame:
+		return s.PushFrame(ctx, f, dir)
+	case frames.InputAudioFrame:
+		s.sendAudio(fr.AudioData().Audio, audioUserID(fr))
+		return s.PushFrame(ctx, f, dir)
+	case *frames.STTUpdateSettingsFrame:
+		if !fr.TargetsService(s) {
+			// Meant for another service; leave it untouched for that one.
+			return s.PushFrame(ctx, f, dir)
+		}
+		s.updateSettings(ctx, fr)
+		return nil
+	case *frames.STTMuteFrame:
+		// Consumed here: the mute is addressed to this service, and nothing
+		// after it has anything to do with it.
+		s.setMuted(fr.Mute)
+		return nil
+	case *frames.VADUserStartedSpeakingFrame:
+		s.mu.Lock()
+		s.canReopen = false
+		// A finalize left over from the utterance before it would mark the
+		// first transcript of this one as the last, so the pair starts clean.
+		s.finalizeRequested = false
+		s.finalizePending = false
+		s.mu.Unlock()
+		s.speechStarted()
+		s.ttfb.speechStarted()
+		s.tracer.speechStarted(fr.SpeechStart())
+		return s.PushFrame(ctx, f, dir)
+	case *frames.VADUserStoppedSpeakingFrame:
+		s.ttfb.speechEnded(ctx, fr)
+		s.finalize()
+		return s.PushFrame(ctx, f, dir)
+	case *frames.InterruptionFrame:
+		// The utterance being measured is not the one that matters any more.
+		s.ttfb.interrupted()
+		return s.PushFrame(ctx, f, dir)
+	case *frames.UserStoppedSpeakingFrame:
+		if err := s.PushFrame(ctx, f, dir); err != nil {
+			return err
+		}
+		// A provider that never marks a transcript as the last one leaves the
+		// segment open. The user turn is over, so whatever it heard is what it
+		// heard, and the segment is closed as one that never finalized.
+		s.tracer.abandon(time.Time{})
+		s.reopenIfDeferred(ctx)
+		return nil
+	case *frames.EndFrame, *frames.CancelFrame:
+		s.disconnect(ctx)
+		// The audio no final transcript has reported yet.
+		s.EmitSTTUsageMetrics(ctx)
+		return s.PushFrame(ctx, f, dir)
+	default:
+		return s.PushFrame(ctx, f, dir)
+	}
+}
+
+// Cleanup tears down the session and the processor.
+func (s *StreamService) Cleanup(ctx context.Context) error {
+	s.disconnect(ctx)
+	s.ttfb.close()
+	return s.Base.Cleanup(ctx)
+}
+
+// PushFrame pushes a frame on, timing the transcripts on their way out. A
+// transcript answering a finalize the provider confirmed is marked as the one
+// that closes the utterance, and the transcript that closes it ends the wait the
+// VAD started when it reported the speech over.
+func (s *StreamService) PushFrame(ctx context.Context, f frames.Frame, dir processor.Direction) error {
+	tf, isTranscript := f.(*frames.TranscriptionFrame)
+	if isTranscript {
+		if s.takeFinalizePending() {
+			tf.Finalized = true
+		}
+		// Opened before the push so that the metrics frame the timing raises,
+		// which is pushed from inside this call, finds its span already open.
+		s.tracer.open()
+		s.ttfb.transcript(ctx, tf.Finalized)
+	}
+	err := s.Base.PushFrame(ctx, f, dir)
+	if isTranscript {
+		s.tracer.record(tf)
+	}
+	return err
+}
+
+// ClassifyError asks the provider what one of its own failures means, so a
+// failure signaled in the provider's protocol rather than an HTTP status still
+// costs the service its usability when that is what it means. A provider that
+// says nothing leaves the shared classification to decide.
+func (s *StreamService) ClassifyError(err error) errs.Category {
+	classifier, ok := s.conn.(ErrorClassifier)
+	if !ok {
+		return errs.Unset
+	}
+	return classifier.ClassifyError(err)
+}
+
+// ServiceMetadataFrame implements service.MetadataDescriber, describing this
+// transcriber to the rest of the pipeline, enriched from the Connector when it
+// implements Describer.
+func (s *StreamService) ServiceMetadataFrame() frames.ServiceMetadata {
+	mf := frames.NewSTTMetadataFrame(0)
+	mf.ServiceName = s.Name()
+	var m Metadata
+	if d, ok := s.conn.(Describer); ok {
+		m = d.Metadata()
+		mf.UserTurnStrategies = m.UserTurnStrategies
+	}
+	mf.TTFSP99Latency = m.ttfs(s.Name())
+	return mf
+}
+
+// connect opens the session and starts the read loop that owns it from here on.
+// The loop outlives any one session: when the session drops it opens another,
+// which is why the loop context is separate from the session's.
+//
+// A session that fails to open is reported, and the read loop starts all the
+// same: it is what retries, so a failed dial is recovered from the way a dropped
+// session is, with the same backoff and the same limit on attempts.
+func (s *StreamService) connect(ctx context.Context) {
+	readCtx, cancel := context.WithCancel(ctx)
+	s.ws.Connect()
+	s.mu.Lock()
+	s.readCancel = cancel
+	s.mu.Unlock()
+	if err := s.ConnectWebsocket(readCtx); err != nil {
+		s.PushError(readCtx, "stt: unable to connect", err, false)
+	}
+	s.startKeepalive(readCtx)
+	s.wg.Go(func() { s.ws.ReceiveTaskHandler(readCtx, s.reportConnectionError) })
+}
+
+// disconnect closes the session.
+func (s *StreamService) disconnect(ctx context.Context) {
+	// Marking the disconnect deliberate first is what tells the read loop that
+	// the session ending is the shutdown it asked for, not one to reconnect.
+	s.ws.Disconnect()
+	s.mu.Lock()
+	cancel := s.readCancel
+	s.readCancel = nil
+	s.mu.Unlock()
+	if cancel == nil {
+		return
+	}
+	// Asked for while the read loop is still alive, since what the provider
+	// answers with reaches the pipeline through it. Canceling first would tear
+	// the reader down before the answer arrived.
+	s.drainSession()
+	s.stopKeepalive()
+	cancel()
+	s.wg.Wait()
+	_ = s.DisconnectWebsocket(ctx)
+}
+
+// drainSession tells a provider that answers the end of a session that it is
+// ending, and gives the read loop the window the provider asked for to deliver
+// what comes back. It returns as soon as the loop ends on its own, which is what
+// the provider closing the socket looks like from here.
+func (s *StreamService) drainSession() {
+	s.mu.Lock()
+	stream := s.stream
+	s.mu.Unlock()
+	d, ok := stream.(Drainer)
+	if !ok {
+		return
+	}
+	window, err := d.Drain()
+	if err != nil {
+		slog.Debug("asking the transcription session to finish failed",
+			"service", s.Name(), "err", err)
+		return
+	}
+	if window <= 0 {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		s.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(window):
+		slog.Debug("the transcription session did not finish within its drain window",
+			"service", s.Name(), "window", window)
+	}
+}
+
+// ConnectWebsocket opens a transcription session. The read loop calls it for
+// every reconnect, so it replaces whatever session was there before.
+func (s *StreamService) ConnectWebsocket(ctx context.Context) error {
+	sessionCtx, cancel := context.WithCancel(ctx)
+	// Held across the dial: the provider reads its settings to build the
+	// session, and a session opened from settings changing underneath it would
+	// be neither the old configuration nor the new one.
+	var (
+		stream Stream
+		err    error
+	)
+	s.set.hold(func() { stream, err = s.conn.Connect(sessionCtx, s.sampleRate) })
+	if err != nil {
+		cancel()
+		return err
+	}
+	if stream == nil {
+		cancel()
+		return errNoSession
+	}
+	s.mu.Lock()
+	s.stream = stream
+	s.sessionCancel = cancel
+	s.sendFailed = false
+	s.mu.Unlock()
+	s.startTurnWatchdog(ctx)
+	return nil
+}
+
+// DisconnectWebsocket closes the current transcription session, if there is one.
+// A session that has already dropped cannot be closed cleanly, and that says
+// nothing about whether the next one will open, so the failure is logged rather
+// than failing the reconnect attempt that is about to redial.
+func (s *StreamService) DisconnectWebsocket(context.Context) error {
+	s.stopTurnWatchdog()
+	s.mu.Lock()
+	stream := s.stream
+	cancel := s.sessionCancel
+	s.stream = nil
+	s.sessionCancel = nil
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	if stream == nil {
+		return nil
+	}
+	if err := stream.Close(); err != nil {
+		slog.Debug("closing the transcription session failed", "service", s.Name(), "err", err)
+	}
+	return nil
+}
+
+// ReceiveMessages reads results until the session ends, pushing each one
+// downstream. It returns the failure that ended the session, leaving the read
+// loop to decide whether to open another.
+func (s *StreamService) ReceiveMessages(ctx context.Context) error {
+	s.mu.Lock()
+	stream := s.stream
+	s.mu.Unlock()
+	if stream == nil {
+		return errNoSession
+	}
+	for {
+		results, err := stream.Recv()
+		if err != nil {
+			if ender, ok := stream.(SessionEnder); ok && !s.ws.Disconnecting() {
+				for _, r := range ender.EndSession() {
+					s.emit(ctx, r)
+				}
+			}
+			return err
+		}
+		for _, r := range results {
+			s.emit(ctx, r)
+		}
+	}
+}
+
+// Connected reports whether there is a session to transcribe on.
+func (s *StreamService) Connected() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.stream != nil
+}
+
+// Muted reports whether the service is muted, and so leaves the audio it is
+// given untranscribed.
+func (s *StreamService) Muted() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.muted
+}
+
+// setMuted applies an STTMuteFrame.
+func (s *StreamService) setMuted(mute bool) {
+	s.mu.Lock()
+	s.muted = mute
+	s.mu.Unlock()
+	if mute {
+		slog.Debug("stt service muted", "service", s.Name())
+	} else {
+		slog.Debug("stt service unmuted", "service", s.Name())
+	}
+}
+
+// sendAudio hands a chunk to the provider.
+//
+// Audio arriving while the session is being replaced is held, and goes through
+// here again once the new one is up. Otherwise the chunk is dropped while the
+// service is muted, and when it can no longer do its job: one that cannot
+// transcribe anything would drop the chunk anyway, and one that connects on
+// demand would attempt a handshake per chunk to do it. A chunk that is sent
+// attributes the transcripts after it to userID.
+func (s *StreamService) sendAudio(audio []byte, userID string) {
+	s.mu.Lock()
+	if s.reopening {
+		s.held = append(s.held, heldAudio{audio: audio, userID: userID})
+		s.mu.Unlock()
+		return
+	}
+	muted := s.muted
+	s.mu.Unlock()
+	if muted {
+		return
+	}
+	if !s.Usable() {
+		return
+	}
+	s.mu.Lock()
+	s.userID = userID
+	s.mu.Unlock()
+	s.send(audio)
+}
+
+// transcriptUserID is the user the transcripts emitted now are attributed to.
+func (s *StreamService) transcriptUserID() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.userID
+}
+
+// reportConnectionError puts a lost provider connection on the pipeline. It is
+// not fatal: the call continues, and the application decides what losing
+// transcription for part of it means.
+func (s *StreamService) reportConnectionError(
+	ctx context.Context, ef *frames.ErrorFrame, forceTreatAsPermanent bool,
+) {
+	// Whatever was being measured ends here. The transcript it was waiting on is
+	// not coming on this connection, and holding the measurement open would
+	// carry it into the utterance after the one it belongs to.
+	s.ttfb.reportNow(ctx)
+	s.ReportConnectionError(ctx, ef, forceTreatAsPermanent)
+}
+
+// EmitSTTUsageMetrics reports the audio submitted since the last report as
+// usage, and adds it to the transcription span open for it. Streaming providers
+// bill for every second of audio a session carries, silence included, and the
+// service reports it once per billing event: ahead of each final transcript,
+// and a last time when the pipeline stops, for the audio no transcript
+// reported. It does nothing when there is no audio to report.
+func (s *StreamService) EmitSTTUsageMetrics(ctx context.Context) {
+	s.mu.Lock()
+	pending := s.audioBytes
+	s.audioBytes = 0
+	model := s.model
+	s.mu.Unlock()
+	audio := pcmDuration(pending, s.sampleRate)
+	if audio == 0 {
+		return
+	}
+	metrics.RecordSTTAudio(ctx, s.TypeName(), model, audio.Seconds())
+	s.tracer.addUsage(frames.STTUsage{AudioSeconds: audio.Seconds()})
+	s.pushUsageMetrics(ctx, audio)
+}
+
+// updateSettings merges an update into the provider's own settings and lets it
+// act on what changed, reopening the session when the provider says the change
+// cannot take effect on the one already running.
+//
+// The reopen is taken after the merge has released its lock, or it would
+// deadlock against the dial it goes on to make.
+func (s *StreamService) updateSettings(ctx context.Context, f *frames.STTUpdateSettingsFrame) {
+	reopen, err := s.set.apply(ctx, f)
+	if err != nil {
+		s.PushError(ctx, "stt: settings update", err, false)
+		return
+	}
+	if reopen {
+		s.requestReopen(ctx)
+	}
+}
+
+// requestReopen replaces the session now, or as soon as the user has finished
+// speaking. Reopening mid-sentence would drop what is being said, and the words
+// lost are exactly the ones the change was meant to transcribe better.
+func (s *StreamService) requestReopen(ctx context.Context) {
+	s.mu.Lock()
+	can := s.canReopen
+	if !can {
+		s.needReopen = true
+	}
+	s.mu.Unlock()
+	if can {
+		s.reopen(ctx)
+	}
+}
+
+// reopenIfDeferred runs a reopen that waited for the user to stop speaking.
+func (s *StreamService) reopenIfDeferred(ctx context.Context) {
+	s.mu.Lock()
+	s.canReopen = true
+	deferred := s.needReopen
+	s.mu.Unlock()
+	if deferred {
+		s.reopen(ctx)
+	}
+}
+
+// reopen replaces the session with one carrying the new settings, holding the
+// audio that arrives in between and sending it on once the new session is up, so
+// the words spoken across the gap still reach the provider.
+func (s *StreamService) reopen(ctx context.Context) {
+	s.mu.Lock()
+	s.held = nil
+	s.reopening = true
+	s.needReopen = false
+	s.mu.Unlock()
+
+	slog.Info("reopening the transcription session", "service", s.Name())
+	s.disconnect(ctx)
+	// A session that fails to open here is reported and retried by the read
+	// loop, as on the first connect.
+	s.connect(ctx)
+
+	s.mu.Lock()
+	s.reopening = false
+	held := s.held
+	s.held = nil
+	s.mu.Unlock()
+
+	for _, h := range held {
+		s.sendAudio(h.audio, h.userID)
+	}
+}
+
+func (s *StreamService) send(audio []byte) {
+	s.mu.Lock()
+	if s.reopening {
+		// The session is being replaced. Hold the audio rather than send it to
+		// one that is going away, or the words spoken across the gap are lost.
+		s.held = append(s.held, heldAudio{audio: audio, userID: s.userID})
+		s.mu.Unlock()
+		return
+	}
+	stream := s.stream
+	failed := s.sendFailed
+	// Stamped whether or not there is a session to send on: audio arriving is
+	// what says the call is not idle, and a session that opens a moment later
+	// has no catching up to do.
+	s.lastAudio = time.Now()
+	s.lastChunk = pcmDuration(int64(len(audio)), s.sampleRate)
+	if stream != nil {
+		s.audioBytes += int64(len(audio))
+	}
+	s.mu.Unlock()
+	if stream == nil || failed {
+		return
+	}
+	if err := stream.Send(audio); err != nil {
+		// The session is gone as far as the audio is concerned. Reopening it is
+		// the read loop's job, which the same failure ends; this only says so
+		// once, and stops feeding a session that is not listening.
+		slog.Warn("sending audio to the transcription session failed",
+			"service", s.Name(), "err", err)
+		s.mu.Lock()
+		s.sendFailed = true
+		s.mu.Unlock()
+		// A provider that reports a failed send has it pushed as an error too.
+		if r, ok := stream.(SendErrorReporter); ok {
+			s.PushError(context.Background(), r.SendErrorMessage(err), err, false)
+		}
+	}
+}
+
+// SendErrorReporter is an optional interface a Stream implements when a failed
+// send of audio is to be reported upstream as a non-fatal error, rather than
+// only logged. SendErrorMessage is the error's message.
+type SendErrorReporter interface {
+	SendErrorMessage(err error) string
+}
+
+// speechStarted tells the session a new utterance has begun, for a provider that
+// carries text from one result to the next and has to be told the utterance it
+// was building is over. It is a no-op for a provider that holds nothing between
+// utterances, and for a session that is being replaced: the one that takes over
+// starts empty anyway.
+func (s *StreamService) speechStarted() {
+	s.mu.Lock()
+	stream := s.stream
+	reopening := s.reopening
+	s.mu.Unlock()
+	if stream == nil || reopening {
+		return
+	}
+	if ss, ok := stream.(SpeechStarter); ok {
+		ss.SpeechStarted()
+	}
+}
+
+// finalize tells the session the speech has ended, for a provider that flushes
+// the transcript for an utterance only when asked. It is a no-op for a provider
+// that does its own endpointing, and for a session that is being replaced: what
+// the finalize would flush is held audio the new session has not been given yet.
+func (s *StreamService) finalize() {
+	s.mu.Lock()
+	stream := s.stream
+	reopening := s.reopening
+	s.mu.Unlock()
+	if stream == nil || reopening {
+		return
+	}
+	fin, ok := stream.(Finalizer)
+	if !ok {
+		return
+	}
+	// Recorded before the request goes out, so a provider that answers straight
+	// away has something to be matched against. A provider that never confirms
+	// leaves it standing, and it is cleared at the next utterance.
+	s.mu.Lock()
+	s.finalizeRequested = true
+	s.mu.Unlock()
+	if err := fin.Finalize(); err != nil {
+		slog.Debug("stt finalize failed", "service", s.Name(), "err", err)
+	}
+}
+
+// confirmFinalize takes the provider's word that it flushed what it was asked
+// to, which marks the next transcript as the last one for the utterance. A
+// confirmation for a finalize that was never asked for says nothing and is
+// ignored.
+func (s *StreamService) confirmFinalize() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.finalizeRequested {
+		s.finalizePending = true
+		s.finalizeRequested = false
+	}
+}
+
+// takeFinalizePending reports whether a confirmed finalize is waiting for the
+// transcript it belongs to, and clears it so it marks only that one.
+func (s *StreamService) takeFinalizePending() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	pending := s.finalizePending
+	s.finalizePending = false
+	return pending
+}
+
+// startKeepalive replaces the running keepalive, if any, with one for the
+// connection just opened. It runs across the sessions the read loop reopens,
+// and does nothing when the provider asked for none.
+func (s *StreamService) startKeepalive(ctx context.Context) {
+	if s.keepalive.Timeout <= 0 {
+		return
+	}
+	s.stopKeepalive()
+	kaCtx, cancel := context.WithCancel(ctx)
+	s.mu.Lock()
+	s.keepaliveCancel = cancel
+	s.lastAudio = time.Now()
+	s.mu.Unlock()
+	s.keepaliveWG.Go(func() { s.keepaliveLoop(kaCtx) })
+}
+
+// stopKeepalive ends the running keepalive and waits for it to finish.
+func (s *StreamService) stopKeepalive() {
+	s.mu.Lock()
+	cancel := s.keepaliveCancel
+	s.keepaliveCancel = nil
+	s.mu.Unlock()
+	if cancel == nil {
+		return
+	}
+	cancel()
+	s.keepaliveWG.Wait()
+}
+
+// keepaliveLoop submits silence to a session that has carried no audio for long
+// enough that the provider might close it. A failed send is logged and the loop
+// keeps going, so the next keepalive goes out on schedule.
+func (s *StreamService) keepaliveLoop(ctx context.Context) {
+	ticker := time.NewTicker(s.keepalive.Interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if !s.Connected() {
+			continue
+		}
+		s.mu.Lock()
+		idle := time.Since(s.lastAudio)
+		s.mu.Unlock()
+		if idle < s.keepalive.Timeout {
+			continue
+		}
+		if err := s.sendKeepalive(); err != nil {
+			slog.Warn("keeping the transcription session alive failed",
+				"service", s.Name(), "err", err)
+			continue
+		}
+		s.mu.Lock()
+		s.lastAudio = time.Now()
+		s.mu.Unlock()
+	}
+}
+
+// sendKeepalive submits one stretch of silence on the current session.
+func (s *StreamService) sendKeepalive() error {
+	s.mu.Lock()
+	stream := s.stream
+	rate := s.sampleRate
+	s.mu.Unlock()
+	if stream == nil {
+		return errNoSession
+	}
+
+	// 16-bit mono silence, which is what every provider is fed.
+	silence := make([]byte, int(float64(rate)*keepaliveSilence.Seconds())*2)
+
+	if ks, ok := stream.(KeepaliveSender); ok {
+		// The provider swapped the silence for something of its own, so there
+		// is no audio to bill for.
+		return ks.SendKeepalive(silence)
+	}
+	if err := stream.Send(silence); err != nil {
+		return err
+	}
+	// Silence submitted as audio is audio the provider bills for.
+	s.mu.Lock()
+	s.audioBytes += int64(len(silence))
+	s.mu.Unlock()
+	return nil
+}
+
+// startTurnWatchdog replaces the running watchdog, if any, with one for the
+// session just opened. It does nothing when the provider asked for none.
+func (s *StreamService) startTurnWatchdog(ctx context.Context) {
+	if !s.watchdogWanted {
+		return
+	}
+	s.stopTurnWatchdog()
+	wdCtx, cancel := context.WithCancel(ctx)
+	s.mu.Lock()
+	s.watchdogCancel = cancel
+	s.mu.Unlock()
+	s.watchdogWG.Go(func() { s.turnWatchdogLoop(wdCtx) })
+}
+
+// stopTurnWatchdog ends the running watchdog and waits for it to finish.
+func (s *StreamService) stopTurnWatchdog() {
+	s.mu.Lock()
+	cancel := s.watchdogCancel
+	s.watchdogCancel = nil
+	s.mu.Unlock()
+	if cancel == nil {
+		return
+	}
+	cancel()
+	s.watchdogWG.Wait()
+}
+
+// turnWatchdogLoop submits silence when the audio stops arriving in the middle
+// of a turn the provider reported. Such a provider decides the end of a turn
+// from the audio it is fed, so a gap leaves the turn open with nothing coming;
+// the silence stands in for the audio that stopped and lets the provider reach
+// its own conclusion.
+//
+// Nothing is submitted outside a turn: an idle session with no turn open has
+// nothing stalled, and holding one open is the keepalive's business.
+func (s *StreamService) turnWatchdogLoop(ctx context.Context) {
+	ticker := time.NewTicker(s.watchdog.Interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+		if !s.Connected() {
+			continue
+		}
+		s.mu.Lock()
+		speaking := s.speaking
+		last := s.lastAudio
+		threshold := max(2*s.lastChunk, *s.watchdog.MinTimeout)
+		s.mu.Unlock()
+		if !speaking || last.IsZero() {
+			continue
+		}
+		gap := time.Since(last)
+		if gap <= threshold {
+			continue
+		}
+		slog.Warn("no audio for a turn the provider is still listening to, "+
+			"submitting silence so the turn can end", "service", s.Name(), "gap", gap)
+		// As long as the gap itself, so the provider hears the pause that
+		// actually happened rather than a fixed stretch of it.
+		if err := s.sendSilence(gap); err != nil {
+			slog.Warn("submitting silence to the transcription session failed",
+				"service", s.Name(), "err", err)
+			return
+		}
+	}
+}
+
+// sendSilence submits d of 16-bit mono silence on the current session, through
+// the same path the call's own audio takes so it is billed for the same way.
+func (s *StreamService) sendSilence(d time.Duration) error {
+	s.mu.Lock()
+	rate := s.sampleRate
+	stream := s.stream
+	s.mu.Unlock()
+	if stream == nil {
+		return errNoSession
+	}
+	samples := int(d.Seconds() * float64(rate))
+	if samples <= 0 {
+		return nil
+	}
+	s.send(make([]byte, samples*2))
+	return nil
+}
+
+// emit turns one provider result into the frames it stands for: the speech
+// boundary it reports and the text it carries.
+//
+// The two are ordered around each other. A proposed start goes out ahead of the
+// text, because resolving it broadcasts an interruption and that has to preempt
+// what is already queued. A proposed stop goes out behind it, because the
+// strategy resolving it closes the turn on the transcript and needs that text in
+// hand; the proposal is a control frame, so it keeps the order it was sent in.
+func (s *StreamService) emit(ctx context.Context, r Result) {
+	if r.Speech == SpeechStarted {
+		s.emitSpeech(ctx, r)
+	}
+	s.emitEagerEndOfTurn(ctx, r)
+	s.emitTranscript(ctx, r)
+	if r.Speech == SpeechStopped {
+		s.emitSpeech(ctx, r)
+	}
+}
+
+// emitEagerEndOfTurn reports a prediction the provider made about the turn
+// ending, or withdraws one.
+//
+// Both are inert unless the service was configured for eager end of turn, so a
+// connector can report what its protocol says without guarding each call: a
+// provider that predicts is not the same as a pipeline that wants the prediction
+// answered.
+//
+// At most one prediction is outstanding at a time, so neither frame names which
+// one it means.
+func (s *StreamService) emitEagerEndOfTurn(ctx context.Context, r Result) {
+	if !s.eagerEndOfTurn {
+		return
+	}
+	switch {
+	case r.EagerEndOfTurn:
+		s.eagerPending = true
+		slog.DebugContext(ctx, "eager end of turn", "service", s.Name(), "text", r.Text)
+		f := frames.NewEagerTranscriptionFrame(r.Text, s.transcriptUserID(), frames.NowTimestamp())
+		f.Language = r.Language
+		_ = s.PushFrame(ctx, f, processor.Downstream)
+	case r.EagerEndOfTurnWithdrawn:
+		if !s.eagerPending {
+			return
+		}
+		s.eagerPending = false
+		slog.DebugContext(ctx, "eager end of turn withdrawn", "service", s.Name())
+		_ = s.PushFrame(ctx, frames.NewUserTurnResponseCancelFrame(), processor.Downstream)
+	case r.Final && r.EndOfTurn:
+		// The turn was committed, so the prediction is resolved. Whatever was
+		// generated from it is settled by the committed transcript rather than
+		// by anything here.
+		s.eagerPending = false
+	}
+}
+
+// EagerEndOfTurnEnabled reports whether predicted ends of turn are answered
+// ahead of committed ones.
+func (s *StreamService) EagerEndOfTurnEnabled() bool { return s.eagerEndOfTurn }
+
+// EagerEndOfTurnPending reports whether a prediction is awaiting a committed end
+// of turn.
+func (s *StreamService) EagerEndOfTurnPending() bool { return s.eagerPending }
+
+// emitTranscript pushes the text a result carries, and settles the finalize it
+// answers.
+func (s *StreamService) emitTranscript(ctx context.Context, r Result) {
+	// A predicted end of turn carries the text it predicts on, which is the
+	// prediction's, not a transcript: it goes out as the eager frame, when eager
+	// end of turn is on, and as nothing otherwise.
+	if r.EagerEndOfTurn {
+		return
+	}
+	// Taken before the text is, since a provider with nothing left to say still
+	// answers the finalize it was asked for, and that answer is what says the
+	// transcript already sent closed the utterance.
+	answered := r.Final && r.FromFinalize
+	if answered {
+		s.confirmFinalize()
+	}
+	if r.Text == "" {
+		if answered {
+			// The transcript went out ahead of the confirmation, so the wait
+			// ended with it. Reported now rather than left to the deadline.
+			s.ttfb.reportNow(ctx)
+		}
+		return
+	}
+	ts := frames.NowTimestamp()
+	if !r.Final {
+		f := frames.NewInterimTranscriptionFrame(r.Text, s.transcriptUserID(), ts)
+		f.Language = r.Language
+		_ = s.PushFrame(ctx, f, processor.Downstream)
+		return
+	}
+	f := frames.NewTranscriptionFrame(r.Text, s.transcriptUserID(), ts)
+	f.Finalized = r.EndOfTurn
+	f.Language = r.Language
+	// A final transcript is the billing event: the audio since the last one is
+	// reported ahead of it, so the span the transcript closes carries it.
+	s.EmitSTTUsageMetrics(ctx)
+	_ = s.PushFrame(ctx, f, processor.Downstream)
+}
+
+// emitSpeech broadcasts the speech boundary a provider reported, as a proposal
+// rather than as the turn itself.
+//
+// The provider heard where the speech begins and ends; whether that is where the
+// turn begins and ends is the pipeline's to decide, and so is whether the bot is
+// barged in on. The turn strategies this service recommends through its metadata
+// resolve the proposal, and they carry the interruption setting the service was
+// configured with.
+//
+// The frames go out in pairs and only on a change: a provider repeating itself,
+// or reporting a stop for speech that never started here, must not leave the
+// pipeline holding a start that nothing closes.
+//
+// They are broadcast rather than pushed downstream because a turn beginning
+// concerns both directions, and the barge-in that follows from it has to reach
+// the output to stop the bot as well as the aggregator to open the turn.
+func (s *StreamService) emitSpeech(ctx context.Context, r Result) {
+	switch r.Speech {
+	case SpeechStarted:
+		s.mu.Lock()
+		already := s.speaking
+		s.speaking = true
+		s.mu.Unlock()
+		if already {
+			return
+		}
+		_ = s.Broadcast(ctx, func() frames.Frame { return frames.NewProposedUserStartedSpeakingFrame() })
+	case SpeechStopped:
+		s.mu.Lock()
+		speaking := s.speaking
+		s.speaking = false
+		s.mu.Unlock()
+		if !speaking {
+			return
+		}
+		_ = s.Broadcast(ctx, func() frames.Frame { return frames.NewProposedUserStoppedSpeakingFrame() })
+	case SpeechUnknown:
+		// The provider leaves speech detection to the pipeline.
+	}
+}
+
+// pcmDuration is how long n bytes of 16-bit mono PCM play for at sampleRate.
+func pcmDuration(n int64, sampleRate int) time.Duration {
+	if n <= 0 || sampleRate <= 0 {
+		return 0
+	}
+	return time.Duration(n) * time.Second / time.Duration(2*sampleRate)
+}
+
+// CanGenerateMetrics reports that this service times transcription and reports
+// the result, so the pipeline counts it when it collects the processors that
+// report metrics.
+func (s *StreamService) CanGenerateMetrics() bool { return true }

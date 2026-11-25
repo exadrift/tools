@@ -1,0 +1,1210 @@
+// Package processor defines the frame processor: the building block of a jargo
+// pipeline. Processors link into a chain, receive frames, process them, and
+// push them on to the next or previous processor. Each processor handles system
+// frames with priority, processes data and control frames in order on its own
+// goroutine, and can be interrupted.
+package processor
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"log/slog"
+	"runtime/debug"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/gojargo/jargo/clock"
+	"github.com/gojargo/jargo/expressive"
+	"github.com/gojargo/jargo/frames"
+	"github.com/gojargo/jargo/internal/goid"
+	"github.com/gojargo/jargo/pipeline/capabilities"
+	"github.com/gojargo/jargo/telemetry/metrics"
+	"github.com/gojargo/jargo/telemetry/tracing"
+	errs "github.com/gojargo/jargo/utils/errors"
+	"github.com/gojargo/jargo/utils/events"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
+)
+
+// Direction is the direction a frame flows through the pipeline.
+type Direction int
+
+const (
+	// Downstream is the direction from input toward output.
+	Downstream Direction = iota
+	// Upstream is the direction from output back toward input.
+	Upstream
+)
+
+// String returns "downstream" or "upstream".
+func (d Direction) String() string {
+	if d == Upstream {
+		return "upstream"
+	}
+	return "downstream"
+}
+
+// inputCancelTimeout bounds how long tearing a processor down waits for its
+// input goroutine to exit after its context is canceled. It guards against a
+// ProcessFrame implementation that ignores cancellation while handling a system
+// frame. The process goroutine is waited for without a bound: see
+// stopProcessTask.
+const inputCancelTimeout = 3 * time.Second
+
+// Running is the pipeline a processor belongs to, for the few things a
+// processor needs from it that the frame path cannot express on its own. It is
+// an interface rather than the concrete task because the task is built on top of
+// processors, so naming that type here would be circular.
+type Running interface {
+	// Flush blocks until every frame queued ahead of the call has traveled the
+	// whole pipeline, so the pipeline has settled. Never call it from the
+	// goroutine that processes frames: the probe has to pass through this
+	// processor to complete its round trip.
+	Flush(ctx context.Context) error
+	// TrackFlushProbe reports that a flush probe from another worker has entered
+	// this pipeline, so that whoever is waiting on it, out of sight in the
+	// pipeline that started it, is told this one is still working. It is called
+	// by whatever brings the probe in, since only that knows it is really coming
+	// in: every worker on the bus sees it, but most have nowhere to put it.
+	TrackFlushProbe(f *frames.PipelineFlushFrame)
+	// TurnTracker follows the conversation's turns, and is nil when the worker
+	// is not tracking them. A processor that has to know where a turn ended
+	// subscribes to it; the interface is narrow because the observer that
+	// implements it already depends on this package.
+	TurnTracker() TurnTracker
+	// Capabilities is what the bot does in the session, derived from the
+	// pipeline's transports and parameters, for a client to configure itself
+	// by.
+	Capabilities() capabilities.BotCapabilities
+	// AppResources is what the application shares across the session through
+	// the worker's configuration, a database handle or an HTTP client say,
+	// passed by reference. The framework never reads it.
+	AppResources() any
+}
+
+// TurnTracker reports where the conversation's turns end.
+type TurnTracker interface {
+	// OnTurnEnded adds a listener called when a turn ends, with the turn number,
+	// how long it lasted, and whether an interruption cut it short.
+	OnTurnEnded(fn func(turn int, duration time.Duration, interrupted bool))
+}
+
+// Setup carries the shared components a processor needs, propagated down the
+// pipeline when it is set up.
+type Setup struct {
+	// AudioInSampleRate is the pipeline's input audio sample rate in Hz.
+	AudioInSampleRate int
+	// AudioOutSampleRate is the pipeline's output audio sample rate in Hz.
+	AudioOutSampleRate int
+	// Clock is the pipeline clock used for timing.
+	Clock clock.Clock
+	// EnableExpressiveConversation is whether the agent takes part in an
+	// expressive conversation (alpha). See
+	// pipeline.Params.EnableExpressiveConversation.
+	EnableExpressiveConversation bool
+	// ExpressionPolicy is which expression tags the LLMs are offered and when
+	// to use them (alpha), or nil for the default policy. See
+	// pipeline.Params.ExpressionPolicy.
+	ExpressionPolicy *expressive.ExpressionPolicy
+	// EnableMetrics turns on performance metrics collection.
+	EnableMetrics bool
+	// EnableUsageMetrics turns on usage metrics collection.
+	EnableUsageMetrics bool
+	// ReportOnlyInitialTTFB asks for the first time-to-first-byte of the run and
+	// nothing after it.
+	ReportOnlyInitialTTFB bool
+	// Observers watch every frame handed between processors.
+	Observers []Observer
+	// Running is the pipeline this processor is part of. Nil for a processor
+	// driven outside a pipeline task.
+	Running Running
+	// Tracing is the session's tracing state: the conversation span the trace
+	// hangs from and the turn being spoken. Processors parent their spans to it,
+	// so a span raised away from the frame path still lands under the turn it
+	// belongs to. Nil when the pipeline is not traced.
+	Tracing *tracing.TracingContext
+	// TracingEnabled reports whether this pipeline is traced, and is what the
+	// processors gate their spans on. It is separate from Tracing being present
+	// because an installed TracerProvider is not on its own a request to trace
+	// the pipeline: an application that traces its own server would otherwise
+	// get a service span per turn with nothing to hang it from.
+	TracingEnabled bool
+}
+
+// Processor is a node in a pipeline. Concrete processors embed *Base, which
+// provides every method here except a custom ProcessFrame.
+type Processor interface {
+	// ID is a process-unique identifier for this processor.
+	ID() uint64
+	// Name is a human-readable label, "<name>#<id>".
+	Name() string
+
+	// Next is the downstream processor, or nil.
+	Next() Processor
+	// Prev is the upstream processor, or nil.
+	Prev() Processor
+
+	// Processors are the sub-processors this processor contains. Only a
+	// compound processor (a pipeline, a parallel pipeline) has any; every
+	// other processor reports none.
+	Processors() []Processor
+	// EntryProcessors are the processors a frame entering a compound
+	// processor reaches first. A pipeline is a processor itself, so an entry
+	// processor can be a pipeline in turn. Every other processor reports none.
+	EntryProcessors() []Processor
+	// ProcessorsWithMetrics are the processors below this one that report
+	// metrics, collected recursively.
+	ProcessorsWithMetrics() []Processor
+	// CanGenerateMetrics reports whether this processor reports metrics. It is
+	// false for everything but a service.
+	CanGenerateMetrics() bool
+	// Link sets next as this processor's downstream neighbor and this
+	// processor as next's upstream neighbor.
+	Link(next Processor)
+
+	// Setup wires the processor with shared components and starts its
+	// goroutines. It must be called before frames are queued.
+	Setup(ctx context.Context, s Setup) error
+	// Cleanup stops the processor's goroutines and releases resources.
+	Cleanup(ctx context.Context) error
+	// SetupStarted holds the StartFrame until SetupFinished is called. A
+	// pipeline calls it before setting the processor up.
+	SetupStarted()
+	// SetupFinished lets the processor start, once its own Setup has returned.
+	SetupFinished()
+
+	// QueueFrame hands a frame to this processor for processing.
+	QueueFrame(ctx context.Context, f frames.Frame, dir Direction) error
+	// ProcessFrame processes a frame. The base implementation handles system
+	// lifecycle frames; concrete processors override it and call the base
+	// first.
+	ProcessFrame(ctx context.Context, f frames.Frame, dir Direction) error
+	// PushFrame sends a frame to the neighboring processor in dir.
+	PushFrame(ctx context.Context, f frames.Frame, dir Direction) error
+	// PushErrorFrame settles the error's category and this processor's
+	// usability, tells the error handlers, and pushes the frame upstream.
+	PushErrorFrame(ctx context.Context, ef *frames.ErrorFrame, forceTreatAsPermanent bool)
+
+	// Usable reports whether this processor can still do its job. See
+	// [Base.Usable].
+	Usable() bool
+	// SetUsable sets whether this processor can be given work, raising
+	// EventUsableChanged when the value moves.
+	SetUsable(ctx context.Context, usable bool)
+	// Events returns the registry of events this processor raises.
+	Events() *events.Registry
+}
+
+//nolint:gochecknoglobals // process-wide id source
+var idCounter atomic.Uint64
+
+func nextID() uint64 { return idCounter.Add(1) }
+
+// Option configures a Base at construction.
+type Option func(*Base)
+
+// WithDirectMode makes a processor process frames immediately on the caller's
+// goroutine instead of queueing them. It is used for routing processors (a
+// pipeline and its source and sink) that only forward frames.
+func WithDirectMode() Option {
+	return func(b *Base) { b.directMode = true }
+}
+
+// Base implements Processor. Embed it in a concrete processor and pass the
+// concrete value as self so the base can dispatch to the overridden
+// ProcessFrame:
+//
+//	type Echo struct{ *processor.Base }
+//
+//	func NewEcho() *Echo {
+//	    e := &Echo{}
+//	    e.Base = processor.New("Echo", e)
+//	    return e
+//	}
+//
+//	func (e *Echo) ProcessFrame(ctx context.Context, f frames.Frame, dir processor.Direction) error {
+//	    if err := e.Base.ProcessFrame(ctx, f, dir); err != nil {
+//	        return err
+//	    }
+//	    return e.PushFrame(ctx, f, dir)
+//	}
+type Base struct {
+	id       uint64
+	name     string
+	typeName string
+	self     Processor
+
+	next, prev Processor
+
+	directMode bool
+	// state is what setting up publishes: the shared components every other
+	// method reads. It is held behind an atomic pointer because a processor is
+	// set up while the pipeline is already carrying frames. Processors are set
+	// up concurrently, so one that connects during setup can push at a
+	// neighbor that has not been set up yet, and that frame would otherwise
+	// read these fields while they were still being written. Setting up stores
+	// one immutable value; every reader loads it whole.
+	state atomic.Pointer[setupState]
+
+	// Lifetime context for the processor's goroutines, canceled on Cleanup.
+	// baseMu guards the pair below. Setting up writes them, and tearing down
+	// reads them, from different goroutines: a pipeline sets its processors up
+	// concurrently and gives up on one that never finishes, so its cleanup can
+	// run while that setup is still in flight.
+	baseMu     sync.RWMutex
+	baseCtx    context.Context
+	baseCancel context.CancelFunc
+
+	// Input goroutine: handles system frames immediately and forwards data and
+	// control frames to the process queue. It is created when the StartFrame is
+	// queued, so nothing is drained before the processor has been started.
+	inputQueue *queue
+	inputWG    sync.WaitGroup
+	// startGate is opened by the StartFrame being queued once the processor is
+	// set up, and is what the input goroutine waits on before it drains
+	// anything.
+	startGate *event
+	// setupDone is clear while a pipeline is setting this processor up. The
+	// StartFrame is held until it is set, so a processor never starts before
+	// its own setup is done, while the ones ahead of it in the pipeline can.
+	setupDone *event
+	// startReceived records that the StartFrame has been queued. startMu
+	// guards it.
+	startMu       sync.Mutex
+	startReceived bool
+
+	// Pause gates. Each loop checks its gate after taking a frame off its queue
+	// and before handling it, so a pause takes effect from the next frame on.
+	// The events are created with the goroutine they hold.
+	pauseMu           sync.Mutex
+	blockSystemFrames bool
+	inputEvent        *event
+	blockFrames       bool
+	processEvent      *event
+	// pendingResume is a resume this processor was asked for by a frame it is
+	// still handling. It is applied once that frame has gone on.
+	pendingResume bool
+	// pauseWatcher cancels the goroutine waiting on the readiness condition a
+	// PauseProcessingAllFramesUntil is holding frames for, and pauseWG waits for
+	// it to have finished.
+	pauseWatcher context.CancelFunc
+	pauseWG      sync.WaitGroup
+
+	// Metrics flags captured from the StartFrame. They are written once on the
+	// input goroutine before the process goroutine is created in start(), which
+	// establishes the happens-before for reads from ProcessFrame.
+
+	// ttfbMu guards armTTFB, which unlike the flags above is written on every
+	// measurement rather than once at the start.
+	ttfbMu sync.Mutex
+	// armTTFB says whether another time-to-first-byte may be measured. It stays
+	// true throughout unless only the initial one was asked for, in which case
+	// arming the first measurement is what clears it.
+	armTTFB bool
+
+	cancelMu  sync.Mutex
+	canceling bool
+
+	// Process goroutine: handles data and control frames in order. It is
+	// created on StartFrame and recreated on interruption.
+	procMu      sync.Mutex
+	procQueue   *queue
+	procRunning bool
+	procCancel  context.CancelFunc
+	procDone    chan struct{}
+	// procGoroutine identifies the goroutine running processLoop, so a request
+	// to cancel it made from that very goroutine can be recognized.
+	procGoroutine atomic.Uint64
+
+	curMu    sync.Mutex
+	curFrame frames.Frame
+
+	// events are the events this processor raises: EventUsableChanged and
+	// EventError. See usable.go.
+	events events.Registry
+	// usability tracks whether this processor can still do its job. Flipped by
+	// the errors it reports, so it is already up to date by the time an error
+	// travels.
+	usability usability
+}
+
+// New builds a Base named name. self is the embedding processor, used to
+// dispatch to its ProcessFrame; pass nil for a plain pass-through that does not
+// override ProcessFrame.
+func New(name string, self Processor, opts ...Option) *Base {
+	b := &Base{
+		id:         nextID(),
+		inputQueue: newQueue(),
+		startGate:  newEvent(),
+		setupDone:  newEvent(),
+		inputEvent: newEvent(),
+		procQueue:  newQueue(),
+		// Armed before any StartFrame, so a measurement started early is not
+		// declined for a restriction nothing has asked for yet.
+		armTTFB: true,
+		// A processor can do its job until something says otherwise.
+		usability: usability{usable: true},
+	}
+	// A processor is set up unless a pipeline says it is being set up.
+	b.setupDone.Set()
+	// The usability change runs on its own goroutine, since a handler may do
+	// anything; the error event is synchronous, so a handler has seen the error
+	// before the frame travels past it.
+	b.events.Register(EventUsableChanged, false)
+	b.events.Register(EventError, true)
+	// The four frame events are synchronous, so "before" really is before: a
+	// handler runs while the frame is still where the event says it is, rather
+	// than at some later point once it has moved on.
+	b.events.Register(EventBeforeProcessFrame, true)
+	b.events.Register(EventAfterProcessFrame, true)
+	b.events.Register(EventBeforePushFrame, true)
+	b.events.Register(EventAfterPushFrame, true)
+	b.typeName = name
+	b.name = fmt.Sprintf("%s#%d", name, b.id)
+	for _, opt := range opts {
+		opt(b)
+	}
+	if self != nil {
+		b.self = self
+	} else {
+		b.self = b
+	}
+	return b
+}
+
+// ID implements Processor.
+func (b *Base) ID() uint64 { return b.id }
+
+// Name implements Processor.
+func (b *Base) Name() string { return b.name }
+
+// TypeName is the name the processor was built with, without the instance
+// number Name appends ("OpenAILLM", where Name is "OpenAILLM#3"). It names the
+// kind of processor rather than this one, which is what identifies the provider
+// behind a service on its spans and what a metric is grouped by.
+func (b *Base) TypeName() string { return b.typeName }
+
+// Processors implements Processor. A plain processor contains none; a compound
+// processor overrides this.
+func (b *Base) Processors() []Processor { return nil }
+
+// EntryProcessors implements Processor. A plain processor has none; a compound
+// processor overrides this.
+func (b *Base) EntryProcessors() []Processor { return nil }
+
+// ProcessorsWithMetrics implements Processor. A plain processor contains
+// nothing, so it reports nothing; a compound processor overrides this and
+// collects from what it contains.
+func (b *Base) ProcessorsWithMetrics() []Processor { return nil }
+
+// CanGenerateMetrics implements Processor. A processor reports no metrics unless
+// it is a service, which overrides this.
+func (b *Base) CanGenerateMetrics() bool { return false }
+
+// Next implements Processor.
+func (b *Base) Next() Processor { return b.next }
+
+// Prev implements Processor.
+func (b *Base) Prev() Processor { return b.prev }
+
+// Link implements Processor.
+func (b *Base) Link(next Processor) {
+	b.next = next
+	if sp, ok := next.(interface{ setPrev(Processor) }); ok {
+		sp.setPrev(b.self)
+	}
+}
+
+func (b *Base) setPrev(p Processor) { b.prev = p }
+
+// Clock returns the pipeline clock, available after Setup.
+func (b *Base) Clock() clock.Clock { return b.setupState().clock }
+
+// Tracing returns the session's tracing state, available after Setup. It is nil
+// when the pipeline is not traced, which its methods handle: parent a span with
+// Tracing().Parent(ctx) without checking.
+func (b *Base) Tracing() *tracing.TracingContext { return b.setupState().tracing }
+
+// TracingEnabled reports whether this pipeline is traced. A processor that
+// raises spans of its own opens them through StartSpan, which checks this.
+func (b *Base) TracingEnabled() bool { return b.setupState().tracingEnabled }
+
+// StartSpan opens a span for work this processor is doing, parented to the turn
+// being spoken (or to the conversation between turns), and returns it with a
+// context carrying it.
+//
+// On a pipeline that is not traced the span is a no-op and nothing is recorded
+// or exported, so a caller opens one unconditionally and sets attributes on it
+// without guarding: the cost of an untraced pipeline is the branch taken here.
+func (b *Base) StartSpan(
+	ctx context.Context, name string, opts ...trace.SpanStartOption,
+) (context.Context, trace.Span) {
+	st := b.setupState()
+	if !st.tracingEnabled {
+		return ctx, noop.Span{}
+	}
+	return tracing.Tracer().Start(st.tracing.Parent(ctx), name, opts...)
+}
+
+// setupState is the immutable set of shared components a processor is given
+// when it is set up.
+type setupState struct {
+	audioInSampleRate     int
+	audioOutSampleRate    int
+	clock                 clock.Clock
+	enableMetrics         bool
+	enableUsageMetrics    bool
+	observers             []Observer
+	reportOnlyInitialTTFB bool
+	tracing               *tracing.TracingContext
+	tracingEnabled        bool
+	running               Running
+}
+
+// setupState returns what setting up published, or an empty value before the
+// processor has been set up.
+func (b *Base) setupState() setupState {
+	if s := b.state.Load(); s != nil {
+		return *s
+	}
+	return setupState{}
+}
+
+// Setup implements Processor. It stores the shared components. The goroutines
+// are not started here: nothing is drained until the StartFrame arrives, so a
+// processor never acts on a frame before it has been started.
+func (b *Base) Setup(ctx context.Context, s Setup) error {
+	b.state.Store(&setupState{
+		audioInSampleRate:     s.AudioInSampleRate,
+		audioOutSampleRate:    s.AudioOutSampleRate,
+		clock:                 s.Clock,
+		enableMetrics:         s.EnableMetrics,
+		enableUsageMetrics:    s.EnableUsageMetrics,
+		observers:             s.Observers,
+		reportOnlyInitialTTFB: s.ReportOnlyInitialTTFB,
+		tracing:               s.Tracing,
+		tracingEnabled:        s.TracingEnabled,
+		running:               s.Running,
+	})
+	baseCtx, baseCancel := context.WithCancel(ctx)
+	b.baseMu.Lock()
+	b.baseCtx, b.baseCancel = baseCtx, baseCancel
+	b.baseMu.Unlock()
+	if !b.directMode {
+		// The goroutine exists from here, but drains nothing until the StartFrame
+		// opens the gate below.
+		b.inputWG.Add(1)
+		go b.inputLoop()
+	}
+	return nil
+}
+
+// Cleanup implements Processor. It stops the input and process goroutines and
+// waits for the event handlers still running, so a caller reading what a handler
+// collected does not race it.
+//
+// The input goroutine is stopped first. Its context is the parent of the process
+// goroutine's, so canceling it reaches both at once. The process goroutine is
+// then waited for without a bound, like any cancel of it (see stopProcessTask).
+func (b *Base) Cleanup(ctx context.Context) error {
+	// A processor left holding frames could not handle the ones that shut it
+	// down, so the hold is lifted before anything else.
+	b.cancelPauseWatcher()
+	b.cancelInputTask()
+	b.cancelProcessTask()
+	b.events.Cleanup(ctx)
+	return nil
+}
+
+// cancelInputTask cancels the input goroutine and waits for it to exit, bounded
+// by inputCancelTimeout.
+//
+// The bound is what keeps one stuck processor from holding up the whole
+// shutdown. Canceling the context only unblocks the loop between frames: a
+// system frame is handled on this goroutine, so a ProcessFrame that blocks
+// leaves the loop inside the call, where cancellation cannot reach it. Waiting
+// for it without a bound would hang teardown for good.
+func (b *Base) cancelInputTask() {
+	b.baseMu.RLock()
+	cancel := b.baseCancel
+	b.baseMu.RUnlock()
+	if cancel != nil {
+		cancel()
+	}
+	if b.directMode {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		b.inputWG.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(inputCancelTimeout):
+		slog.Warn("timed out canceling input goroutine", "processor", b.name)
+	}
+}
+
+// QueueFrame implements Processor.
+func (b *Base) QueueFrame(ctx context.Context, f frames.Frame, dir Direction) error {
+	if b.isCanceling() {
+		return nil
+	}
+	if b.directMode {
+		if isStartFrame(f) && !b.setupDone.Wait(ctx) {
+			return ctx.Err()
+		}
+		return b.processFrame(ctx, item{frame: f, dir: dir})
+	}
+	b.inputQueue.push(item{frame: f, dir: dir})
+
+	// Nothing drains the queue until the StartFrame arrives and this processor
+	// is set up, so a processor never acts on a frame before it has been
+	// started. Processors are set up concurrently, so one that connects during
+	// setup can push frames at a processor that has not started yet; those
+	// frames simply wait, and the StartFrame is taken off the queue ahead of
+	// them.
+	if isStartFrame(f) {
+		b.startMu.Lock()
+		b.startReceived = true
+		b.startMu.Unlock()
+		b.maybeOpenStartGate()
+	}
+	return nil
+}
+
+// SetupStarted implements Processor.
+func (b *Base) SetupStarted() {
+	b.setupDone.Clear()
+}
+
+// SetupFinished implements Processor.
+func (b *Base) SetupFinished() {
+	if !b.directMode && b.baseContext() == nil {
+		// Setting up was cut short before Base.Setup ran, so there is no input
+		// goroutine to start processing frames with.
+		slog.Error("processor can't start, setup ended before Base.Setup was called "+
+			"(call Base.Setup before anything that can block)", "processor", b.name)
+	}
+	b.setupDone.Set()
+	b.maybeOpenStartGate()
+}
+
+// maybeOpenStartGate lets the input goroutine start draining once the
+// StartFrame is here and setting this processor up is done.
+func (b *Base) maybeOpenStartGate() {
+	b.startMu.Lock()
+	received := b.startReceived
+	b.startMu.Unlock()
+	if !received || !b.setupDone.IsSet() {
+		return
+	}
+	b.startGate.Set()
+}
+
+// inputLoop handles every frame queued to the processor. System frames are
+// processed immediately; data and control frames are forwarded to the process
+// queue for in-order processing.
+func (b *Base) inputLoop() {
+	defer b.inputWG.Done()
+	ctx := b.baseContext()
+	// Nothing is drained until the StartFrame arrives, so a processor never acts
+	// on a frame before it has been started. Processors are set up concurrently,
+	// so one that connects during setup can push frames at a processor that has
+	// not started yet; those frames wait here, and the StartFrame is taken off
+	// the queue ahead of them.
+	if !b.startGate.Wait(ctx) {
+		return
+	}
+	for {
+		it, ok := b.inputQueue.get(ctx)
+		if !ok {
+			return
+		}
+		if !b.waitWhilePaused(ctx, true) {
+			return
+		}
+		if _, isSystem := it.frame.(frames.SystemFrame); isSystem {
+			_ = b.processFrame(ctx, it)
+		} else {
+			b.procQueue.push(it)
+		}
+	}
+}
+
+// baseContext is the context the processor's own goroutines run under, which
+// tearing it down cancels. It is nil before the processor has been set up.
+func (b *Base) baseContext() context.Context {
+	b.baseMu.RLock()
+	defer b.baseMu.RUnlock()
+	return b.baseCtx
+}
+
+// processLoop handles data and control frames in order. It runs under ctx,
+// which is canceled to interrupt the processor. Once ctx is canceled the loop
+// handles nothing more: the frames queued behind the one that was interrupted
+// are what the interruption drops.
+func (b *Base) processLoop(ctx context.Context, done chan struct{}) {
+	defer close(done)
+	b.procGoroutine.Store(goid.Current())
+	for {
+		b.setCurFrame(nil)
+		it, ok := b.procQueue.get(ctx)
+		if !ok {
+			return
+		}
+		if !b.takeCurFrame(ctx, it) {
+			b.giveBack(it)
+			return
+		}
+		if !b.waitWhilePaused(ctx, false) {
+			b.giveBack(it)
+			return
+		}
+		_ = b.processFrame(ctx, it)
+	}
+}
+
+// takeCurFrame makes it the frame being handled, unless the loop was canceled
+// after taking it off the queue. It holds the same lock an interruption decides
+// under, so an interruption either sees the frame as current (and spares it if
+// it is uninterruptible) or has canceled the loop before the frame became
+// current.
+func (b *Base) takeCurFrame(ctx context.Context, it item) bool {
+	b.curMu.Lock()
+	defer b.curMu.Unlock()
+	if ctx.Err() != nil {
+		return false
+	}
+	b.curFrame = it.frame
+	return true
+}
+
+// giveBack returns a frame the process goroutine took but was stopped before
+// handling. An uninterruptible frame goes back to the head of the queue, since
+// nothing that stops the goroutine may drop it; the queue reset that follows
+// drops any other.
+func (b *Base) giveBack(it item) {
+	if !frames.Interruptible(it.frame) {
+		b.procQueue.requeue(it)
+	}
+}
+
+// processFrame dispatches a frame to the concrete processor and turns a
+// processing error into an ErrorFrame pushed upstream.
+//
+// A panic while handling the frame is reported the same way and goes no
+// further: one faulty frame must not take down the goroutine that handles every
+// frame after it, let alone the process. Once reported it is handled, so it is
+// not returned to the caller as well.
+func (b *Base) processFrame(ctx context.Context, it item) error {
+	// A resume this frame carried takes effect once the frame itself has gone on,
+	// so what it released cannot overtake it. Deferred so a processor is released
+	// even when handling the frame failed.
+	defer b.applyPendingResume()
+	defer func() {
+		if v := recover(); v != nil {
+			b.reportPanic(ctx, "Error processing frame", v)
+		}
+	}()
+	b.notifyProcess(it.frame, it.dir)
+	b.events.Call(ctx, EventBeforeProcessFrame, b.self, it.frame)
+	if err := b.self.ProcessFrame(ctx, it.frame, it.dir); err != nil {
+		// A frame cut short by an interruption or a cancel is not a failure,
+		// so it is not reported as one.
+		// Its cause cannot be attributed: the error may come from a processor
+		// further on, an observer or a callback as much as from this one, so it
+		// is reported unclassified rather than costing this processor its
+		// usability.
+		if cerr := ctx.Err(); cerr == nil || !errors.Is(err, cerr) {
+			b.PushError(ctx, fmt.Sprintf("Error processing frame: %v", err), err, false,
+				WithErrorCategory(errs.Unknown))
+		}
+		return err
+	}
+	b.events.Call(ctx, EventAfterProcessFrame, b.self, it.frame)
+	return nil
+}
+
+// ProcessFrame implements Processor. It handles the system frames that drive a
+// processor's lifecycle: StartFrame, InterruptionFrame and CancelFrame. A
+// concrete processor overrides this, calls the base first, then forwards the
+// frame with PushFrame.
+func (b *Base) ProcessFrame(ctx context.Context, f frames.Frame, dir Direction) error {
+	switch fr := f.(type) {
+	case *frames.StartFrame:
+		b.ttfbMu.Lock()
+		b.armTTFB = true
+		b.ttfbMu.Unlock()
+		b.start()
+	case *frames.InterruptionFrame:
+		b.startInterruption()
+		b.stopAllMetrics(ctx)
+	case *frames.CancelFrame:
+		b.cancel()
+	case *frames.FrameProcessorPauseFrame:
+		b.pauseIfAddressed(fr.Processor)
+	case *frames.FrameProcessorPauseUrgentFrame:
+		b.pauseIfAddressed(fr.Processor)
+	case *frames.FrameProcessorResumeFrame:
+		b.resumeIfAddressed(fr.Processor)
+	case *frames.FrameProcessorResumeUrgentFrame:
+		b.resumeIfAddressed(fr.Processor)
+	}
+	return nil
+}
+
+// HasQueuedFrame reports whether a frame satisfying match is still waiting in
+// this processor's in-order queue, behind the one being handled now. A
+// processor uses it to tell that more of the same work is already on its way, so
+// it can hold off on an action until the last of it arrives rather than
+// repeating the action once per frame.
+//
+// Only data and control frames are considered. A system frame is handled the
+// moment it is queued and so never waits.
+func (b *Base) HasQueuedFrame(match func(frames.Frame) bool) bool {
+	return b.procQueue.hasFrame(match)
+}
+
+// MetricsEnabled reports whether performance-metrics collection was enabled by
+// the StartFrame. It is valid once the processor has received its StartFrame.
+func (b *Base) MetricsEnabled() bool { return b.setupState().enableMetrics }
+
+// AudioInSampleRate is the pipeline's input audio sample rate in Hz, which a
+// service that was not given one of its own takes as its own. It is known from
+// the moment the processor is set up.
+func (b *Base) AudioInSampleRate() int { return b.setupState().audioInSampleRate }
+
+// AudioOutSampleRate is the pipeline's output audio sample rate in Hz. See
+// AudioInSampleRate.
+func (b *Base) AudioOutSampleRate() int { return b.setupState().audioOutSampleRate }
+
+// Running is the pipeline this processor is part of, or nil for a processor
+// driven outside one.
+func (b *Base) Running() Running { return b.setupState().running }
+
+// BeginTTFB reports whether a time-to-first-byte measurement should be started,
+// and records that one was. A service calls it where it would start the clock,
+// and measures nothing when it reports false.
+//
+// It answers true every time unless the StartFrame asked for only the initial
+// TTFB, in which case the first measurement is the only one armed: a caller who
+// wants the figure the call opened with gets it once rather than on every turn.
+func (b *Base) BeginTTFB() bool {
+	b.ttfbMu.Lock()
+	defer b.ttfbMu.Unlock()
+	if !b.armTTFB {
+		return false
+	}
+	b.armTTFB = !b.setupState().reportOnlyInitialTTFB
+	return true
+}
+
+// UsageMetricsEnabled reports whether usage-metrics collection was enabled by
+// the StartFrame. It is valid once the processor has received its StartFrame.
+func (b *Base) UsageMetricsEnabled() bool { return b.setupState().enableUsageMetrics }
+
+// Self is the processor this base belongs to: the concrete value passed to New,
+// or the base itself when none was.
+//
+// Push through it, rather than through the embedded base, whenever a frame
+// leaving a processor should go through whatever the outer type does on its way
+// out. A type embedding another processor overrides PushFrame to inspect,
+// rewrite or drop what leaves it, and a push made on the inner value would go
+// straight past that.
+func (b *Base) Self() Processor { return b.self }
+
+// PushFrame implements Processor. It forwards a frame to the neighbor in dir.
+//
+// A frame pushed at a neighbor that has not started yet is not dropped: it waits
+// in that neighbor's queue until its StartFrame arrives, which is what lets a
+// processor that connects while the pipeline is being set up push what it
+// receives straight away.
+func (b *Base) PushFrame(ctx context.Context, f frames.Frame, dir Direction) error {
+	b.events.Call(ctx, EventBeforePushFrame, b.self, f)
+	err := b.internalPushFrame(ctx, f, dir)
+	b.events.Call(ctx, EventAfterPushFrame, b.self, f)
+	return err
+}
+
+// internalPushFrame hands the frame to the neighbor in dir, telling the
+// observers about the handover first.
+//
+// A direct-mode neighbor and the observer reports run inside the call, so a
+// panic in either is caught here and reported as an error from this processor,
+// which then carries on as though the push had gone through. In a pipeline the
+// reports only queue the frame for each observer, which is told on a goroutine
+// of its own that contains its own panics.
+func (b *Base) internalPushFrame(ctx context.Context, f frames.Frame, dir Direction) error {
+	defer func() {
+		if v := recover(); v != nil {
+			// Reporting an error pushes a frame through here too, so a fault that
+			// hits every push would report itself forever. The error that failed to
+			// travel is logged and dropped instead.
+			if _, isError := f.(*frames.ErrorFrame); isError {
+				slog.ErrorContext(ctx, "uncaught panic pushing an error frame; dropping it",
+					"processor", b.name, "panic", v, "stack", string(debug.Stack()))
+				return
+			}
+			b.reportPanic(ctx, "uncaught panic", v)
+		}
+	}()
+	switch dir {
+	case Downstream:
+		if b.next != nil {
+			b.notifyPush(f, dir, b.next)
+			return b.next.QueueFrame(ctx, f, dir)
+		}
+	case Upstream:
+		if b.prev != nil {
+			b.notifyPush(f, dir, b.prev)
+			return b.prev.QueueFrame(ctx, f, dir)
+		}
+	}
+	return nil
+}
+
+// TrackFlushProbe reports a flush probe from another worker entering the
+// pipeline this processor runs in, so the worker waiting on it hears that this
+// pipeline is working on it. It is a no-op for a processor driven outside a
+// pipeline worker, which answers no probes.
+func (b *Base) TrackFlushProbe(f *frames.PipelineFlushFrame) {
+	running := b.setupState().running
+	if running == nil {
+		return
+	}
+	running.TrackFlushProbe(f)
+}
+
+// FlushPipeline blocks until every frame queued ahead of the call has traveled
+// the whole pipeline, along with anything a processor started by pushing
+// upstream. Use it to let the pipeline settle, after an interruption say, before
+// injecting new work.
+//
+// The wait is bounded by the flush itself, which gives up once the pipeline has
+// gone quiet without the probe coming back; a pipeline that keeps working keeps
+// the wait alive however long it takes.
+//
+// Never call it from the goroutine that processes frames: the probe it waits on
+// has to pass through this processor to complete its trip, so a processor
+// blocking its own frame path would wait forever. A processor that needs this
+// runs it from a goroutine of its own.
+//
+// It is a no-op for a processor driven outside a pipeline worker, which has
+// nothing to drain.
+func (b *Base) FlushPipeline(ctx context.Context) error {
+	running := b.setupState().running
+	if running == nil {
+		return nil
+	}
+	return running.Flush(ctx)
+}
+
+// Broadcast sends a frame both downstream and upstream, so an event that the
+// whole pipeline has to see reaches processors on either side of this one.
+//
+// build is called once per direction: the two halves are distinct frames paired
+// by BroadcastSiblingID. The directions are processed on separate goroutines, so
+// a single shared frame would be mutated concurrently, and a consumer that sees
+// both halves can recognize the pair rather than reporting the event twice.
+func (b *Base) Broadcast(ctx context.Context, build func() frames.Frame) error {
+	down, up := build(), build()
+	down.Base().SetBroadcastSiblingID(up.ID())
+	up.Base().SetBroadcastSiblingID(down.ID())
+
+	if err := b.self.PushFrame(ctx, down, Downstream); err != nil {
+		return err
+	}
+	return b.self.PushFrame(ctx, up, Upstream)
+}
+
+// BroadcastInterruption interrupts the pipeline from this processor: it drops
+// the work this processor had queued and sends an InterruptionFrame both ways,
+// so every processor on either side hears that the turn was cut off.
+//
+// Use it wherever something other than the user's voice interrupts the bot: a
+// client typing over it, a tool deciding the answer is stale, a supervisor
+// stopping the turn.
+//
+// It returns as soon as the frames are away, and this processor's own goroutine
+// is left running, so a caller can carry on and push what it interrupted for.
+// That is why the queue is emptied rather than the goroutine canceled: canceling
+// here would cancel the call asking for the interruption.
+func (b *Base) BroadcastInterruption(ctx context.Context) error {
+	slog.DebugContext(ctx, "broadcasting interruption", "processor", b.name)
+	b.resetProcessTask()
+	b.stopAllMetrics(ctx)
+	return b.Broadcast(ctx, func() frames.Frame { return frames.NewInterruptionFrame() })
+}
+
+// MetricsStopper is an optional interface a processor implements when it times
+// what it does: a service measuring its time to first byte or its processing
+// time. StopAllMetrics stops every clock it is running and reports what each has
+// measured so far.
+type MetricsStopper interface {
+	StopAllMetrics(ctx context.Context)
+}
+
+// stopAllMetrics stops the clocks of a processor that runs any, on an
+// interruption: what they were measuring will never finish, so what each has
+// measured is reported now.
+func (b *Base) stopAllMetrics(ctx context.Context) {
+	if m, ok := b.self.(MetricsStopper); ok {
+		m.StopAllMetrics(ctx)
+	}
+}
+
+// StartInterruption stops what this processor is doing without telling anyone
+// else, which is what a processor needs when work it started turns out to be
+// unwanted but the pipeline is not being interrupted.
+//
+// BroadcastInterruption is the announced half: it tells the whole pipeline to
+// drop what it has. This one is local, so a caller can abandon its own work and
+// leave the turn open.
+func (b *Base) StartInterruption() { b.startInterruption() }
+
+// PushTokenUsage reports LLM token usage measured by a service that does not run
+// through the LLM base: a realtime (speech-to-speech) service that receives a
+// usage event from its provider. It records the aggregate token counts as
+// metrics and emits a MetricsFrame downstream for in-band consumers (e.g. an
+// RTVI client). The caller passes the model id and gates the call on
+// UsageMetricsEnabled, so the conversion from the provider's usage shape happens
+// only when metrics are collected.
+//
+// The gen_ai.usage.* attributes go on the span already covering the work the
+// usage was measured for, which the caller supplies through ctx. A service that
+// reports usage outside any span of its own records it in metrics alone: usage
+// belongs to the operation that incurred it, and a span raised here just to hold
+// it would have nothing to say about what the model actually did.
+func (b *Base) PushTokenUsage(ctx context.Context, model string, u frames.LLMTokenUsage) error {
+	tracing.SetTokenUsage(ctx, u)
+	metrics.RecordTokens(ctx, b.typeName, model, u.PromptTokens, u.CompletionTokens)
+	f := frames.NewMetricsFrame(frames.LLMUsageMetricsData{
+		Processor: b.name, Model: model,
+		Value: u,
+	})
+	return b.self.PushFrame(ctx, f, Downstream)
+}
+
+func (b *Base) start() {
+	b.createProcessTask()
+}
+
+func (b *Base) cancel() {
+	b.setCanceling(true)
+	b.cancelProcessTask()
+}
+
+// startInterruption interrupts in-order processing. If the frame currently
+// being processed is uninterruptible it is left to finish and only the queued
+// interruptible frames are flushed; otherwise the process goroutine is
+// canceled and recreated.
+func (b *Base) startInterruption() {
+	if b.directMode {
+		return
+	}
+	if b.onProcessGoroutine() {
+		// The goroutine cannot cancel itself and wait for itself to exit. What is
+		// queued behind the frame it is handling is dropped instead, as
+		// BroadcastInterruption does.
+		slog.Warn("ignoring attempt to cancel the process goroutine from itself", "processor", b.name)
+		b.resetProcessTask()
+		return
+	}
+	// The decision and the cancel are made under the lock the process goroutine
+	// takes a frame under, so a frame cannot become current between the two.
+	b.curMu.Lock()
+	if current := b.curFrame; current != nil && !frames.Interruptible(current) {
+		b.curMu.Unlock()
+		// The frame currently being processed is uninterruptible, so it must not
+		// be canceled. Only flush the interruptible frames queued behind it.
+		b.procQueue.reset()
+		return
+	}
+	wait := b.stopProcessTask()
+	b.curMu.Unlock()
+	wait()
+	b.createProcessTask()
+}
+
+// createProcessTask starts the process goroutine if it is not already running.
+func (b *Base) createProcessTask() {
+	if b.directMode {
+		return
+	}
+	b.procMu.Lock()
+	defer b.procMu.Unlock()
+	if b.procRunning {
+		return
+	}
+	b.resetProcessTask()
+	b.spawnProcessLoop()
+}
+
+// spawnProcessLoop starts the process goroutine on the queue as it stands. The
+// caller holds procMu and has checked that none is running.
+func (b *Base) spawnProcessLoop() {
+	ctx, cancel := context.WithCancel(b.baseContext())
+	done := make(chan struct{})
+	b.procCancel = cancel
+	b.procDone = done
+	b.procRunning = true
+	go b.processLoop(ctx, done)
+}
+
+// CancelFrameInProgress stops processing f if it is the frame in progress,
+// leaving the queue as it is.
+//
+// Unlike an interruption, it drops nothing else: the frames queued behind the
+// canceled one, interruptible or not, are processed next, on a process
+// goroutine started afresh.
+//
+// Call it while processing a system frame, as interruptions are, so it runs on
+// the input goroutine and never overlaps an interruption. It reports whether f
+// was in progress and its processing was canceled.
+func (b *Base) CancelFrameInProgress(f frames.Frame) bool {
+	if b.directMode || f == nil {
+		return false
+	}
+	if b.onProcessGoroutine() {
+		slog.Warn("ignoring attempt to cancel the process goroutine from itself", "processor", b.name)
+		return false
+	}
+	// Decided under the lock the process goroutine takes a frame under, so f
+	// cannot stop being current between the check and the cancel.
+	b.curMu.Lock()
+	if b.curFrame != f {
+		b.curMu.Unlock()
+		return false
+	}
+	b.procMu.Lock()
+	running := b.procRunning
+	b.procMu.Unlock()
+	if !running {
+		b.curMu.Unlock()
+		return false
+	}
+	wait := b.stopProcessTask()
+	b.curMu.Unlock()
+	wait()
+	b.procMu.Lock()
+	defer b.procMu.Unlock()
+	if !b.procRunning {
+		b.spawnProcessLoop()
+	}
+	return true
+}
+
+// resetProcessTask clears the in-order queue and starts the pause gate afresh,
+// without touching the goroutine itself.
+//
+// It is what an interruption does to a processor that is interrupting from
+// inside its own frame handling: canceling the goroutine there would cancel the
+// very call asking for the interruption, so the queued work is dropped and the
+// gate reopened while the goroutine carries on.
+//
+// A fresh gate matters because a pause that was in effect must not survive the
+// interruption that cleared everything behind it.
+func (b *Base) resetProcessTask() {
+	if b.directMode {
+		return
+	}
+	b.pauseMu.Lock()
+	b.blockFrames = false
+	b.processEvent = newEvent()
+	b.pauseMu.Unlock()
+	b.procQueue.reset()
+}
+
+// cancelProcessTask cancels the process goroutine and waits for it to exit.
+func (b *Base) cancelProcessTask() {
+	b.stopProcessTask()()
+}
+
+// stopProcessTask cancels the process goroutine and returns a function that
+// waits for it to exit. Canceling never blocks, so it can be done under a lock
+// the goroutine itself takes, with the wait left until after the lock is
+// released.
+//
+// The wait has no bound. A goroutine cannot be stopped from outside, so one
+// that is given up on keeps running, and a processor that then starts another
+// would have two handling its frames at once, out of order. A ProcessFrame
+// that ignores its context therefore holds up whoever canceled it until it
+// returns.
+//
+// A request made from the process goroutine itself is ignored, since waiting
+// for itself to exit would never return.
+func (b *Base) stopProcessTask() (wait func()) {
+	if b.directMode {
+		return func() {}
+	}
+	if b.onProcessGoroutine() {
+		slog.Warn("ignoring attempt to cancel the process goroutine from itself", "processor", b.name)
+		return func() {}
+	}
+	b.procMu.Lock()
+	if !b.procRunning {
+		b.procMu.Unlock()
+		return func() {}
+	}
+	cancel := b.procCancel
+	done := b.procDone
+	b.procRunning = false
+	b.procMu.Unlock()
+
+	cancel()
+	return func() { <-done }
+}
+
+// onProcessGoroutine reports whether the caller is running on this processor's
+// process goroutine.
+func (b *Base) onProcessGoroutine() bool {
+	id := b.procGoroutine.Load()
+	return id != 0 && id == goid.Current()
+}
+
+// reportPanic pushes upstream an error for a panic caught while this processor
+// was handling or pushing a frame. The fault may lie anywhere in the code that
+// ran, not necessarily in this processor, so its cause is reported as unknown.
+func (b *Base) reportPanic(ctx context.Context, msg string, v any) {
+	err := panicError(v)
+	slog.ErrorContext(ctx, "uncaught panic", "processor", b.name, "panic", v,
+		"stack", string(debug.Stack()))
+	b.PushError(ctx, fmt.Sprintf("%s: %v", msg, err), err, false, WithErrorCategory(errs.Unknown))
+}
+
+// ErrPanic is what a panic that was not raised with an error is reported as,
+// wrapped with the value it was raised with.
+var ErrPanic = errors.New("panic")
+
+// panicError turns a recovered panic value into an error, keeping it as is when
+// it already is one.
+func panicError(v any) error {
+	if err, ok := v.(error); ok {
+		return err
+	}
+	return fmt.Errorf("%w: %v", ErrPanic, v)
+}
+
+func (b *Base) isCanceling() bool {
+	b.cancelMu.Lock()
+	defer b.cancelMu.Unlock()
+	return b.canceling
+}
+
+func (b *Base) setCanceling(v bool) {
+	b.cancelMu.Lock()
+	b.canceling = v
+	b.cancelMu.Unlock()
+}
+
+func (b *Base) setCurFrame(f frames.Frame) {
+	b.curMu.Lock()
+	b.curFrame = f
+	b.curMu.Unlock()
+}
+
+var _ Processor = (*Base)(nil)

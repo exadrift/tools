@@ -1,0 +1,140 @@
+package llm
+
+import (
+	"log/slog"
+	"strings"
+
+	"github.com/gojargo/jargo/expressive"
+	"github.com/gojargo/jargo/frames"
+)
+
+// The system instruction a service sends is composed rather than stored whole:
+// the prompt the application gave is one part of it, and the framework adds
+// others as features that need the model told about them are turned on. This
+// file holds that composition.
+//
+// The base prompt is the single source of truth. Every rebuild starts from it,
+// so composing twice produces the same instruction rather than compounding the
+// additions.
+
+// SystemInstruction returns the system instruction this service sends: the base
+// prompt the application set, followed by everything composed onto it.
+//
+// A provider reads it when it builds a request, and passes it to its adapter as
+// the instruction for the call.
+func (b *Base) SystemInstruction() string {
+	b.systemMu.Lock()
+	defer b.systemMu.Unlock()
+	return b.systemInstruction
+}
+
+// SetSystemInstruction replaces the base system prompt and rebuilds the
+// composed instruction from it. It is what an LLMUpdateSettingsFrame carrying a
+// system instruction ends up calling.
+func (b *Base) SetSystemInstruction(instruction string) {
+	b.systemMu.Lock()
+	b.baseSystemInstruction = instruction
+	b.systemMu.Unlock()
+	b.composeSystemInstruction()
+}
+
+// AppendSystemInstruction adds durable text to the end of the system
+// instruction, keeping the application's own prompt.
+//
+// The text is composed onto the instruction rather than written into the
+// conversation, so it survives a reset of the context messages and is sent on
+// every generation. It is for a framework component that owns an LLM and has to
+// tell the model something the application did not: how to use a wire format it
+// is being asked to produce, say. Appended text is joined after the base prompt
+// and before the instructions the built-in tools contribute.
+func (b *Base) AppendSystemInstruction(instruction string) {
+	b.systemMu.Lock()
+	b.appendedSystemInstructions = append(b.appendedSystemInstructions, instruction)
+	b.systemMu.Unlock()
+	b.composeSystemInstruction()
+}
+
+// composeSystemInstruction rebuilds the instruction from the base prompt and
+// every addition currently in force. It always rebuilds from the base, so it is
+// safe to call repeatedly.
+func (b *Base) composeSystemInstruction() {
+	b.systemMu.Lock()
+	parts := make([]string, 0, len(b.appendedSystemInstructions)+1)
+	if b.baseSystemInstruction != "" {
+		parts = append(parts, b.baseSystemInstruction)
+	}
+	for _, p := range b.appendedSystemInstructions {
+		if p != "" {
+			parts = append(parts, p)
+		}
+	}
+	// With expressive conversation on, how to read perception and the
+	// expression tags the TTS service performs. They come and go with the
+	// metadata that announces them.
+	if expression := b.expressionInstructionsLocked(); expression != "" {
+		parts = append(parts, expression)
+	}
+	perceives := b.expression.perception != nil && len(b.expression.perception.Signals) > 0
+	b.systemMu.Unlock()
+
+	// The marker protocol is composed on rather than appended, so turning the
+	// gating off takes it back out again.
+	b.turnCompletion.mu.Lock()
+	if b.turnCompletion.enabled {
+		parts = append(parts, b.turnCompletion.config.CompletionInstructions())
+		// With perception taught, a reading of how the user sounded is not to
+		// decide the marker.
+		if perceives {
+			parts = append(parts, expressive.PerceptionTurnCompletionInstructions(b.turnCompletion.config.Markers()))
+		}
+	}
+	b.turnCompletion.mu.Unlock()
+
+	// Likewise the guidance on stopping work early: it comes and goes with the
+	// cancel tools it describes, so a session with none never carries it.
+	if len(b.cancelToolNames()) > 0 {
+		parts = append(parts, asyncToolCancellationInstructions)
+	}
+
+	// The standing policy on results that arrive after the reply. The message
+	// carrying each result says the same thing, but it lands in a conversation
+	// whose most recent turn is the user asking for something else, and a model
+	// weighing the two follows the nearer request. Stating it up front puts it in
+	// force before any result exists.
+	if b.hasAsyncTools() {
+		parts = append(parts, frames.AsyncToolInstructions)
+	}
+
+	b.systemMu.Lock()
+	composed := strings.Join(parts, "\n\n")
+	changed := composed != b.systemInstruction
+	b.systemInstruction = composed
+	b.systemMu.Unlock()
+
+	// The instruction is recomposed whenever anything that feeds it is touched,
+	// which is far more often than it actually changes. Logging every pass buries
+	// the times it moved, which are the ones worth reading.
+	if changed {
+		slog.Debug("composed system instruction", "service", b.Name(), "chars", len(composed))
+	}
+}
+
+// WarnIfRealtimeServiceEmitsNoTurnFrames reports, once, that a realtime service
+// emits no turn frames of its own. A realtime service calls it where it settles
+// whether its turns are provider-driven, which is when it describes itself.
+//
+// Processors that expect UserStartedSpeakingFrame and UserStoppedSpeakingFrame
+// (RTVI, say) then need local voice activity or turn detection in the user
+// aggregator, and the turns it detects are approximate unless it also drives
+// the service's turns.
+func (b *Base) WarnIfRealtimeServiceEmitsNoTurnFrames(emitsTurnFrames bool) {
+	if emitsTurnFrames || !b.warnedNoTurnFrames.CompareAndSwap(false, true) {
+		return
+	}
+	slog.Warn("this service is not emitting turn frames (UserStartedSpeakingFrame, "+
+		"UserStoppedSpeakingFrame): it either does not support them or is not configured to emit them. "+
+		"Other processors in the pipeline, such as RTVI, may expect turn frames; local voice activity or "+
+		"turn detection can be enabled on the user aggregator. Local turns may not align with the turns "+
+		"the server decides, so treat them as approximate unless local detection also drives the "+
+		"service's turns.", "service", b.Name())
+}

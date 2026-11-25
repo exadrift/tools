@@ -1,0 +1,124 @@
+package resample
+
+import "time"
+
+// Quality named a conversion filter, trading audio quality against CPU cost.
+//
+// Deprecated: every conversion now runs the one windowed-sinc filter, flat to
+// 90% of the band with about 90 dB of aliasing rejection, so a Quality has no
+// effect. It will be removed in a future release.
+type Quality int
+
+const (
+	// QualityVHQ is very high quality. It is the zero value, and so the default.
+	QualityVHQ Quality = iota
+	// QualityHQ is high quality: a shorter filter than VHQ, and audibly
+	// transparent for speech.
+	QualityHQ
+	// QualityMQ is medium quality.
+	QualityMQ
+	// QualityLQ is low quality.
+	QualityLQ
+	// QualityQQ is "quick": interpolation rather than a windowed filter, for
+	// paths that care more about cost than about the stopband.
+	QualityQQ
+)
+
+// String returns the recipe name.
+func (q Quality) String() string {
+	switch q {
+	case QualityVHQ:
+		return "VHQ"
+	case QualityHQ:
+		return "HQ"
+	case QualityMQ:
+		return "MQ"
+	case QualityLQ:
+		return "LQ"
+	case QualityQQ:
+		return "QQ"
+	default:
+		return "unknown"
+	}
+}
+
+// DefaultClearAfter was the idle window a Resampler used when its config left
+// ClearAfter at zero.
+//
+// Deprecated: a zero ClearAfter now keeps the filter history across pauses, so
+// nothing uses this window unless it is asked for. Mark where a stream ends
+// with Flush and Clear instead.
+const DefaultClearAfter = 200 * time.Millisecond
+
+// NeverClear is the ClearAfter that turns the idle window off, for a caller that
+// marks the boundaries of a stream itself with Flush and Clear. Any negative
+// duration does the same; this one names the intent.
+const NeverClear = -1 * time.Nanosecond
+
+// Config configures a Resampler.
+type Config struct {
+	// Quality has no effect.
+	//
+	// Deprecated: every conversion runs the same filter.
+	Quality Quality
+	// ClearAfter is how long the resampler may sit idle before its filter
+	// history is discarded. A resampler carries the tail of the audio it last
+	// saw so that a continuous stream converts cleanly across chunk boundaries,
+	// but after a gap that tail is no longer what came before: it is the end of
+	// the previous utterance bleeding into the start of the next one, which is
+	// heard as a click. Zero, the default, never clears, and neither does
+	// NeverClear (or any negative value); a positive value clears after that
+	// long idle.
+	//
+	// Leave it off for a caller that knows where its streams end, and say so
+	// with Flush and Clear. The window only ever guesses, and it guesses wrong
+	// in both directions: a telephony leg delivers a continuous stream in bursts
+	// that look like gaps, and a stream running ahead of playback pauses
+	// mid-utterance whenever what feeds it does.
+	ClearAfter time.Duration
+}
+
+// clearAfter returns the idle window the config asks for, and whether clearing
+// is wanted at all: only a positive window clears.
+func (c Config) clearAfter() (time.Duration, bool) {
+	if c.ClearAfter <= 0 {
+		return 0, false
+	}
+	return c.ClearAfter, true
+}
+
+// idleClock decides when a stream has been idle long enough that the filter
+// history should be dropped. It measures the gap between successive calls, not
+// the age of the audio, because that is the only thing a resampler can see.
+type idleClock struct {
+	after   time.Duration
+	enabled bool
+	last    time.Time
+	// now is the clock, replaced in tests. nil means time.Now.
+	now func() time.Time
+}
+
+func newIdleClock(cfg Config) idleClock {
+	after, enabled := cfg.clearAfter()
+	return idleClock{after: after, enabled: enabled}
+}
+
+func (c *idleClock) time() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}
+
+// stale reports whether the gap since the previous call exceeds the idle window,
+// and records this call as the most recent one. The first call is never stale:
+// there is no history to drop yet.
+func (c *idleClock) stale() bool {
+	now := c.time()
+	idle := c.enabled && !c.last.IsZero() && now.Sub(c.last) > c.after
+	c.last = now
+	return idle
+}
+
+// reset forgets the last call, so the next one starts a fresh idle window.
+func (c *idleClock) reset() { c.last = time.Time{} }

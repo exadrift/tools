@@ -1,0 +1,756 @@
+package chat
+
+import (
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"log/slog"
+	"maps"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/gojargo/jargo/adapter"
+	"github.com/gojargo/jargo/adapter/openai"
+	"github.com/gojargo/jargo/frames"
+	"github.com/gojargo/jargo/internal/validate"
+	"github.com/gojargo/jargo/provider/openai/internal/apierror"
+	"github.com/gojargo/jargo/provider/openai/internal/sdkretry"
+	"github.com/gojargo/jargo/service/llm"
+	errs "github.com/gojargo/jargo/utils/errors"
+)
+
+const (
+	defaultLLMModel = "gpt-4o-mini"
+	// defaultRetryTimeout bounds the first attempt when a service was built to
+	// retry a request that times out.
+	defaultRetryTimeout = 5 * time.Second
+)
+
+// The message roles the chat-completions API defines. They are aliases of the
+// adapter's own, which is where the wire format lives.
+const (
+	RoleSystem    = openai.RoleSystem
+	RoleUser      = openai.RoleUser
+	RoleAssistant = openai.RoleAssistant
+	RoleTool      = openai.RoleTool
+	RoleDeveloper = openai.RoleDeveloper
+)
+
+// LLMConfig configures an OpenAI (or OpenAI-compatible) LLM service. The
+// sampling controls are pointers so a deliberate zero is distinguishable from
+// "unset"; a nil value is omitted from the request, leaving the API default.
+type LLMConfig struct {
+	// APIKey is the API key. It is not marked required because OpenAI-compatible
+	// endpoints vary — some (e.g. a local Ollama) need none — so the caller
+	// supplies it when the endpoint requires one.
+	APIKey string
+	// BaseURL overrides the API base (e.g. an OpenAI-compatible endpoint).
+	BaseURL string
+	// Organization is the OpenAI organization the requests are billed to, sent
+	// as the OpenAI-Organization header; empty sends none.
+	Organization string
+	// Project is the OpenAI project the requests belong to, sent as the
+	// OpenAI-Project header; empty sends none.
+	Project string
+	// DefaultHeaders are additional HTTP headers sent with every request. They
+	// are applied last, so they override any header the service sets.
+	DefaultHeaders map[string]string
+	// Model is the model id; empty uses the provider default.
+	Model string
+	// MaxTokens caps the response length; 0 omits it, leaving the API default.
+	MaxTokens int
+	// MaxCompletionTokens caps the completion length on models that require it in
+	// place of MaxTokens; nil omits it.
+	MaxCompletionTokens *int
+	// Temperature is the sampling temperature (0.0 to 2.0); nil omits it.
+	Temperature *float64
+	// TopP is the nucleus-sampling parameter (0.0 to 1.0); nil omits it.
+	TopP *float64
+	// FrequencyPenalty penalizes frequent tokens (-2.0 to 2.0); nil omits it.
+	FrequencyPenalty *float64
+	// PresencePenalty penalizes already-present tokens (-2.0 to 2.0); nil omits it.
+	PresencePenalty *float64
+	// Seed requests deterministic sampling for a fixed seed; nil omits it.
+	Seed *int
+	// ServiceTier selects the tier the request is served under (e.g. "auto",
+	// "flex", "priority") on an endpoint that offers them; empty omits it.
+	ServiceTier string
+	// RetryOnTimeout runs a request that takes longer than RetryTimeout a second
+	// time, that one unbounded. It is for an endpoint that occasionally stalls on
+	// the first token, where waiting out the stall costs more than asking again.
+	RetryOnTimeout bool
+	// RetryTimeout is how long the first attempt may take before RetryOnTimeout
+	// gives up on it. Zero uses five seconds. It bounds nothing unless
+	// RetryOnTimeout is set.
+	RetryTimeout time.Duration
+	// Extra sets arbitrary additional request-body fields not modeled above
+	// (e.g. provider-specific parameters), applied to every request.
+	Extra map[string]any
+}
+
+// RequestShaper customizes how a chat-completions request is addressed and
+// authorized, so an OpenAI-compatible deployment with a different URL layout or
+// auth scheme (e.g. Azure OpenAI) can reuse this implementation. The default
+// shaper targets <baseURL>/chat/completions with a Bearer token.
+type RequestShaper interface {
+	// Endpoint returns the full chat-completions URL for baseURL, including any
+	// query string.
+	Endpoint(baseURL string) string
+	// Authorize sets the authorization headers for apiKey on req.
+	Authorize(req *http.Request, apiKey string)
+}
+
+// defaultShaper is the standard OpenAI addressing and Bearer authorization.
+type defaultShaper struct{}
+
+func (defaultShaper) Endpoint(baseURL string) string { return baseURL + "/chat/completions" }
+
+func (defaultShaper) Authorize(req *http.Request, apiKey string) {
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+}
+
+// LLMService is a streaming OpenAI-compatible chat-completions LLM processor.
+type LLMService struct {
+	*llm.Base
+	cfg LLMConfig
+	// live is what an LLMUpdateSettingsFrame may change while the pipeline runs.
+	// It is seeded from cfg, and is what every request is built from.
+	live   *LLMSettings
+	http   *http.Client
+	shaper RequestShaper
+	// adapter converts the conversation into the request this endpoint takes.
+	adapter adapter.LLMAdapter[openai.Params, openai.Tool]
+	// How this endpoint departs from OpenAI's own API, fixed at construction.
+	noDeveloperRole  bool
+	noResponseSchema bool
+	// noMaxCompletion leaves max_completion_tokens off every request.
+	noMaxCompletion bool
+	// newStreamFilter builds the filter each completion's stream goes through,
+	// or is nil when the stream is taken as it comes.
+	newStreamFilter func(*LLMService) StreamFilter
+	// tokenUsage adjusts the reported usage, or is nil to take it as converted.
+	tokenUsage func(frames.LLMTokenUsage) frames.LLMTokenUsage
+}
+
+// StreamDelta is the part of a streamed delta a StreamFilter sees.
+type StreamDelta struct {
+	// Content is the answer text the delta carries. A filter may rewrite it,
+	// and what it leaves is what the service takes as the answer.
+	Content string
+	// ReasoningContent is the model's reasoning, for an endpoint that carries it
+	// in a field of its own: reasoning_content, or reasoning.
+	ReasoningContent string
+}
+
+// StreamFilter intercepts a completion's stream before the service reads it,
+// for an endpoint whose stream carries more than OpenAI's: a model that writes
+// its reasoning ahead of the answer, say, which a filter can push as thoughts
+// rather than let it be spoken. A filter lives for one completion.
+type StreamFilter interface {
+	// Delta sees each delta that holds model output, and may rewrite its
+	// content.
+	Delta(ctx context.Context, d *StreamDelta) error
+	// End sees the stream end, completed or cut short by an interruption or an
+	// error. text passes on answer text the filter held back.
+	End(ctx context.Context, completed bool, text func(string) error) error
+}
+
+// Validate reports whether the configuration is usable.
+func (c LLMConfig) Validate() error { return validate.Struct(c) }
+
+// MergeExtra adds provider-specific fields to the request body fields c sends in
+// Extra. It is how an OpenAI-compatible provider sends a field of its own that
+// the modeled parameters have no place for.
+//
+// A field already in Extra, set by the caller, wins key by key, matching how
+// Extra overrides every other request parameter. Extra is copied rather than
+// modified, so a caller's map is never written to. Nil values are omitted.
+func (c *LLMConfig) MergeExtra(fields map[string]any) {
+	extra := make(map[string]any, len(fields)+len(c.Extra))
+	for name, value := range fields {
+		if value != nil {
+			extra[name] = value
+		}
+	}
+	maps.Copy(extra, c.Extra)
+	if len(extra) > 0 {
+		c.Extra = extra
+	}
+}
+
+// Compat describes an OpenAI-compatible endpoint: the label its service runs
+// under, where it lives, and the ways it departs from OpenAI's own API. The
+// zero value of every optional field is OpenAI's own behavior, so a provider
+// only states what differs.
+type Compat struct {
+	// Name is the processor label the service is known by in logs, metrics and
+	// traces.
+	Name string
+	// BaseURL is the API base used when the config leaves it empty.
+	BaseURL string
+	// DefaultModel is the model used when the config leaves it empty.
+	DefaultModel string
+	// Shaper addresses and authorizes the request. Nil means OpenAI's own
+	// layout: <base>/chat/completions with a Bearer token.
+	Shaper RequestShaper
+	// NoDeveloperRole marks an endpoint with no developer role. Its messages are
+	// sent as user messages instead, which is what carries an asynchronous
+	// tool's late results to a model that would otherwise reject the role.
+	NoDeveloperRole bool
+	// NoResponseSchema marks an endpoint whose API has no way to hold a reply to
+	// a JSON schema, so an inference given one runs without it.
+	NoResponseSchema bool
+	// NoMaxCompletionTokens marks an endpoint without the max_completion_tokens
+	// field. The config's MaxCompletionTokens is not sent to it, and the bound an
+	// inference is given goes in max_tokens instead.
+	NoMaxCompletionTokens bool
+	// TokenUsage, when set, adjusts the token usage converted from what the
+	// endpoint reported, for one that counts differently from OpenAI.
+	TokenUsage func(frames.LLMTokenUsage) frames.LLMTokenUsage
+	// StreamFilter, when set, builds the filter each completion's stream goes
+	// through before the service reads it. It is called once per completion.
+	StreamFilter func(*LLMService) StreamFilter
+	// Adapter converts the conversation into the request this endpoint takes. It
+	// is for an endpoint that constrains the shape of a conversation beyond what
+	// OpenAI's schema says: such an adapter embeds the OpenAI one and rewrites
+	// what it produced. Nil converts the conversation as OpenAI itself takes it.
+	Adapter adapter.LLMAdapter[openai.Params, openai.Tool]
+	// Base configures the shared LLM base this service is built on.
+	Base []llm.Option
+}
+
+// NewLLM builds an OpenAI LLM service.
+func NewLLM(cfg LLMConfig) *LLMService {
+	return NewCompatLLM(Compat{
+		Name:         "OpenAILLM",
+		BaseURL:      defaultLLMBaseURL,
+		DefaultModel: defaultLLMModel,
+	}, cfg)
+}
+
+// NewCompatLLM builds an LLM service for an OpenAI-compatible endpoint
+// described by c.
+func NewCompatLLM(c Compat, cfg LLMConfig) *LLMService {
+	if cfg.BaseURL == "" {
+		cfg.BaseURL = c.BaseURL
+	}
+	if cfg.Model == "" {
+		cfg.Model = c.DefaultModel
+	}
+	if cfg.RetryTimeout == 0 {
+		cfg.RetryTimeout = defaultRetryTimeout
+	}
+	shaper := c.Shaper
+	if shaper == nil {
+		shaper = defaultShaper{}
+	}
+	a := c.Adapter
+	if a == nil {
+		a = &openai.Adapter{}
+	}
+	s := &LLMService{
+		cfg:              cfg,
+		live:             newLLMSettings(cfg),
+		http:             &http.Client{},
+		shaper:           shaper,
+		adapter:          a,
+		noDeveloperRole:  c.NoDeveloperRole,
+		noResponseSchema: c.NoResponseSchema,
+		noMaxCompletion:  c.NoMaxCompletionTokens,
+		newStreamFilter:  c.StreamFilter,
+		tokenUsage:       c.TokenUsage,
+	}
+	s.Base = llm.New(c.Name, s, c.Base...)
+	s.Base.SetModel(cfg.Model)
+	return s
+}
+
+// The chat-completions wire types. They live in the adapter, which is what
+// converts a conversation into them; these aliases keep them reachable under
+// this package's name.
+type (
+	// Message is one message of the conversation as the chat-completions API
+	// takes it.
+	Message = openai.Message
+	// ToolCall is an assistant tool-call entry on a message.
+	ToolCall = openai.ToolCall
+	// ToolCallFunction is the function a tool call invokes, with its arguments as
+	// the raw JSON string the model produced.
+	ToolCallFunction = openai.ToolCallFunction
+)
+
+type chatRequest struct {
+	Model               string                 `json:"model"`
+	Messages            []Message              `json:"messages"`
+	Stream              bool                   `json:"stream"`
+	StreamOptions       *streamOptions         `json:"stream_options,omitempty"`
+	MaxTokens           int                    `json:"max_tokens,omitempty"`
+	MaxCompletionTokens *int                   `json:"max_completion_tokens,omitempty"`
+	Temperature         *float64               `json:"temperature,omitempty"`
+	TopP                *float64               `json:"top_p,omitempty"`
+	FrequencyPenalty    *float64               `json:"frequency_penalty,omitempty"`
+	PresencePenalty     *float64               `json:"presence_penalty,omitempty"`
+	Seed                *int                   `json:"seed,omitempty"`
+	ServiceTier         string                 `json:"service_tier,omitempty"`
+	Tools               []openai.Tool          `json:"tools,omitempty"`
+	ToolChoice          string                 `json:"tool_choice,omitempty"`
+	ResponseFormat      *openai.ResponseFormat `json:"response_format,omitempty"`
+	// extra are the settings' request fields the request does not model,
+	// merged over the modeled ones when it is encoded.
+	extra map[string]any
+}
+
+// streamOptions asks for the token counts to be reported on the stream. Without
+// it a streamed completion carries no usage at all.
+type streamOptions struct {
+	IncludeUsage bool `json:"include_usage"`
+}
+
+// encodeBody marshals the request, merging any extra fields over the modeled
+// ones. The merge cost is paid only when extra is non-empty.
+func encodeBody(req chatRequest, extra map[string]any) ([]byte, error) {
+	if len(extra) == 0 {
+		return json.Marshal(req)
+	}
+	return openai.MergeExtra(req, extra)
+}
+
+type toolCallDelta struct {
+	Index    int    `json:"index"`
+	ID       string `json:"id"`
+	Function struct {
+		Name      string `json:"name"`
+		Arguments string `json:"arguments"`
+	} `json:"function"`
+}
+
+type chatDelta struct {
+	Content   string          `json:"content"`
+	ToolCalls []toolCallDelta `json:"tool_calls"`
+	// ReasoningContent and Reasoning are the model's reasoning, which some
+	// endpoints stream apart from the answer, under one name or the other.
+	ReasoningContent string `json:"reasoning_content"`
+	Reasoning        string `json:"reasoning"`
+}
+
+// chatUsage is the token accounting a completion reports. It arrives on a chunk
+// of its own at the end of the stream, or repeated on every chunk as a running
+// total, depending on the provider.
+type chatUsage struct {
+	PromptTokens        int64 `json:"prompt_tokens"`
+	CompletionTokens    int64 `json:"completion_tokens"`
+	TotalTokens         int64 `json:"total_tokens"`
+	PromptTokensDetails *struct {
+		CachedTokens int64 `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+	CompletionTokensDetails *struct {
+		ReasoningTokens int64 `json:"reasoning_tokens"`
+	} `json:"completion_tokens_details"`
+}
+
+// tokenUsage converts the reported counts into the shape the pipeline carries.
+func (u chatUsage) tokenUsage() frames.LLMTokenUsage {
+	out := frames.LLMTokenUsage{
+		PromptTokens:     u.PromptTokens,
+		CompletionTokens: u.CompletionTokens,
+		TotalTokens:      u.TotalTokens,
+	}
+	if u.PromptTokensDetails != nil {
+		out.CacheReadTokens = new(u.PromptTokensDetails.CachedTokens)
+	}
+	if u.CompletionTokensDetails != nil {
+		out.ReasoningTokens = new(u.CompletionTokensDetails.ReasoningTokens)
+	}
+	return out
+}
+
+type chatChunk struct {
+	// Model is the model that answered, which is more specific than the one
+	// asked for: an alias resolves to a dated build here.
+	Model   string     `json:"model"`
+	Usage   *chatUsage `json:"usage"`
+	Choices []struct {
+		Delta chatDelta `json:"delta"`
+	} `json:"choices"`
+}
+
+// textSink adapts a text-only generation to the streaming loop, which is shared
+// with the tool-capable one. A request advertising no tools gives the model
+// nothing to call, so a reported call would be the provider inventing one.
+type textSink struct{ emit llm.Emit }
+
+func (t textSink) Text(text string) error { return t.emit(text) }
+
+func (textSink) Tool(frames.ToolCall) error { return nil }
+
+// Generate streams a chat completion, emitting each content delta.
+func (s *LLMService) Generate(ctx context.Context, convo *frames.LLMContext, emit llm.Emit) error {
+	reqBody, err := s.baseRequest(convo, adapter.Options{SystemInstruction: s.SystemInstruction()})
+	if err != nil {
+		return err
+	}
+	// A text-only generation advertises no tools, so the model has nothing to
+	// call and a reported call would be the provider inventing one.
+	reqBody.Tools = nil
+	reqBody.ToolChoice = ""
+	return s.generate(ctx, reqBody, textSink{emit})
+}
+
+// GenerateWithTools streams a tool-capable completion. It emits text deltas to
+// the sink as they arrive and, once the stream completes, reports each tool call
+// the model produced. The conversation's tools are sent on the request, and any
+// tool turns already in the context are replayed as the matching messages.
+func (s *LLMService) GenerateWithTools(ctx context.Context, convo *frames.LLMContext, sink llm.Sink) error {
+	reqBody, err := s.baseRequest(convo, adapter.Options{SystemInstruction: s.SystemInstruction()})
+	if err != nil {
+		return err
+	}
+	return s.generate(ctx, reqBody, sink)
+}
+
+// baseRequest builds the streaming request shared by both generation paths.
+func (s *LLMService) baseRequest(
+	convo *frames.LLMContext, opts adapter.Options,
+) (chatRequest, error) {
+	p, err := s.params(convo, opts)
+	if err != nil {
+		return chatRequest{}, err
+	}
+	live := s.liveSettings()
+	maxCompletion := live.MaxCompletionTokens.Ptr()
+	if s.noMaxCompletion {
+		maxCompletion = nil
+	}
+	return chatRequest{
+		Model:               live.Model.Or(""),
+		Messages:            p.Messages,
+		Tools:               p.Tools,
+		ToolChoice:          p.ToolChoice,
+		Stream:              true,
+		StreamOptions:       &streamOptions{IncludeUsage: true},
+		MaxTokens:           live.MaxTokens.Or(0),
+		MaxCompletionTokens: maxCompletion,
+		Temperature:         live.Temperature.Ptr(),
+		TopP:                live.TopP.Ptr(),
+		FrequencyPenalty:    live.FrequencyPenalty.Ptr(),
+		PresencePenalty:     live.PresencePenalty.Ptr(),
+		Seed:                live.Seed.Ptr(),
+		ServiceTier:         s.cfg.ServiceTier,
+		extra:               live.Extra,
+	}, nil
+}
+
+// generate sends one streaming request and feeds what comes back to sink.
+func (s *LLMService) generate(ctx context.Context, reqBody chatRequest, sink llm.Sink) error {
+	body, err := encodeBody(reqBody, reqBody.extra)
+	if err != nil {
+		return err
+	}
+	s.StartTTFBMetrics()
+	resp, err := s.send(ctx, body)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return apierror.FromResponse(resp, errStatus)
+	}
+	return s.consume(ctx, resp.Body, sink)
+}
+
+// consume reads the stream: text and tool-call fragments reach the sink as they
+// arrive, whole calls once the stream ends.
+//
+// Providers differ over how often they report the token counts, some once at
+// the end and some as a running total on every chunk, so the latest is held and
+// reported when the stream finishes: one report per completion either way. It is
+// reported even when the stream fails or is cut off part way, because the
+// tokens were spent regardless.
+func (s *LLMService) consume(ctx context.Context, body io.Reader, sink llm.Sink) error {
+	c := &toolCoalescer{calls: map[int]*toolAccumulator{}}
+	var filter StreamFilter
+	if s.newStreamFilter != nil {
+		filter = s.newStreamFilter(s)
+	}
+	var usage *chatUsage
+	scanErr := llm.ScanSSE(body, func(data string) error {
+		var chunk chatChunk
+		if json.Unmarshal([]byte(data), &chunk) != nil {
+			return nil //nolint:nilerr // An empty or malformed chunk is skipped.
+		}
+		if chunk.Usage != nil {
+			usage = chunk.Usage
+		}
+		if chunk.Model != "" {
+			s.SetFullModelName(chunk.Model)
+		}
+		// The chunk carrying the counts has no choices of its own, so TTFB ends
+		// at the first chunk that holds model output.
+		if len(chunk.Choices) == 0 {
+			return nil
+		}
+		s.StopTTFBMetrics(ctx)
+		delta := chunk.Choices[0].Delta
+		if len(delta.ToolCalls) > 0 {
+			// A turn that only calls tools produces no answer text, so the call
+			// itself is what the caller gets and TTFAT ends here rather than
+			// going unmeasured.
+			s.StopTTFATMetrics(ctx)
+		}
+		if filter != nil {
+			if err := filterDelta(ctx, filter, &delta); err != nil {
+				return err
+			}
+		}
+		return c.add(delta, sink)
+	})
+	if err := endFilter(ctx, filter, scanErr, sink); err != nil && scanErr == nil {
+		scanErr = err
+	}
+	if usage != nil && s.UsageMetricsEnabled() {
+		if err := s.PushTokenUsage(ctx, s.convertUsage(*usage)); err != nil {
+			return err
+		}
+	}
+	if scanErr != nil {
+		return scanErr
+	}
+	return c.emit(sink)
+}
+
+// convertUsage converts the usage the endpoint reported into the pipeline's,
+// adjusted for an endpoint that counts differently.
+func (s *LLMService) convertUsage(u chatUsage) frames.LLMTokenUsage {
+	out := u.tokenUsage()
+	if s.tokenUsage != nil {
+		out = s.tokenUsage(out)
+	}
+	return out
+}
+
+// endFilter tells the stream filter, if any, the stream has ended. A stream cut
+// short still ends what the filter opened, so that ending must not depend on
+// the context that was canceled to cut it.
+func endFilter(ctx context.Context, filter StreamFilter, scanErr error, sink llm.Sink) error {
+	if filter == nil {
+		return nil
+	}
+	completed := scanErr == nil && ctx.Err() == nil
+	return filter.End(context.WithoutCancel(ctx), completed, sink.Text)
+}
+
+// filterDelta passes a delta through the stream filter, taking back the
+// content it leaves.
+func filterDelta(ctx context.Context, filter StreamFilter, delta *chatDelta) error {
+	d := StreamDelta{Content: delta.Content, ReasoningContent: delta.ReasoningContent}
+	if d.ReasoningContent == "" {
+		d.ReasoningContent = delta.Reasoning
+	}
+	if err := filter.Delta(ctx, &d); err != nil {
+		return err
+	}
+	delta.Content = d.Content
+	return nil
+}
+
+// send posts the encoded body to the chat-completions endpoint. A service built
+// to retry a timed-out request bounds the wait for the first attempt and, if
+// nothing has come back by then, asks again with no bound at all: the point is
+// to give up on an attempt that has stalled, not on one that is answering
+// slowly.
+func (s *LLMService) send(ctx context.Context, body []byte) (*http.Response, error) {
+	return sdkretry.DoRetryingOnTimeout(ctx, s.http, s.cfg.RetryOnTimeout, s.cfg.RetryTimeout,
+		func(attemptCtx context.Context) (*http.Request, error) {
+			req, err := http.NewRequestWithContext(
+				attemptCtx, http.MethodPost, s.shaper.Endpoint(s.cfg.BaseURL), bytes.NewReader(body),
+			)
+			if err != nil {
+				return nil, err
+			}
+			s.shaper.Authorize(req, s.cfg.APIKey)
+			req.Header.Set("Content-Type", "application/json")
+			if s.cfg.Organization != "" {
+				req.Header.Set("OpenAI-Organization", s.cfg.Organization)
+			}
+			if s.cfg.Project != "" {
+				req.Header.Set("OpenAI-Project", s.cfg.Project)
+			}
+			for k, v := range s.cfg.DefaultHeaders {
+				req.Header.Set(k, v)
+			}
+			return req, nil
+		})
+}
+
+// toolAccumulator coalesces the streamed fragments of one tool call.
+type toolAccumulator struct {
+	id, name string
+	args     strings.Builder
+}
+
+// toolCoalescer assembles tool calls from streamed deltas, keyed by index and
+// remembering arrival order.
+type toolCoalescer struct {
+	calls map[int]*toolAccumulator
+	order []int
+}
+
+// add folds one delta in: text deltas go straight to the sink, tool-call
+// fragments accumulate by index.
+func (c *toolCoalescer) add(delta chatDelta, sink llm.Sink) error {
+	if len(delta.ToolCalls) == 0 {
+		return sink.Text(delta.Content)
+	}
+	for _, d := range delta.ToolCalls {
+		a := c.calls[d.Index]
+		if a == nil {
+			a = &toolAccumulator{}
+			c.calls[d.Index] = a
+			c.order = append(c.order, d.Index)
+		}
+		if d.ID != "" {
+			a.id = d.ID
+		}
+		a.name += d.Function.Name
+		a.args.WriteString(d.Function.Arguments)
+	}
+	return nil
+}
+
+// emit reports the assembled calls to the sink in arrival order, defaulting
+// empty arguments to an empty JSON object.
+//
+// A call whose arguments did not arrive as valid JSON is dropped rather than
+// passed on: nothing downstream can act on arguments that cannot be read, and a
+// handler given them would fail on its own account, which the model would read
+// as the tool having failed.
+func (c *toolCoalescer) emit(sink llm.Sink) error {
+	for _, idx := range c.order {
+		a := c.calls[idx]
+		if a.name == "" {
+			continue
+		}
+		args := a.args.String()
+		if args == "" {
+			args = "{}"
+		}
+		if !json.Valid([]byte(args)) {
+			slog.Warn("dropping a function call whose arguments are not valid JSON",
+				"function", a.name, "tool_call_id", a.id, "arguments", args)
+			continue
+		}
+		if err := sink.Tool(frames.ToolCall{ID: a.id, Name: a.name, Args: json.RawMessage(args)}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// RunInference answers the conversation once, off to the side of the pipeline:
+// no streaming, no frames, just the text. It implements llm.Inferencer.
+func (s *LLMService) RunInference(
+	ctx context.Context, convo *frames.LLMContext, opts llm.InferenceOptions,
+) (string, error) {
+	// The call's own instruction, or else the service's: an inference is still
+	// this service answering.
+	instruction := opts.SystemInstruction
+	if instruction == "" {
+		instruction = s.SystemInstruction()
+	}
+	// Built the way a streamed turn is, tools included: a conversation holding a
+	// tool exchange is only valid alongside the tools it used.
+	reqBody, err := s.baseRequest(convo, adapter.Options{SystemInstruction: instruction})
+	if err != nil {
+		return "", err
+	}
+	reqBody.Stream = false
+	reqBody.StreamOptions = nil
+	if opts.MaxTokens > 0 {
+		// max_completion_tokens is the bound OpenAI's reasoning models read, and
+		// the only one they accept, so it carries the override wherever the
+		// endpoint has the field.
+		if s.noMaxCompletion {
+			reqBody.MaxTokens = opts.MaxTokens
+		} else {
+			reqBody.MaxCompletionTokens = &opts.MaxTokens
+		}
+	}
+	if schema := s.CheckResponseSchema(ctx, opts.ResponseSchema); schema != nil {
+		reqBody.ResponseFormat = openai.JSONSchemaFormat(schema)
+	}
+	body, err := encodeBody(reqBody, reqBody.extra)
+	if err != nil {
+		return "", err
+	}
+	resp, err := s.send(ctx, body)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if resp.StatusCode != http.StatusOK {
+		return "", apierror.FromResponse(resp, errStatus)
+	}
+	var completion struct {
+		Choices []struct {
+			Message struct {
+				Content string `json:"content"`
+			} `json:"message"`
+		} `json:"choices"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&completion); err != nil {
+		return "", err
+	}
+	if len(completion.Choices) == 0 {
+		return "", nil
+	}
+	return completion.Choices[0].Message.Content, nil
+}
+
+// params converts the conversation into what this endpoint takes.
+func (s *LLMService) params(
+	convo *frames.LLMContext, opts adapter.Options,
+) (openai.Params, error) {
+	opts.ConvertDeveloperToUser = s.noDeveloperRole
+	return s.adapter.LLMInvocationParams(convo, opts)
+}
+
+// LLMAdapter returns the adapter this service converts through, so the base can
+// add the tools it implements itself to what every request advertises. It
+// implements llm.AdapterHolder.
+func (s *LLMService) LLMAdapter() llm.BuiltinToolHolder {
+	holder, ok := s.adapter.(llm.BuiltinToolHolder)
+	if !ok {
+		return nil
+	}
+	return holder
+}
+
+// MessagesForLogging renders the conversation as this endpoint will see it, for
+// the generation span. It implements llm.TraceRenderer.
+func (s *LLMService) MessagesForLogging(convo *frames.LLMContext) []map[string]any {
+	return s.adapter.MessagesForLogging(convo)
+}
+
+// ToolsForLogging renders the toolset as this endpoint will see it, for the
+// generation span. It implements llm.TraceRenderer.
+func (s *LLMService) ToolsForLogging(schema frames.ToolsSchema) []any {
+	return adapter.ToolsForLogging(s.adapter, schema)
+}
+
+// SupportsResponseSchema implements llm.ResponseSchemaSupporter. OpenAI's API
+// can hold a reply to a schema; an OpenAI-compatible endpoint whose API cannot
+// says so through Compat.NoResponseSchema.
+func (s *LLMService) SupportsResponseSchema() bool { return !s.noResponseSchema }
+
+// ModelSupportsResponseSchema implements llm.ResponseSchemaSupporter. OpenAI
+// models before gpt-4o-mini and gpt-4o-2024-08-06 cannot enforce a schema.
+func (s *LLMService) ModelSupportsResponseSchema(model string) bool {
+	return openai.ModelSupportsResponseSchema(model)
+}
+
+// ClassifyError implements processor.ErrorClassifier: a content filter's
+// refusal is content the provider refused, not the permanent invalid request
+// its status says.
+func (s *LLMService) ClassifyError(err error) errs.Category { return apierror.Classify(err) }
