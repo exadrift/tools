@@ -2,9 +2,10 @@ package main
 
 import (
 	"context"
-	"fmt"
+	"net/http"
 
 	"github.com/exadrift/tools/buddy/internal/config"
+	"github.com/exadrift/tools/buddy/internal/ui"
 	"github.com/gojargo/jargo/frames"
 	"github.com/gojargo/jargo/pipeline"
 	"github.com/gojargo/jargo/processor/aggregators"
@@ -13,10 +14,33 @@ import (
 	"github.com/gojargo/jargo/provider/whispercpp"
 	"github.com/gojargo/jargo/runner"
 	"github.com/gojargo/jargo/transport"
+	"github.com/gojargo/jargo-web/prebuilt"
 )
 
 func main() {
-	fmt.Println("hello")
+	// We want to serve production UI at /, but the runner always redirects / to /client/
+	// The runner's setupFrontendRoutes adds a redirect handler that takes precedence
+	// over our handler for / because it's added after.
+
+	// The solution: set runner.Frontend to nil to skip the redirect, then manually add
+	// the /client/ route with the prebuilt handler, and add our own handler for /.
+
+	// Create a custom mux for our routes
+	customMux := http.NewServeMux()
+
+	// Add our handler for / that serves production UI
+	customMux.Handle("/", ui.Handler())
+
+	// Add the /client/ route with the prebuilt handler (for JS files)
+	customMux.Handle("/client/", http.StripPrefix("/client", prebuilt.Handler()))
+
+	// Set runner.App to our custom mux
+	runner.App = customMux
+
+	// Set runner.Frontend to nil to prevent setupFrontendRoutes from adding the redirect
+	runner.Frontend = nil
+
+	// Let the runner add its routes
 	runner.Main(bot)
 }
 

@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Buddy - Interactive voice chat</title>
+    <style>
+        :root {
+            --primary-color: #1a73e8;
+            --primary-hover: #1557b0;
+            --danger-color: #dc3545;
+            --danger-hover: #bb2d3b;
+            --bg-color: #f8f9fa;
+            --card-bg: #ffffff;
+            --text-color: #333;
+            --border-radius: 8px;
+            --shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            min-height: 100vh;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            padding: 20px;
+        }
+
+        .container {
+            background-color: var(--card-bg);
+            border-radius: var(--border-radius);
+            box-shadow: var(--shadow);
+            padding: 40px;
+            width: 100%;
+            max-width: 500px;
+        }
+
+        h1 { font-size: 24px; margin-bottom: 30px; text-align: center; }
+
+        .control-group { margin-bottom: 20px; }
+
+        label {
+            display: block;
+            margin-bottom: 8px;
+            font-weight: 500;
+            font-size: 14px;
+            color: #555;
+        }
+
+        select, button {
+            width: 100%;
+            padding: 12px;
+            border: 1px solid #ddd;
+            border-radius: var(--border-radius);
+            font-size: 16px;
+            font-family: inherit;
+        }
+
+        select { background-color: #fff; cursor: pointer; }
+
+        select:focus {
+            outline: none;
+            border-color: var(--primary-color);
+            box-shadow: 0 0 0 3px rgba(26, 115, 232, 0.1);
+        }
+
+        button {
+            background-color: var(--primary-color);
+            color: white;
+            border: none;
+            cursor: pointer;
+            font-weight: 600;
+            margin-top: 20px;
+            font-size: 16px;
+        }
+
+        button:hover { background-color: var(--primary-hover); }
+
+        button.stop { background-color: var(--danger-color); }
+
+        button.stop:hover { background-color: var(--danger-hover); }
+
+        button:disabled { background-color: #ccc; cursor: not-allowed; }
+
+        .status { margin-top: 20px; padding: 12px; border-radius: var(--border-radius); text-align: center; font-weight: 500; font-size: 14px; }
+        .status.idle { background-color: #e9ecef; color: #6c757d; }
+        .status.active { background-color: #d4edda; color: #155724; }
+        .status.error { background-color: #f8d7da; color: #721c24; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Buddy</h1>
+        <div class="control-group">
+            <label for="microphone">Microphone Input</label>
+            <select id="microphone"><option value="">No devices found</option></select>
+        </div>
+        <div class="control-group">
+            <label for="speaker">Speaker Output</label>
+            <select id="speaker"><option value="">No devices found</option></select>
+        </div>
+        <button id="startBtn" onclick="startSession()">Start</button>
+        <div id="status" class="status idle">Ready to start</div>
+    </div>
+    <script>
+        var peerConnection = null;
+        var isSessionActive = false;
+        var microphoneStream = null;
+
+        function loadDevices() {
+            document.getElementById("status").textContent = "Loading devices...";
+            document.getElementById("status").className = "status idle";
+
+            // First request microphone permission to get device labels
+            navigator.mediaDevices.getUserMedia({ audio: true })
+                .then(function(stream) {
+                    // Stop the stream so we don't hold onto the microphone
+                    stream.getTracks().forEach(function(track) { track.stop(); });
+                    return navigator.mediaDevices.enumerateDevices();
+                })
+                .then(function(devices) {
+                    var microphoneSelect = document.getElementById("microphone");
+                    var speakerSelect = document.getElementById("speaker");
+
+                    var microphoneOptions = devices.filter(function(d) { return d.kind === "audioinput"; });
+                    var speakerOptions = devices.filter(function(d) { return d.kind === "audiooutput"; });
+
+                    microphoneSelect.innerHTML = "";
+                    microphoneOptions.forEach(function(device) {
+                        var option = document.createElement("option");
+                        option.value = device.deviceId;
+                        option.text = device.label || "Microphone";
+                        microphoneSelect.appendChild(option);
+                    });
+
+                    speakerSelect.innerHTML = "";
+                    speakerOptions.forEach(function(device) {
+                        var option = document.createElement("option");
+                        option.value = device.deviceId;
+                        option.text = device.label || "Speaker";
+                        speakerSelect.appendChild(option);
+                    });
+
+                    if (microphoneOptions.length > 0) {
+                        microphoneSelect.value = microphoneOptions[0].deviceId;
+                    }
+                    if (speakerOptions.length > 0) {
+                        speakerSelect.value = speakerOptions[0].deviceId;
+                    }
+
+                    if (microphoneOptions.length === 0 && speakerOptions.length === 0) {
+                        document.getElementById("status").textContent = "No audio devices found. Please connect your microphone and speaker.";
+                        document.getElementById("status").className = "status error";
+                    }
+                })
+                .catch(function(error) {
+                    console.error("Error loading devices:", error);
+                    // If permission denied, try enumerateDevices anyway (might still show devices without labels)
+                    navigator.mediaDevices.enumerateDevices()
+                        .then(function(devices) {
+                            var microphoneSelect = document.getElementById("microphone");
+                            var speakerSelect = document.getElementById("speaker");
+
+                            var microphoneOptions = devices.filter(function(d) { return d.kind === "audioinput"; });
+                            var speakerOptions = devices.filter(function(d) { return d.kind === "audiooutput"; });
+
+                            microphoneSelect.innerHTML = "";
+                            microphoneOptions.forEach(function(device) {
+                                var option = document.createElement("option");
+                                option.value = device.deviceId;
+                                option.text = device.label || "Microphone";
+                                microphoneSelect.appendChild(option);
+                            });
+
+                            speakerSelect.innerHTML = "";
+                            speakerOptions.forEach(function(device) {
+                                var option = document.createElement("option");
+                                option.value = device.deviceId;
+                                option.text = device.label || "Speaker";
+                                speakerSelect.appendChild(option);
+                            });
+
+                            document.getElementById("status").textContent = "Microphone access denied. Please allow access to see device details.";
+                            document.getElementById("status").className = "status error";
+                        })
+                        .catch(function(err) {
+                            console.error("Failed to enumerate devices:", err);
+                            document.getElementById("status").textContent = "Error: " + err.message;
+                            document.getElementById("status").className = "status error";
+                        });
+                });
+        }
+
+        function setStatus(message, type) {
+            var statusEl = document.getElementById("status");
+            statusEl.textContent = message;
+            statusEl.className = "status " + type;
+        }
+
+        async function startSession() {
+            if (isSessionActive) return;
+
+            var microphoneId = document.getElementById("microphone").value;
+            if (!microphoneId) {
+                setStatus("Please select a microphone", "error");
+                return;
+            }
+
+            setStatus("Connecting...", "idle");
+            document.getElementById("startBtn").textContent = "Connecting...";
+            document.getElementById("startBtn").disabled = true;
+
+            try {
+                // First, get ICE server configuration from the backend
+                var startResponse = await fetch(window.location.origin + "/start", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ transport: "webrtc" })
+                });
+
+                if (!startResponse.ok) {
+                    throw new Error("Failed to get ICE config: " + startResponse.statusText);
+                }
+
+                var startData = await startResponse.json();
+                var sessionID = startData.session_id || startData.sessionId;
+
+                // Get microphone stream
+                microphoneStream = await navigator.mediaDevices.getUserMedia({
+                    audio: { deviceId: microphoneId },
+                    video: false
+                });
+
+                // Create peer connection with ICE servers from backend
+                var iceServers = startData.iceConfig ? startData.iceConfig.iceServers : [];
+                // If no ICE servers from backend, use a public STUN server as fallback
+                if (iceServers.length === 0) {
+                    iceServers = [{ urls: "stun:stun.l.google.com:19302" }];
+                }
+                peerConnection = new RTCPeerConnection({ iceServers: iceServers });
+
+                // Add microphone tracks to peer connection
+                microphoneStream.getTracks().forEach(function(track) {
+                    peerConnection.addTrack(track, microphoneStream);
+                });
+
+                // Handle ICE candidates
+                peerConnection.onicecandidate = function(event) {
+                    if (event.candidate) {
+                        // Send ICE candidate to server via PATCH /api/offer
+                        fetch(window.location.origin + "/sessions/" + encodeURIComponent(sessionID) + "/api/offer", {
+                            method: "PATCH",
+                            headers: { "Content-Type": "application/json" },
+                            body: JSON.stringify({
+                                pc_id: event.candidate.sdpMid || "0",
+                                candidates: [event.candidate]
+                            })
+                        }).catch(function(err) {
+                            console.error("Failed to send ICE candidate:", err);
+                        });
+                    }
+                };
+
+                // Create and set local offer
+                var offer = await peerConnection.createOffer();
+                await peerConnection.setLocalDescription(offer);
+
+                // Send offer to server
+                var response = await fetch(window.location.origin + "/sessions/" + encodeURIComponent(sessionID) + "/api/offer", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({
+                        sdp: offer.sdp,
+                        type: "offer"
+                    })
+                });
+
+                if (!response.ok) {
+                    throw new Error("Failed to start session: " + response.statusText);
+                }
+
+                var data = await response.json();
+
+                // Set remote description from answer
+                if (data.sdp) {
+                    await peerConnection.setRemoteDescription({
+                        type: "answer",
+                        sdp: data.sdp
+                    });
+                }
+
+                isSessionActive = true;
+                document.getElementById("startBtn").textContent = "Stop";
+                document.getElementById("startBtn").className = "stop";
+                setStatus("Session active", "active");
+            } catch (error) {
+                console.error("Error starting session:", error);
+                setStatus("Error: " + error.message, "error");
+                document.getElementById("startBtn").textContent = "Start";
+                document.getElementById("startBtn").disabled = false;
+                // Clean up on error
+                if (peerConnection) {
+                    peerConnection.close();
+                    peerConnection = null;
+                }
+                if (microphoneStream) {
+                    microphoneStream.getTracks().forEach(function(track) { track.stop(); });
+                    microphoneStream = null;
+                }
+            }
+        }
+
+        function stopSession() {
+            if (!isSessionActive) return;
+
+            // Close peer connection
+            if (peerConnection) {
+                peerConnection.close();
+                peerConnection = null;
+            }
+
+            // Stop microphone stream
+            if (microphoneStream) {
+                microphoneStream.getTracks().forEach(function(track) { track.stop(); });
+                microphoneStream = null;
+            }
+
+            isSessionActive = false;
+            document.getElementById("startBtn").textContent = "Start";
+            document.getElementById("startBtn").className = "";
+            setStatus("Session ended", "idle");
+        }
+
+        // Load devices on page load
+        loadDevices();
+
+        // Expose functions globally
+        window.startSession = startSession;
+        window.stopSession = stopSession;
+    </script>
+</body>
+</html>
