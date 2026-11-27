@@ -122,6 +122,11 @@
                     stream.getTracks().forEach(function(track) { track.stop(); });
                     return navigator.mediaDevices.enumerateDevices();
                 })
+                .catch(function(err) {
+                    console.error("Failed to get microphone permission:", err);
+                    // Fall back to enumerateDevices without permission (device labels will be empty)
+                    return navigator.mediaDevices.enumerateDevices();
+                })
                 .then(function(devices) {
                     var microphoneSelect = document.getElementById("microphone");
                     var speakerSelect = document.getElementById("speaker");
@@ -155,6 +160,9 @@
                     if (microphoneOptions.length === 0 && speakerOptions.length === 0) {
                         document.getElementById("status").textContent = "No audio devices found. Please connect your microphone and speaker.";
                         document.getElementById("status").className = "status error";
+                    } else {
+                        document.getElementById("status").textContent = "Ready to start";
+                        document.getElementById("status").className = "status idle";
                     }
                 })
                 .catch(function(error) {
@@ -296,12 +304,15 @@
                 isSessionActive = true;
                 document.getElementById("startBtn").textContent = "Stop";
                 document.getElementById("startBtn").className = "stop";
+                document.getElementById("startBtn").disabled = false;
+                document.getElementById("startBtn").setAttribute("onclick", "stopSession()");
                 setStatus("Session active", "active");
             } catch (error) {
                 console.error("Error starting session:", error);
                 setStatus("Error: " + error.message, "error");
                 document.getElementById("startBtn").textContent = "Start";
                 document.getElementById("startBtn").disabled = false;
+                document.getElementById("startBtn").setAttribute("onclick", "startSession()");
                 // Clean up on error
                 if (peerConnection) {
                     peerConnection.close();
@@ -332,6 +343,7 @@
             isSessionActive = false;
             document.getElementById("startBtn").textContent = "Start";
             document.getElementById("startBtn").className = "";
+            document.getElementById("startBtn").setAttribute("onclick", "startSession()");
             setStatus("Session ended", "idle");
         }
 
